@@ -423,17 +423,17 @@ export class RoadRenderer {
     const perps = perpendicularsFor(pts);
 
     for (const run of runs) {
-      // side rails: thin box-ribbons offset to left/right of the deck edges
-      const railOffset = ROAD_WIDTH / 2 + BRIDGE_RAIL_WIDTH / 2;
+      // side rails: real 0.4 (wide) x 0.8 (tall) box cross-sections following the deck curve,
+      // offset to sit just inside the deck edges, resting on top of the paved deck surface.
+      const railOffset = ROAD_WIDTH / 2 - 0.2;
       for (const side of [-1, 1]) {
-        const railGeo = buildOffsetRibbonGeometry(
+        const railGeo = buildRailBoxGeometry(
           pts,
           perps,
-          BRIDGE_RAIL_WIDTH,
-          BRIDGE_RAIL_HEIGHT * 0.5,
           run.fromDist,
           run.toDist,
           side * railOffset,
+          STAGE_YLIFT.paved,
         );
         const railMat = makeStandardMaterial(BRIDGE_COLOR);
         this.addMesh(v, railGeo, railMat);
@@ -492,25 +492,135 @@ export class RoadRenderer {
   }
 }
 
-/** Like buildRibbonGeometry but offsets the ribbon centerline sideways by `sideOffset` and lifts vertically by height/2 with a fixed y (used for bridge rails). */
-function buildOffsetRibbonGeometry(
+/**
+ * Builds a solid rectangular-cross-section "box rail" that follows the deck curve.
+ *
+ * The rail's centerline is the input polyline (`pts`) shifted sideways by `sideOffset` along
+ * each sample's XZ perpendicular (`perps`). At each retained sample the cross-section is a
+ * `BRIDGE_RAIL_WIDTH` (across, along the perpendicular) x `BRIDGE_RAIL_HEIGHT` (vertical) rectangle
+ * whose bottom sits at `deckY + yLift` and whose top is `BRIDGE_RAIL_HEIGHT` above that. Consecutive
+ * rings are stitched into quads (2 triangles each) for the outer, top, inner, and bottom faces; the
+ * two open ends are capped with a single quad each. Vertex normals are computed afterward via
+ * `computeVertexNormals()` for flat/box-like shading.
+ */
+function buildRailBoxGeometry(
   pts: SamplePoint[],
   perps: Array<{ px: number; pz: number }>,
-  width: number,
-  yLift: number,
   from: number,
   to: number,
   sideOffset: number,
+  yLift: number,
 ): THREE.BufferGeometry {
-  // Shift each sample point sideways by sideOffset along its perpendicular, then reuse the
-  // standard ribbon builder against that shifted polyline.
-  const shifted: RoadSample[] = pts.map((p, i) => ({
-    x: p.x + perps[i].px * sideOffset,
-    y: p.y,
-    z: p.z + perps[i].pz * sideOffset,
-    bridge: false,
-  }));
-  return buildRibbonGeometry(shifted, width, yLift, from, to);
+  const geo = new THREE.BufferGeometry();
+  if (pts.length < 2 || to <= from) return geo;
+
+  const total = pts[pts.length - 1].dist;
+  const lo = Math.max(0, from);
+  const hi = Math.min(total, to);
+  if (hi <= lo) return geo;
+
+  const half = BRIDGE_RAIL_WIDTH / 2;
+  const bottomY = yLift;
+  const topY = yLift + BRIDGE_RAIL_HEIGHT;
+
+  // Collect the ordered (point, perp) samples spanning [lo, hi], including interpolated
+  // boundary samples at exactly lo and hi (mirrors buildRibbonGeometry's boundary handling).
+  const centers: SamplePoint[] = [];
+  const centerPerps: Array<{ px: number; pz: number }> = [];
+
+  const pushCenter = (p: SamplePoint, perp: { px: number; pz: number }) => {
+    centers.push({
+      x: p.x + perp.px * sideOffset,
+      y: p.y,
+      z: p.z + perp.pz * sideOffset,
+      dist: p.dist,
+    });
+    centerPerps.push(perp);
+  };
+
+  for (let i = 0; i < pts.length; i++) {
+    const d = pts[i].dist;
+    if (d < lo) {
+      if (i + 1 < pts.length && pts[i + 1].dist > lo) {
+        const u = (lo - d) / (pts[i + 1].dist - d);
+        const p = lerpPoint(pts[i], pts[i + 1], u);
+        const perp = lerpPerp(perps[i], perps[i + 1], u);
+        pushCenter(p, perp);
+      }
+      continue;
+    }
+    if (d > hi) {
+      if (i > 0 && pts[i - 1].dist < hi) {
+        const u = (hi - pts[i - 1].dist) / (d - pts[i - 1].dist);
+        const p = lerpPoint(pts[i - 1], pts[i], u);
+        const perp = lerpPerp(perps[i - 1], perps[i], u);
+        pushCenter(p, perp);
+      }
+      break;
+    }
+    if (Math.abs(d - lo) < 1e-9 && centers.length === 0) {
+      pushCenter(pts[i], perps[i]);
+      continue;
+    }
+    pushCenter(pts[i], perps[i]);
+  }
+
+  if (centers.length < 2) return geo;
+
+  const positions: number[] = [];
+  const indices: number[] = [];
+
+  // Per ring: 4 vertices in order [outer-bottom, outer-top, inner-top, inner-bottom].
+  // "Outer" = +half along perp, "inner" = -half along perp.
+  const ringIndices: number[] = [];
+  for (let i = 0; i < centers.length; i++) {
+    const c = centers[i];
+    const perp = centerPerps[i];
+    const ox = c.x + perp.px * half;
+    const oz = c.z + perp.pz * half;
+    const ix = c.x - perp.px * half;
+    const iz = c.z - perp.pz * half;
+
+    const vi = positions.length / 3;
+    positions.push(ox, c.y + bottomY, oz); // outer-bottom
+    positions.push(ox, c.y + topY, oz); // outer-top
+    positions.push(ix, c.y + topY, iz); // inner-top
+    positions.push(ix, c.y + bottomY, iz); // inner-bottom
+    ringIndices.push(vi);
+  }
+
+  const quad = (a: number, b: number, c: number, d: number) => {
+    // a-b-c-d in order around the quad; two CCW (from outside) triangles.
+    indices.push(a, b, c);
+    indices.push(a, c, d);
+  };
+
+  for (let i = 0; i < ringIndices.length - 1; i++) {
+    const r0 = ringIndices[i];
+    const r1 = ringIndices[i + 1];
+    const ob0 = r0, ot0 = r0 + 1, it0 = r0 + 2, ib0 = r0 + 3;
+    const ob1 = r1, ot1 = r1 + 1, it1 = r1 + 2, ib1 = r1 + 3;
+
+    // Outer face (facing +perp)
+    quad(ob0, ot0, ot1, ob1);
+    // Top face (facing +Y)
+    quad(ot0, it0, it1, ot1);
+    // Inner face (facing -perp)
+    quad(it0, ib0, ib1, it1);
+    // Bottom face (facing -Y)
+    quad(ib0, ob0, ob1, ib1);
+  }
+
+  // End caps (start and end rings), each a single quad closing the rectangle.
+  const startR = ringIndices[0];
+  quad(startR + 3, startR + 2, startR + 1, startR); // inner-bottom, inner-top, outer-top, outer-bottom
+  const endR = ringIndices[ringIndices.length - 1];
+  quad(endR, endR + 1, endR + 2, endR + 3); // outer-bottom, outer-top, inner-top, inner-bottom
+
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
 }
 
 function samplePointAt(pts: SamplePoint[], d: number): SamplePoint {
