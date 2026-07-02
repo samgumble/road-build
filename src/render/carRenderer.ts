@@ -74,71 +74,89 @@ export class CarRenderer {
     const loader = new GLTFLoader();
     const loaded: VariantMesh[] = [];
 
-    for (const file of VARIANT_FILES) {
-      const url = MODELS_BASE + file;
-      const gltf = await new Promise<{ scene: THREE.Object3D }>((resolve, reject) => {
-        loader.load(url, (g) => resolve(g), undefined, (err) => reject(err));
-      });
+    // Minor 11: previously each variant's InstancedMesh was added to the scene immediately as it
+    // finished loading, inside this loop. If a later variant then failed, `.catch()` below would
+    // call `buildFallback()` — but the earlier variants' meshes were already in the scene and
+    // never removed/disposed, leaving them rendered as orphans alongside the fallback car. Build
+    // every variant's mesh here WITHOUT adding it to the scene; only add them all (and commit
+    // `this.variants`) once every variant has resolved successfully, in `loadGltfVariants`'s
+    // caller. On any failure, dispose whatever partial meshes were created here before falling
+    // back — see the `.catch()` in the constructor.
+    try {
+      for (const file of VARIANT_FILES) {
+        const url = MODELS_BASE + file;
+        const gltf = await new Promise<{ scene: THREE.Object3D }>((resolve, reject) => {
+          loader.load(url, (g) => resolve(g), undefined, (err) => reject(err));
+        });
 
-      const geometries: THREE.BufferGeometry[] = [];
-      let material: THREE.Material | null = null;
+        const geometries: THREE.BufferGeometry[] = [];
+        let material: THREE.Material | null = null;
 
-      gltf.scene.updateMatrixWorld(true);
-      gltf.scene.traverse((obj) => {
-        if (!(obj instanceof THREE.Mesh)) return;
-        const geo = obj.geometry.clone();
-        geo.applyMatrix4(obj.matrixWorld);
-        // Keep only attributes we need and that are consistent across sub-meshes.
-        for (const attrName of Object.keys(geo.attributes)) {
-          if (attrName !== 'position' && attrName !== 'normal' && attrName !== 'uv') {
-            geo.deleteAttribute(attrName);
+        gltf.scene.updateMatrixWorld(true);
+        gltf.scene.traverse((obj) => {
+          if (!(obj instanceof THREE.Mesh)) return;
+          const geo = obj.geometry.clone();
+          geo.applyMatrix4(obj.matrixWorld);
+          // Keep only attributes we need and that are consistent across sub-meshes.
+          for (const attrName of Object.keys(geo.attributes)) {
+            if (attrName !== 'position' && attrName !== 'normal' && attrName !== 'uv') {
+              geo.deleteAttribute(attrName);
+            }
           }
+          geometries.push(geo);
+          if (!material) {
+            const m = obj.material as THREE.Material;
+            material = Array.isArray(m) ? m[0] : m;
+          }
+        });
+
+        if (!geometries.length || !material) throw new Error(`No meshes found in ${file}`);
+
+        const merged = mergeGeometries(geometries, false);
+        if (!merged) throw new Error(`Failed to merge geometry for ${file}`);
+        for (const g of geometries) g.dispose();
+
+        merged.computeBoundingBox();
+        const bbox = merged.boundingBox!;
+        const size = new THREE.Vector3();
+        bbox.getSize(size);
+        // Kenney's Car Kit models are authored with the car's length along Z and sit with their
+        // wheel-bottom near local y=0; normalize uniformly by the longest horizontal axis (Z) so
+        // the car's length maps to TARGET_LENGTH, then lift so the lowest point sits at y=0.
+        const scale = size.z > 0.001 ? TARGET_LENGTH / size.z : 1;
+        merged.scale(scale, scale, scale);
+        merged.computeBoundingBox();
+        const liftedBox = merged.boundingBox!;
+        merged.translate(0, -liftedBox.min.y, 0);
+
+        const mat = (material as THREE.Material).clone();
+        if ('map' in mat && (mat as THREE.MeshStandardMaterial).map) {
+          ((mat as THREE.MeshStandardMaterial).map as THREE.Texture).colorSpace = THREE.SRGBColorSpace;
         }
-        geometries.push(geo);
-        if (!material) {
-          const m = obj.material as THREE.Material;
-          material = Array.isArray(m) ? m[0] : m;
-        }
-      });
 
-      if (!geometries.length || !material) throw new Error(`No meshes found in ${file}`);
+        const instMesh = new THREE.InstancedMesh(merged, mat, CAR_CAPACITY_PER_VARIANT);
+        instMesh.count = 0;
+        instMesh.castShadow = true;
+        instMesh.receiveShadow = true;
+        instMesh.frustumCulled = false;
 
-      const merged = mergeGeometries(geometries, false);
-      if (!merged) throw new Error(`Failed to merge geometry for ${file}`);
-      for (const g of geometries) g.dispose();
-
-      merged.computeBoundingBox();
-      const bbox = merged.boundingBox!;
-      const size = new THREE.Vector3();
-      bbox.getSize(size);
-      // Kenney's Car Kit models are authored with the car's length along Z and sit with their
-      // wheel-bottom near local y=0; normalize uniformly by the longest horizontal axis (Z) so
-      // the car's length maps to TARGET_LENGTH, then lift so the lowest point sits at y=0.
-      const scale = size.z > 0.001 ? TARGET_LENGTH / size.z : 1;
-      merged.scale(scale, scale, scale);
-      merged.computeBoundingBox();
-      const liftedBox = merged.boundingBox!;
-      merged.translate(0, -liftedBox.min.y, 0);
-
-      const mat = (material as THREE.Material).clone();
-      if ('map' in mat && (mat as THREE.MeshStandardMaterial).map) {
-        ((mat as THREE.MeshStandardMaterial).map as THREE.Texture).colorSpace = THREE.SRGBColorSpace;
+        // Forward axis convention verified empirically against this exact Kenney Car Kit export:
+        // the body mesh's Z+ extent points toward the front bumper (matches wheel node naming
+        // "front"/"back" being at +Z/-Z respectively) — so local +Z is forward (see the yaw
+        // computation in update(), which is keyed off `this.usingFallback`).
+        loaded.push({ mesh: instMesh });
       }
-
-      const instMesh = new THREE.InstancedMesh(merged, mat, CAR_CAPACITY_PER_VARIANT);
-      instMesh.count = 0;
-      instMesh.castShadow = true;
-      instMesh.receiveShadow = true;
-      instMesh.frustumCulled = false;
-      this.scene.add(instMesh);
-
-      // Forward axis convention verified empirically against this exact Kenney Car Kit export:
-      // the body mesh's Z+ extent points toward the front bumper (matches wheel node naming
-      // "front"/"back" being at +Z/-Z respectively) — so local +Z is forward (see the yaw
-      // computation in update(), which is keyed off `this.usingFallback`).
-      loaded.push({ mesh: instMesh });
+    } catch (err) {
+      for (const v of loaded) {
+        v.mesh.geometry.dispose();
+        const mat = v.mesh.material;
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else mat.dispose();
+      }
+      throw err;
     }
 
+    for (const v of loaded) this.scene.add(v.mesh);
     this.variants = loaded;
     this.usingFallback = false;
     this.ready = true;

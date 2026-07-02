@@ -154,8 +154,11 @@ export class SceneryRenderer {
   private animating: Animating[] = [];
 
   // spawn events that arrive before their category's variants have finished loading are queued
-  // and flushed once that category becomes ready.
-  private pendingSpawns: SpawnRecord[] = [];
+  // and flushed once that category becomes ready. Minor 7: `animate` is carried alongside each
+  // record (not hardcoded true at flush time) so a `rebuild()`-sourced record whose category
+  // wasn't ready yet still gets placed with no pop-in once its variants load — matching every
+  // other already-ready category in that same restore.
+  private pendingSpawns: { rec: SpawnRecord; animate: boolean }[] = [];
 
   constructor(private scene: THREE.Scene, private hf: Heightfield, private bus: EventBus) {
     const fieldGeo = new THREE.PlaneGeometry(FIELD_SIZE, FIELD_SIZE);
@@ -349,10 +352,10 @@ export class SceneryRenderer {
 
   private flushPending(): void {
     if (!this.pendingSpawns.length) return;
-    const remaining: SpawnRecord[] = [];
-    for (const rec of this.pendingSpawns) {
-      if (this.categoryReady(rec.kind)) this.place(rec, true);
-      else remaining.push(rec);
+    const remaining: { rec: SpawnRecord; animate: boolean }[] = [];
+    for (const entry of this.pendingSpawns) {
+      if (this.categoryReady(entry.rec.kind)) this.place(entry.rec, entry.animate);
+      else remaining.push(entry);
     }
     this.pendingSpawns = remaining;
   }
@@ -366,7 +369,7 @@ export class SceneryRenderer {
 
   private onSpawn(e: SpawnRecord): void {
     if (!this.categoryReady(e.kind)) {
-      this.pendingSpawns.push(e);
+      this.pendingSpawns.push({ rec: e, animate: true }); // live gameplay spawn — always pops in
       return;
     }
     this.place(e, true);
@@ -399,6 +402,15 @@ export class SceneryRenderer {
       this.field.instanceMatrix.needsUpdate = true;
 
       // 3 stripe quads per field, offset along local Z, sharing the field's transform.
+      // Minor 6: unlike the field's own instance (tracked in `this.animating` and rescaled every
+      // frame by `update()`), these stripe instances are a *separate* InstancedMesh
+      // (`this.fieldStripe`) with their own slots that `update()` never touches — composing them
+      // with the animating field's `dummyScale` (0.001 while a pop-in is in flight) left them
+      // permanently stuck at that near-zero scale, i.e. invisible, since nothing ever grows them
+      // back to 1. They're thin decorative overlays, not a a focal pop-in element, so the simplest
+      // correct fix is to always compose them at final scale (1) regardless of `animate` — worst
+      // case they pop in a frame ahead of the field's own tween, which reads as fine in practice.
+      dummyScale.set(1, 1, 1);
       for (let s2 = 0; s2 < 3 && this.stripeCount < this.fieldStripe.instanceMatrix.count; s2++) {
         const localZ = (s2 - 1) * (FIELD_SIZE / 3);
         // rotate the local (0, localZ) offset by rec.rot into world space
@@ -488,7 +500,7 @@ export class SceneryRenderer {
 
     for (const rec of spawned) {
       if (this.categoryReady(rec.kind)) this.place(rec, false);
-      else this.pendingSpawns.push(rec);
+      else this.pendingSpawns.push({ rec, animate: false }); // restored — no pop-in once ready
     }
   }
 

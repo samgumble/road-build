@@ -320,6 +320,11 @@ export class Hud {
 
   private wireEvents(): void {
     this.deps.bus.on('construction:stage', ({ edgeId, stage }) => {
+      // Minor 8: 'removed' is exactly the case `roads:edgeRemoved` below already handles by
+      // deleting the entry — re-adding it here (with a 'removed' value, no less) would leak a
+      // permanent entry for an edge that no longer exists, regardless of handler registration
+      // order relative to `roads:edgeRemoved`.
+      if (stage === 'removed') return;
       this.stageByEdge.set(edgeId, stage);
       this.updateTicker();
     });

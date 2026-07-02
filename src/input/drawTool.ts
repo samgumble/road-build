@@ -257,6 +257,11 @@ export class DrawTool {
     };
 
     const onPointerLeave = () => {
+      // Minor 5: also clear `hoverVisible`, not just the ring's `visible` flag — otherwise the
+      // per-frame update loop (`update()`'s `showHover` computation) resurrects the ring next
+      // frame at its last hovered position, since it only reads `hoverVisible`/`dragging`/`mode`
+      // and has no idea the pointer actually left the canvas.
+      this.hoverVisible = false;
       this.hoverRing.visible = false;
     };
 

@@ -60,6 +60,7 @@ export function deserialize(json: string): SaveV1 | null {
   if (
     typeof p.seed !== 'string' ||
     typeof p.timeOfDay !== 'number' ||
+    !Number.isFinite(p.timeOfDay) || // Minor 9: reject NaN/Infinity, not just "is a number"
     !Array.isArray(p.edges) ||
     !p.growth ||
     !Array.isArray(p.growth.dev) ||
@@ -73,7 +74,13 @@ export function deserialize(json: string): SaveV1 | null {
       e === null ||
       !Array.isArray((e as { ctrl?: unknown }).ctrl) ||
       !(e as { ctrl: unknown[] }).ctrl.every(
-        (c) => typeof c === 'object' && c !== null && typeof (c as P2).x === 'number' && typeof (c as P2).z === 'number',
+        (c) =>
+          typeof c === 'object' &&
+          c !== null &&
+          typeof (c as P2).x === 'number' &&
+          typeof (c as P2).z === 'number' &&
+          Number.isFinite((c as P2).x) && // Minor 9: reject NaN/Infinity control points, which
+          Number.isFinite((c as P2).z), // would otherwise poison the sampler/heightfield downstream
       ) ||
       !STAGES.includes((e as { stage?: unknown }).stage as Stage)
     ) {

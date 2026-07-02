@@ -55,6 +55,35 @@ describe('save/load', () => {
       deserialize(JSON.stringify({ ...base, edges: [{ ctrl: 'not-an-array', stage: 'graded' }] })),
     ).toBeNull();
   });
+  it('returns null for non-finite timeOfDay or ctrl coordinates', () => {
+    const base = {
+      version: 1,
+      seed: 'x',
+      growth: { dev: [], spawned: [] },
+    };
+    // 1e400 overflows to Infinity once JSON.parse evaluates it as a number literal — this is how
+    // a hand-edited/corrupted save file could smuggle a non-finite value through JSON, since
+    // JSON.stringify on an in-memory NaN/Infinity would instead just emit `null`.
+    expect(
+      deserialize(JSON.stringify({ ...base, timeOfDay: 0.5, edges: [] }).replace('0.5', '1e400')),
+    ).toBeNull();
+    expect(
+      deserialize(
+        JSON.stringify({ ...base, timeOfDay: 0, edges: [{ ctrl: [{ x: 0, z: 0 }], stage: 'graded' }] }).replace(
+          '"x":0',
+          '"x":1e400',
+        ),
+      ),
+    ).toBeNull();
+    expect(
+      deserialize(
+        JSON.stringify({ ...base, timeOfDay: 0, edges: [{ ctrl: [{ x: 0, z: 0 }], stage: 'graded' }] }).replace(
+          '"z":0}',
+          '"z":1e400}',
+        ),
+      ),
+    ).toBeNull();
+  });
   it('resumes construction of mid-stage edges after restore', () => {
     const w = freshWorld('resume-test');
     let anchor = { x: 0, z: 0 };
