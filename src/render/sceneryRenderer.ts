@@ -372,10 +372,15 @@ export class SceneryRenderer {
     this.place(e, true);
   }
 
-  private pickVariant(kind: GrowthKind): VariantMesh | null {
+  private variantIndex(x: number, z: number, count: number): number {
+    const h = Math.abs(Math.imul(Math.round(x * 4) * 374761393 + Math.round(z * 4) * 668265263, 1274126177));
+    return h % count;
+  }
+
+  private pickVariant(kind: GrowthKind, x: number, z: number): VariantMesh | null {
     const list = kind === 'tree' ? this.treeVariants : kind === 'house' ? this.houseVariants : this.buildingVariants;
     if (!list.length) return null;
-    return list[Math.floor(Math.random() * list.length)];
+    return list[this.variantIndex(x, z, list.length)];
   }
 
   private place(rec: SpawnRecord, animate: boolean): void {
@@ -413,7 +418,7 @@ export class SceneryRenderer {
       return;
     }
 
-    const variant = this.pickVariant(rec.kind);
+    const variant = this.pickVariant(rec.kind, rec.x, rec.z);
     if (!variant) return; // category not ready yet and not queued (shouldn't happen; onSpawn queues first)
     if (variant.mesh.instanceMatrix.count === 0) return;
 
