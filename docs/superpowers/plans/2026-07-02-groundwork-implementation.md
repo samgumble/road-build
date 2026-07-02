@@ -96,7 +96,7 @@ Dependency direction: `render/`, `input/`, `ui/`, `audio/` depend on `sim/` + `c
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "vitest run",
+    "test": "vitest run --passWithNoTests",
     "test:watch": "vitest"
   },
   "dependencies": {
@@ -202,8 +202,8 @@ jobs:
 
 - [ ] **Step 2: Install and verify**
 
-Run: `npm install && npm run build`
-Expected: build succeeds, `dist/index.html` exists. (`npm test` will report "no test files" until Task 2 — that is fine; do not add a dummy test.)
+Run: `npm install && npm run build && npm test`
+Expected: build succeeds, `dist/index.html` exists, `npm test` exits 0 via `--passWithNoTests` (no dummy tests).
 
 - [ ] **Step 3: Commit**
 
