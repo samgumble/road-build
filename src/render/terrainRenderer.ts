@@ -11,10 +11,16 @@ const SAND_MAX_Y = 1;
 const GRASS_MAX_Y = 14;
 const ROCK_SLOPE = 0.6;
 
+const NORMAL_RECOMPUTE_THROTTLE_MS = 100;
+
 export class TerrainRenderer {
   readonly mesh: THREE.Mesh;
   readonly water: THREE.Mesh;
   private geo: THREE.PlaneGeometry;
+
+  private lastNormalRecomputeAt = 0;
+  private pendingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private dirty: { minI: number; minJ: number; maxI: number; maxJ: number } | null = null;
 
   constructor(scene: THREE.Scene, private hf: Heightfield, bus: EventBus) {
     this.geo = new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE, GRID_SIZE - 1, GRID_SIZE - 1);
@@ -77,6 +83,33 @@ export class TerrainRenderer {
 
   refreshRegion(minI: number, minJ: number, maxI: number, maxJ: number): void {
     this.writeHeightsAndColors(minI, minJ, maxI, maxJ);
+
+    if (this.dirty) {
+      this.dirty.minI = Math.min(this.dirty.minI, minI);
+      this.dirty.minJ = Math.min(this.dirty.minJ, minJ);
+      this.dirty.maxI = Math.max(this.dirty.maxI, maxI);
+      this.dirty.maxJ = Math.max(this.dirty.maxJ, maxJ);
+    } else {
+      this.dirty = { minI, minJ, maxI, maxJ };
+    }
+
+    const now = performance.now();
+    const elapsed = now - this.lastNormalRecomputeAt;
+    if (elapsed >= NORMAL_RECOMPUTE_THROTTLE_MS) {
+      this.flushNormals();
+    } else if (this.pendingFlushTimer === null) {
+      this.pendingFlushTimer = setTimeout(() => this.flushNormals(), NORMAL_RECOMPUTE_THROTTLE_MS - elapsed);
+    }
+  }
+
+  private flushNormals(): void {
+    if (this.pendingFlushTimer !== null) {
+      clearTimeout(this.pendingFlushTimer);
+      this.pendingFlushTimer = null;
+    }
+    if (!this.dirty) return;
+    this.dirty = null;
     this.geo.computeVertexNormals();
+    this.lastNormalRecomputeAt = performance.now();
   }
 }
