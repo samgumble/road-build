@@ -17,6 +17,15 @@ const STAGE_COLOR: Record<Stage, string> = {
   painted: '#3c3f41', // painted reuses paved's full-width ribbon color; center-line added separately
 };
 
+// The roller (see constructionRenderer.ts) trails the paver by this many arclength units during
+// the 'paved' stage; duplicated here (rather than imported) because it's a small rendering-tuning
+// constant, not a shared sim contract, and the two renderers otherwise have no reason to share a
+// module. Mirroring it lets the road ribbon show a slightly darker "already compacted" shade
+// behind the roller's position and the lighter freshly-laid color ahead of it, without having to
+// thread the roller's position through the construction:progress event contract.
+const ROLLER_TRAIL_DISTANCE = 8;
+const PAVED_COMPACTED_COLOR = '#2f3234'; // paved, darkened ~20% — compacted asphalt behind the roller
+
 const STAGE_YLIFT: Record<Stage, number> = {
   surveyed: 0.02,
   graded: 0.06,
@@ -62,15 +71,44 @@ function cumulativeDistances(samples: RoadSample[]): SamplePoint[] {
   return out;
 }
 
-/** Perpendicular (XZ, normalized) at sample i, derived from neighbor direction. Falls back to the previous perpendicular when the local direction is degenerate. */
+// How many samples to look ahead/behind (each direction) when estimating the tangent at a
+// vertex. A window of 1 (immediate neighbors only) tracks a Catmull-Rom curve tightly enough
+// that a sharp back-and-forth in the user's drawn control points can flip the tangent direction
+// almost 180 degrees between consecutive samples; because the perpendicular is derived straight
+// from that tangent with no miter clamping, the ribbon's inner edge folds back on itself at the
+// bend, reading as a visible notch/pinch in the road surface. Averaging the tangent over a wider
+// span smooths that direction change across several samples, trading a touch of "sharpness" at
+// genuine hairpins for a ribbon edge that never self-overlaps.
+const TANGENT_WINDOW = 2;
+
+/** Perpendicular (XZ, normalized) at sample i, derived from a smoothed neighbor direction (see
+ * TANGENT_WINDOW). Falls back to the previous perpendicular when the local direction is
+ * degenerate (e.g. duplicate points). */
 function perpendicularsFor(pts: SamplePoint[]): Array<{ px: number; pz: number }> {
   const out: Array<{ px: number; pz: number }> = [];
   let prevPerp = { px: 0, pz: 1 };
-  for (let i = 0; i < pts.length; i++) {
-    const a = pts[Math.max(0, i - 1)];
-    const b = pts[Math.min(pts.length - 1, i + 1)];
-    const dx = b.x - a.x;
-    const dz = b.z - a.z;
+  const n = pts.length;
+  for (let i = 0; i < n; i++) {
+    // Average the direction of every neighboring segment within +/-TANGENT_WINDOW samples,
+    // rather than just the single a->b chord used previously. This is a cheap tangent-smoothing
+    // pass (not a true miter join), but it's exactly what eliminates the self-crossing inner edge
+    // at sharp bends while leaving straight/gently-curved sections numerically unchanged (their
+    // neighboring chords already point the same way, so the average equals the single-chord
+    // result to within floating point).
+    let dx = 0;
+    let dz = 0;
+    const lo = Math.max(0, i - TANGENT_WINDOW);
+    const hi = Math.min(n - 1, i + TANGENT_WINDOW);
+    for (let k = lo; k < hi; k++) {
+      let sdx = pts[k + 1].x - pts[k].x;
+      let sdz = pts[k + 1].z - pts[k].z;
+      const slen = Math.hypot(sdx, sdz);
+      if (slen < 1e-6) continue;
+      sdx /= slen;
+      sdz /= slen;
+      dx += sdx;
+      dz += sdz;
+    }
     const len = Math.hypot(dx, dz);
     let perp: { px: number; pz: number };
     if (len < 1e-6) {
@@ -389,7 +427,7 @@ export class RoadRenderer {
       const { stage, t } = v.pending;
       const prev = prevStage(stage);
       const clampedT = Math.max(0, Math.min(length, t));
-      this.buildStageSegment(v, samples, stage, 0, clampedT);
+      this.buildStageSegment(v, samples, stage, 0, clampedT, /* advancing */ true);
       if (prev) this.buildStageSegment(v, samples, prev, clampedT, length);
       else this.buildStageSegment(v, samples, 'surveyed', clampedT, length);
     } else {
@@ -399,13 +437,42 @@ export class RoadRenderer {
     this.buildBridgeParts(v, samples);
   }
 
-  /** Renders the appearance for `stage` across arclength [from, to] on this edge. */
-  private buildStageSegment(v: EdgeVisual, samples: RoadSample[], stage: Stage, from: number, to: number): void {
+  /**
+   * Renders the appearance for `stage` across arclength [from, to] on this edge. `advancing` is
+   * true only for the actively-growing partial segment of an in-progress job (i.e. the [0,
+   * clampedT] call from `rebuild()`'s `v.pending` branch) — for 'paved', this additionally splits
+   * the segment at the roller's trailing position so already-compacted asphalt reads slightly
+   * darker than the freshly-laid strip still ahead of the roller. A fully-`paved` edge with no
+   * pending progress (the `else` branch in `rebuild()`) always renders uniformly, since there's no
+   * roller actively working it anymore.
+   */
+  private buildStageSegment(v: EdgeVisual, samples: RoadSample[], stage: Stage, from: number, to: number, advancing = false): void {
     if (to <= from) return;
     if (stage === 'surveyed') {
       const geo = buildDashedRibbonGeometry(samples, SURVEY_WIDTH, STAGE_YLIFT.surveyed, from, to, 2);
       const mat = makeStandardMaterial(STAGE_COLOR.surveyed, SURVEY_OPACITY);
       this.addMesh(v, geo, mat);
+      return;
+    }
+
+    if (stage === 'paved' && advancing) {
+      // Roller trails the paver by ROLLER_TRAIL_DISTANCE (see constructionRenderer.ts): everything
+      // it's already passed over ([from, rollerT]) is fully compacted (darker); the strip between
+      // the roller and the paver's leading edge ([rollerT, to]) is freshly laid, still the normal
+      // paved color.
+      const rollerT = Math.max(from, to - ROLLER_TRAIL_DISTANCE);
+      if (rollerT > from) {
+        const compactedGeo = buildRibbonGeometry(samples, ROAD_WIDTH, STAGE_YLIFT.paved, from, rollerT);
+        const compactedMat = makeStandardMaterial(PAVED_COMPACTED_COLOR, 1, true);
+        this.addMesh(v, compactedGeo, compactedMat);
+      }
+      if (rollerT < to) {
+        const freshGeo = buildRibbonGeometry(samples, ROAD_WIDTH, STAGE_YLIFT.paved, rollerT, to);
+        const freshMat = makeStandardMaterial(STAGE_COLOR.paved, 1, true);
+        freshMat.roughness = 0.35; // fresh asphalt sheen start; advanced in update()
+        const freshMesh = this.addMesh(v, freshGeo, freshMat);
+        freshMesh.userData.freshAsphalt = true;
+      }
       return;
     }
 

@@ -16,6 +16,91 @@ const HOVER_BREATHE_HZ = 0.5;
 const HOVER_BREATHE_AMOUNT = 0.05;
 const FADE_DURATION = 0.3; // seconds
 
+const STAKE_DUST_COUNT = 200; // pool capacity — plenty for rapid-fire stake planting during a drag
+const STAKE_DUST_BURST = 5; // particles spawned per planted stake
+const STAKE_DUST_LIFETIME = 0.5; // seconds
+const STAKE_DUST_SIZE = 0.5;
+const STAKE_DUST_COLOR = '#c9b48a';
+
+/**
+ * Minimal fixed-capacity particle pool for the stake-planting dust puff — deliberately not shared
+ * with `ConstructionRenderer`'s pool (that one lives in render/, this is input/, and the two never
+ * need to coordinate); see the plan's polish checklist item for "stake dust puffs on plant".
+ * Same ring-buffer/no-per-frame-allocation shape as the construction dust/steam pools.
+ */
+class StakeDustPool {
+  private readonly positions: Float32Array;
+  private readonly velocities: Float32Array;
+  private readonly ages: Float32Array;
+  private readonly alive: Uint8Array;
+  private cursor = 0;
+  readonly points: THREE.Points;
+  private readonly geo: THREE.BufferGeometry;
+
+  constructor(private readonly capacity: number) {
+    this.positions = new Float32Array(capacity * 3);
+    this.velocities = new Float32Array(capacity * 3);
+    this.ages = new Float32Array(capacity).fill(Infinity);
+    this.alive = new Uint8Array(capacity);
+
+    this.geo = new THREE.BufferGeometry();
+    this.geo.setAttribute('position', new THREE.BufferAttribute(this.positions, 3));
+    this.geo.setDrawRange(0, 0);
+
+    const mat = new THREE.PointsMaterial({
+      color: STAKE_DUST_COLOR,
+      size: STAKE_DUST_SIZE,
+      transparent: true,
+      opacity: 0.8,
+      depthWrite: false,
+      sizeAttenuation: true,
+    });
+    this.points = new THREE.Points(this.geo, mat);
+    this.points.frustumCulled = false;
+  }
+
+  burst(x: number, y: number, z: number): void {
+    for (let i = 0; i < STAKE_DUST_BURST; i++) {
+      const slot = this.cursor;
+      this.cursor = (this.cursor + 1) % this.capacity;
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 0.4 + Math.random() * 0.6;
+      this.positions[slot * 3] = x;
+      this.positions[slot * 3 + 1] = y;
+      this.positions[slot * 3 + 2] = z;
+      this.velocities[slot * 3] = Math.cos(angle) * speed;
+      this.velocities[slot * 3 + 1] = 0.8 + Math.random() * 0.6;
+      this.velocities[slot * 3 + 2] = Math.sin(angle) * speed;
+      this.ages[slot] = 0;
+      this.alive[slot] = 1;
+    }
+  }
+
+  update(dt: number): void {
+    let maxAlive = 0;
+    for (let i = 0; i < this.capacity; i++) {
+      if (!this.alive[i]) continue;
+      this.ages[i] += dt;
+      if (this.ages[i] >= STAKE_DUST_LIFETIME) {
+        this.alive[i] = 0;
+        this.positions[i * 3 + 1] = -9999;
+        continue;
+      }
+      this.positions[i * 3] += this.velocities[i * 3] * dt;
+      this.positions[i * 3 + 1] += this.velocities[i * 3 + 1] * dt;
+      this.positions[i * 3 + 2] += this.velocities[i * 3 + 2] * dt;
+      maxAlive = i + 1;
+    }
+    this.geo.setDrawRange(0, maxAlive);
+    (this.geo.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+  }
+
+  dispose(): void {
+    this.geo.dispose();
+    (this.points.material as THREE.Material).dispose();
+  }
+}
+
 export type DrawToolMode = 'draw' | 'demolish' | 'none';
 
 /**
@@ -57,6 +142,9 @@ export class DrawTool {
   private hoverBase = new THREE.Vector3();
   private clock = 0;
 
+  // dust puff on stake plant
+  private stakeDust: StakeDustPool;
+
   private disposers: Array<() => void> = [];
 
   constructor(
@@ -96,6 +184,9 @@ export class DrawTool {
     this.hoverRing.visible = false;
     this.scene.add(this.hoverRing);
 
+    this.stakeDust = new StakeDustPool(STAKE_DUST_COUNT);
+    this.scene.add(this.stakeDust.points);
+
     this.bindEvents();
   }
 
@@ -123,6 +214,7 @@ export class DrawTool {
       const p = RoadGraph.snap(hit.x, hit.z);
       this.chain = [p];
       this.updatePreview();
+      this.spawnStakeDust(p.x, p.z);
     };
 
     const onPointerMove = (e: PointerEvent) => {
@@ -143,6 +235,7 @@ export class DrawTool {
       if (last && last.x === p.x && last.z === p.z) return;
       this.chain.push(p);
       this.updatePreview();
+      this.spawnStakeDust(p.x, p.z);
     };
 
     const onPointerUp = (e: PointerEvent) => {
@@ -250,6 +343,12 @@ export class DrawTool {
       }
     }
     return null;
+  }
+
+  /** Small dust puff at a freshly-planted survey stake — see StakeDustPool above. */
+  private spawnStakeDust(x: number, z: number): void {
+    const y = this.hf.heightAt(x, z);
+    this.stakeDust.burst(x, y, z);
   }
 
   private updateDemolishHover(clientX: number, clientY: number): void {
@@ -415,6 +514,8 @@ export class DrawTool {
       const breathe = 1 + HOVER_BREATHE_AMOUNT * Math.sin(2 * Math.PI * HOVER_BREATHE_HZ * this.clock);
       this.hoverRing.scale.set(breathe, 1, breathe);
     }
+
+    this.stakeDust.update(dt);
   }
 
   dispose(): void {
@@ -429,5 +530,7 @@ export class DrawTool {
     this.demolishHoverRingMat.dispose();
     this.stakeMat.dispose();
     this.stakeMatInvalid.dispose();
+    this.scene.remove(this.stakeDust.points);
+    this.stakeDust.dispose();
   }
 }

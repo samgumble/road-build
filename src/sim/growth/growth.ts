@@ -12,8 +12,32 @@ const DEV_RATE_BASE = 0.008;
 const DEV_RATE_DIST_DIVISOR = 7;
 const MAX_SLOPE = 0.5;
 
-const JITTER = 1.5; // u
-const MIN_ROAD_CLEARANCE = 5; // u, spawns are pushed away from road samples closer than this
+const JITTER = 2.2; // u — wide enough relative to CELL (4u) that neighboring cells' trees don't line up into a hedge
+// u, spawns are pushed away from road samples closer than this. House/building pads flatten a
+// FLATTEN_RADIUS=5u circle (see sceneryRenderer.ts) around their spawn point toward the pad's own
+// ground height; at the old 5u clearance value, a house sitting right at that minimum has its
+// flatten circle's weight function (`1 - smoothstep(0.35, 1.0, d/radius)`, see heightfield.ts)
+// still at ~0.98 strength right at the paved edge (road centerline +/- ROAD_WIDTH/2 = 3u away —
+// only 2u from a 5u-clearance house's flatten center), which can re-disturb the terrain the road's
+// own grading pass already matched to its deck height there. Bumping clearance to 6.5u roughly
+// halves that weight (~0.44 at the edge) — measured empirically across several seeds, though, the
+// house's own ground-height target also drifts further from the road's graded height as clearance
+// grows (more natural terrain variation at a farther sample point), so the net effect on the
+// worst-case visible seam is genuinely mixed rather than a clean win: this is a defensible
+// mitigation (lower weight = less override of already-correct terrain, per the formula) but not a
+// verified fix for every terrain profile. A more thorough fix would need to also tighten
+// flattenCircle's falloff curve or shrink FLATTEN_RADIUS, which is a shared function used by road
+// grading too and out of scope for this pass.
+const MIN_ROAD_CLEARANCE = 6.5;
+
+// A cell crossing the 'tree' threshold spawns trees only with this probability; every qualifying
+// cell along a corridor would otherwise plant 2-3 trees every 4u (CELL), which at typical canopy
+// radii reads as a solid hedge rather than scattered woodland. Thinning to ~40% of cells, each
+// with fewer trees (see TREE_COUNT_MIN/MAX below), keeps the "development spreads from the road"
+// feel while leaving visible gaps of bare ground between clumps.
+const TREE_SPAWN_CHANCE = 0.4;
+const TREE_COUNT_MIN = 1;
+const TREE_COUNT_MAX = 2; // inclusive-exclusive count is TREE_COUNT_MIN + floor(rng * (MAX - MIN + 1))
 
 export type GrowthKind = 'tree' | 'field' | 'house' | 'building';
 
@@ -234,7 +258,10 @@ export class GrowthSim {
           if (mask & th.bit) continue;
           this.spawnMask[idx] |= th.bit;
           if (th.kind === 'tree') {
-            const count = 2 + Math.floor(this.rng() * 2); // 2-3
+            // Thinned + scattered (see TREE_SPAWN_CHANCE) so corridors read as woodland, not a
+            // hedge; the bit is still set above so a skipped cell isn't re-rolled every frame.
+            if (this.rng() >= TREE_SPAWN_CHANCE) continue;
+            const count = TREE_COUNT_MIN + Math.floor(this.rng() * (TREE_COUNT_MAX - TREE_COUNT_MIN + 1));
             for (let k = 0; k < count; k++) this.spawn('tree', x, z);
           } else {
             this.spawn(th.kind, x, z);

@@ -57,7 +57,10 @@ const RAIN_COUNT = 1500;
 const RAIN_RADIUS = 80;
 const RAIN_FALL_SPEED = 60; // u/s
 const RAIN_HEIGHT = 60; // spawn ceiling above ground, recycle when reaching ground
-const RAIN_STREAK_LEN = 2.2;
+const RAIN_STREAK_LEN = 3.4; // was rendered as disconnected point sprites (see below), barely
+// visible at typical camera distance; each drop stores a head+tail position pair so it can be
+// drawn as an actual line segment (a visible streak) rather than two separate dots.
+const RAIN_OPACITY = 0.85; // was 0.6 — streaks read thin against daylight sky/fog otherwise
 const RAIN_TRANSITION = 5; // seconds to ease rain-linked effects in/out
 
 const RAIN_MIN_INTERVAL = 90;
@@ -82,7 +85,7 @@ export class Atmosphere {
 
   private clouds: CloudGroup[] = [];
 
-  private rainPoints: THREE.Points;
+  private rainLines: THREE.LineSegments;
   private rainVelocities: Float32Array;
   private rainActive = false;
   private rainIntensity = 0; // eased 0..1, drives sun/fog coupling
@@ -110,24 +113,26 @@ export class Atmosphere {
     this.buildClouds();
 
     const rainGeom = new THREE.BufferGeometry();
-    const positions = new Float32Array(RAIN_COUNT * 3 * 2); // each streak = 2 points (line segment)
+    // Each drop is a head+tail vertex pair forming one line segment (a visible streak); rendering
+    // this layout as THREE.Points (as before) draws the head and tail as two separate disconnected
+    // dots and never actually connects them, which is why rain read as faint dust rather than
+    // streaks at typical camera distance. THREE.LineSegments draws the segment itself.
+    const positions = new Float32Array(RAIN_COUNT * 3 * 2);
     this.rainVelocities = new Float32Array(RAIN_COUNT);
     for (let i = 0; i < RAIN_COUNT; i++) {
       this.spawnRainDrop(positions, i);
       this.rainVelocities[i] = RAIN_FALL_SPEED * (0.85 + 0.3 * this.rng());
     }
     rainGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    const rainMat = new THREE.PointsMaterial({
-      color: '#cfe3f2',
-      size: 0.35,
+    const rainMat = new THREE.LineBasicMaterial({
+      color: '#dcecf7',
       transparent: true,
       opacity: 0,
       depthWrite: false,
-      sizeAttenuation: true,
     });
-    this.rainPoints = new THREE.Points(rainGeom, rainMat);
-    this.rainPoints.frustumCulled = false;
-    this.scene.add(this.rainPoints);
+    this.rainLines = new THREE.LineSegments(rainGeom, rainMat);
+    this.rainLines.frustumCulled = false;
+    this.scene.add(this.rainLines);
 
     this.rainTimer = RAIN_MIN_INTERVAL + this.rng() * (RAIN_MAX_INTERVAL - RAIN_MIN_INTERVAL);
 
@@ -248,17 +253,17 @@ export class Atmosphere {
     if (this.rainIntensity < target) this.rainIntensity = Math.min(target, this.rainIntensity + rate);
     else if (this.rainIntensity > target) this.rainIntensity = Math.max(target, this.rainIntensity - rate);
 
-    const mat = this.rainPoints.material as THREE.PointsMaterial;
-    mat.opacity = 0.6 * this.rainIntensity;
-    this.rainPoints.visible = this.rainIntensity > 0.001;
+    const mat = this.rainLines.material as THREE.LineBasicMaterial;
+    mat.opacity = RAIN_OPACITY * this.rainIntensity;
+    this.rainLines.visible = this.rainIntensity > 0.001;
 
-    if (!this.rainPoints.visible) return;
+    if (!this.rainLines.visible) return;
 
     // Rain follows the camera target's XZ so it stays around the player without simulating world-scale weather.
     const center = this.cameraTarget;
-    this.rainPoints.position.set(center.x, 0, center.z);
+    this.rainLines.position.set(center.x, 0, center.z);
 
-    const positions = this.rainPoints.geometry.attributes.position as THREE.BufferAttribute;
+    const positions = this.rainLines.geometry.attributes.position as THREE.BufferAttribute;
     const arr = positions.array as Float32Array;
     for (let i = 0; i < RAIN_COUNT; i++) {
       const base = i * 6;
