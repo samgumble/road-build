@@ -1,5 +1,5 @@
 import { LANE_OFFSET } from '../../core/constants';
-import type { V3 } from '../../core/types';
+import type { RoadSample, V3 } from '../../core/types';
 import type { RoadGraph } from './graph';
 
 export interface Lane {
@@ -8,6 +8,11 @@ export interface Lane {
   from: number;
   to: number;
   points: V3[];
+  /**
+   * Length of the lane's offset path (`points`), NOT the edge centerline.
+   * `length` and `points` are offset-path values and MUST be used together
+   * for s-parameterization; do not mix with `edge.length`/`edge.samples`.
+   */
   length: number;
   maxSpeed: number[];
 }
@@ -15,6 +20,8 @@ export interface Lane {
 export interface LaneGraph {
   lanes: Map<number, Lane>;
   outgoing: Map<number, number[]>;
+  /** True node positions (not offset lane endpoints), keyed by node id. */
+  nodePos: Map<number, { x: number; z: number }>;
 }
 
 /**
@@ -130,10 +137,12 @@ function computeLaneLength(points: V3[]): number {
 export function buildLaneGraph(graph: RoadGraph): LaneGraph {
   const lanes = new Map<number, Lane>();
   const outgoing = new Map<number, number[]>();
+  const nodePos = new Map<number, { x: number; z: number }>();
 
-  // Initialize outgoing map with empty arrays for all nodes
+  // Initialize outgoing map with empty arrays for all nodes, and record true node positions
   for (const node of graph.nodes.values()) {
     outgoing.set(node.id, []);
+    nodePos.set(node.id, { x: node.x, z: node.z });
   }
 
   // Process each painted edge
@@ -185,14 +194,7 @@ export function buildLaneGraph(graph: RoadGraph): LaneGraph {
     }
   }
 
-  return { lanes, outgoing };
-}
-
-interface RoadSample {
-  x: number;
-  y: number;
-  z: number;
-  bridge: boolean;
+  return { lanes, outgoing, nodePos };
 }
 
 /**
@@ -203,32 +205,13 @@ export function findRoute(lg: LaneGraph, fromNode: number, toNode: number): Lane
   // Special case: already at destination
   if (fromNode === toNode) return [];
 
-  const nodes = new Set<number>();
-  for (const lane of lg.lanes.values()) {
-    nodes.add(lane.from);
-    nodes.add(lane.to);
-  }
-
-  // Compute heuristic: euclidean distance between node positions
-  // We'll approximate by storing node coords when we see them
-  const nodeCoords = new Map<number, [number, number]>();
-  for (const lane of lg.lanes.values()) {
-    if (lane.points.length > 0) {
-      if (!nodeCoords.has(lane.from)) {
-        nodeCoords.set(lane.from, [lane.points[0].x, lane.points[0].z]);
-      }
-      if (!nodeCoords.has(lane.to)) {
-        nodeCoords.set(lane.to, [lane.points[lane.points.length - 1].x, lane.points[lane.points.length - 1].z]);
-      }
-    }
-  }
-
+  // Compute heuristic: euclidean distance between true node positions
   const heuristic = (node: number): number => {
-    const destCoords = nodeCoords.get(toNode);
-    const nodeCoord = nodeCoords.get(node);
+    const destCoords = lg.nodePos.get(toNode);
+    const nodeCoord = lg.nodePos.get(node);
     if (!destCoords || !nodeCoord) return 0;
-    const dx = destCoords[0] - nodeCoord[0];
-    const dz = destCoords[1] - nodeCoord[1];
+    const dx = destCoords.x - nodeCoord.x;
+    const dz = destCoords.z - nodeCoord.z;
     return Math.hypot(dx, dz);
   };
 
@@ -313,10 +296,10 @@ export function findRoute(lg: LaneGraph, fromNode: number, toNode: number): Lane
         fCost: f,
         parent: current,
       });
-
-      // Keep open list sorted
-      openList.sort((a, b) => a.fCost - b.fCost);
     }
+
+    // Keep open list sorted (once per outer expansion, not once per successor)
+    openList.sort((a, b) => a.fCost - b.fCost);
   }
 
   // No path found
