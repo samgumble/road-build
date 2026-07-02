@@ -257,6 +257,18 @@ interface VehicleState {
   scale: number; // current animated scale, 0..1
   fadeElapsed: number; // 0 (hidden) .. 1 (fully shown), eased into `scale` via easeOutCubic
   hasTarget: boolean; // false until the first progress event positions this vehicle
+  // Edge-session tracking so a same-kind vehicle handed from one edge's job to another's (e.g. a
+  // demolish job on edge A immediately followed by a queued build job on edge B, both using the
+  // excavator) doesn't glide/teleport across the gap. `currentEdgeId` is the edge this vehicle is
+  // currently "shown" on; a progress event for a different edge is buffered in `pendingHandoff`
+  // rather than applied immediately, and `handoffPending` forces a fade-out (ignoring the normal
+  // idle-timeout liveness check) until the vehicle is fully hidden, at which point update() snaps
+  // it to the buffered position/heading and lets it fade back in.
+  currentEdgeId: number | null;
+  handoffPending: boolean;
+  pendingPos: THREE.Vector3;
+  pendingHeading: number;
+  pendingEdgeId: number | null;
 }
 
 /**
@@ -404,6 +416,11 @@ export class ConstructionRenderer {
       scale: 0,
       fadeElapsed: 0,
       hasTarget: false,
+      currentEdgeId: null,
+      handoffPending: false,
+      pendingPos: new THREE.Vector3(),
+      pendingHeading: 0,
+      pendingEdgeId: null,
     };
   }
 
@@ -416,6 +433,45 @@ export class ConstructionRenderer {
     return s;
   }
 
+  /**
+   * Applies a newly-reported position/heading for `edgeId` to `state`, session-aware: if this is
+   * the same edge the vehicle is already showing (or its first sighting ever), the target is
+   * applied directly and damping/fade behaves exactly as before. If it's a *different* edge (a
+   * same-kind job handoff, e.g. demolish-excavator on edge A immediately followed by a queued
+   * build-excavator on edge B), the new position is buffered rather than applied — the vehicle
+   * keeps damping toward its *old* target and is forced to fade out (see `handoffPending` in
+   * `stepVehicle`); once fully hidden, `update()` snaps it onto the buffered target and lets it
+   * fade back in on the new edge.
+   */
+  private applyProgressTarget(state: VehicleState, edgeId: number, pos: THREE.Vector3, heading: number): void {
+    if (!state.hasTarget) {
+      // snap on first sighting so it doesn't damp in from the origin
+      state.targetPos.copy(pos);
+      state.targetHeading = heading;
+      state.curPos.copy(pos);
+      state.curHeading = heading;
+      state.hasTarget = true;
+      state.currentEdgeId = edgeId;
+      return;
+    }
+
+    if (state.currentEdgeId === null || state.currentEdgeId === edgeId) {
+      // same session (or a state that was never assigned an edge, e.g. legacy/edge-less) — behave
+      // exactly as before.
+      state.currentEdgeId = edgeId;
+      state.targetPos.copy(pos);
+      state.targetHeading = heading;
+      return;
+    }
+
+    // Different edge: buffer the target and request a fade-out; do NOT touch targetPos/Heading so
+    // the vehicle keeps damping toward its last on-screen position while it fades.
+    state.handoffPending = true;
+    state.pendingPos.copy(pos);
+    state.pendingHeading = heading;
+    state.pendingEdgeId = edgeId;
+  }
+
   private onProgress(e: {
     edgeId: number;
     stage: string;
@@ -426,14 +482,7 @@ export class ConstructionRenderer {
     demolish: boolean;
   }): void {
     const state = this.stateFor(e.vehicle);
-    state.targetPos.set(e.pos.x, e.pos.y, e.pos.z);
-    state.targetHeading = e.heading;
-    if (!state.hasTarget) {
-      // snap on first sighting so it doesn't damp in from the origin
-      state.curPos.copy(state.targetPos);
-      state.curHeading = state.targetHeading;
-      state.hasTarget = true;
-    }
+    this.applyProgressTarget(state, e.edgeId, new THREE.Vector3(e.pos.x, e.pos.y, e.pos.z), e.heading);
     this.lastSeenAt.set(e.vehicle, this.clock);
 
     // Dust/steam bursts are driven by timers in update() (see there), not per-event — progress
@@ -445,13 +494,8 @@ export class ConstructionRenderer {
       if (edge) {
         const rollerT = Math.max(0, e.t - ROLLER_TRAIL_DISTANCE);
         const { pos, heading } = sampleAt(edge.samples, rollerT);
-        this.roller.targetPos.set(pos.x, pos.y, pos.z);
-        this.roller.targetHeading = e.demolish ? heading + Math.PI : heading;
-        if (!this.roller.hasTarget) {
-          this.roller.curPos.copy(this.roller.targetPos);
-          this.roller.curHeading = this.roller.targetHeading;
-          this.roller.hasTarget = true;
-        }
+        const rollerHeading = e.demolish ? heading + Math.PI : heading;
+        this.applyProgressTarget(this.roller, e.edgeId, new THREE.Vector3(pos.x, pos.y, pos.z), rollerHeading);
         this.lastRollerSeenAt = this.clock;
       }
     }
@@ -487,9 +531,18 @@ export class ConstructionRenderer {
     }
   }
 
-  /** Damps position/heading toward the last-reported target, advances fade scale toward `active`, and applies the result to the rig's THREE.Group. */
+  /**
+   * Damps position/heading toward the last-reported target, advances fade scale toward `active`,
+   * and applies the result to the rig's THREE.Group. If a same-kind edge handoff is pending (see
+   * `applyProgressTarget`), `active` is overridden to force a fade-out; once the fade-out
+   * completes (scale reaches ~0), the vehicle is snapped onto the buffered handoff target and
+   * allowed to fade back in from there — so a handoff never damps/glides across the gap between
+   * the old edge and the new one.
+   */
   private stepVehicle(state: VehicleState, dt: number, active: boolean): void {
     if (!state.hasTarget) return;
+
+    const effectiveActive = state.handoffPending ? false : active;
 
     state.curPos.x = damp(state.curPos.x, state.targetPos.x, POS_LAMBDA, dt);
     state.curPos.y = damp(state.curPos.y, state.targetPos.y, POS_LAMBDA, dt);
@@ -500,11 +553,23 @@ export class ConstructionRenderer {
     delta = Math.atan2(Math.sin(delta), Math.cos(delta));
     state.curHeading = state.curHeading + delta * (1 - Math.exp(-ROT_LAMBDA * dt));
 
-    const direction = active ? 1 : -1;
+    const direction = effectiveActive ? 1 : -1;
     state.fadeElapsed = clamp01(state.fadeElapsed + direction * (dt / FADE_DURATION));
     // `fadeElapsed` always represents "progress toward fully shown" (1 = fully visible, 0 = fully
     // hidden); ease it so scale-in/out both use easeOutCubic rather than linear interpolation.
     state.scale = easeOutCubic(state.fadeElapsed);
+
+    if (state.handoffPending && state.fadeElapsed <= 0.001) {
+      // Fully faded out — move the vehicle to the buffered target position/heading (no damping,
+      // so no glide across the gap) and let it fade back in on the new edge from here.
+      state.curPos.copy(state.pendingPos);
+      state.curHeading = state.pendingHeading;
+      state.targetPos.copy(state.pendingPos);
+      state.targetHeading = state.pendingHeading;
+      state.currentEdgeId = state.pendingEdgeId;
+      state.handoffPending = false;
+      state.pendingEdgeId = null;
+    }
 
     const rig = state.rig;
     rig.group.visible = state.scale > 0.001;

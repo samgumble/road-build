@@ -266,13 +266,24 @@ function findBridgeRuns(samples: RoadSample[]): BridgeRun[] {
   return runs;
 }
 
-function makeStandardMaterial(color: string, opacity = 1): THREE.MeshStandardMaterial {
+function makeStandardMaterial(color: string, opacity = 1, ribbon = false): THREE.MeshStandardMaterial {
   return new THREE.MeshStandardMaterial({
     color,
     flatShading: true,
     roughness: 0.9,
     transparent: opacity < 1,
     opacity,
+    // The terrain grid (4u cells) is coarser than the road's sample spacing, so even
+    // fully-graded terrain can interpolate slightly above the ribbon between grid vertices —
+    // combined with the terrain renderer's throttled (100ms) normal/geometry recompute during
+    // continuous deformation, this can flicker as faint ground bleed-through on the full-width
+    // stage ribbons (graded/gravel/paved/painted). Bias the ribbon's depth toward the camera
+    // (without changing any actual geometry heights) so it reliably draws on top. Survey dashes
+    // and the painted centerline are thin/decorative, not full-width road surface, so they don't
+    // need this and are excluded via the `ribbon` flag.
+    polygonOffset: ribbon,
+    polygonOffsetFactor: ribbon ? -2 : 0,
+    polygonOffsetUnits: ribbon ? -2 : 0,
   });
 }
 
@@ -401,7 +412,7 @@ export class RoadRenderer {
     const yLift = STAGE_YLIFT[stage];
     const color = STAGE_COLOR[stage];
     const geo = buildRibbonGeometry(samples, ROAD_WIDTH, yLift, from, to);
-    const mat = makeStandardMaterial(color);
+    const mat = makeStandardMaterial(color, 1, true);
     const mesh = this.addMesh(v, geo, mat);
     if (stage === 'paved' || stage === 'painted') {
       mat.roughness = 0.35; // fresh asphalt sheen start; advanced in update()

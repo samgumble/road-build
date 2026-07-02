@@ -154,7 +154,18 @@ export class BuildQueue {
     if (stage === 'graded') {
       const nearest = nearestSampleIndex(edge.samples, clampedT);
       if (!edge.samples[nearest]?.bridge) {
+        // `flattenCircle`'s full-strength core is only ~0.35*radius, so a single centerline pass
+        // at GRADE_RADIUS leaves the ribbon's edges (out toward the road's actual half-width)
+        // under-flattened — on a ridge crossing this shows up as terrain poking back up through
+        // the graded strip. Cut the full road width by flattening three times per update: once on
+        // the centerline and once at each perpendicular offset toward the road's edges, all with
+        // the same target height and radius.
+        const perpX = -Math.sin(heading);
+        const perpZ = Math.cos(heading);
+        const offset = ROAD_WIDTH / 2 - 0.8;
         this.hf.flattenCircle(pos.x, pos.z, pos.y, GRADE_RADIUS);
+        this.hf.flattenCircle(pos.x + perpX * offset, pos.z + perpZ * offset, pos.y, GRADE_RADIUS);
+        this.hf.flattenCircle(pos.x - perpX * offset, pos.z - perpZ * offset, pos.y, GRADE_RADIUS);
       }
     }
 
