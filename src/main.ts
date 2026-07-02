@@ -20,8 +20,39 @@ import { Hud, randomSeed } from './ui/hud';
 import { serialize, deserialize, restoreWorld } from './sim/save';
 import { AmbientAudio } from './audio/ambient';
 
-const SAVE_KEY = 'groundwork-save';
+// Important 3: saves used to live under one shared key (`groundwork-save`), so visiting with a
+// different `?seed=` would silently ignore that seed's own progress (deserialize's seed mismatch
+// check just fell back to a fresh world) and then the 10s autosave interval would overwrite the
+// previous seed's save entirely. Each seed now gets its own save slot, and a small separate key
+// tracks which seed was last played so a plain visit (no `?seed=` in the URL) resumes it.
+const LEGACY_SAVE_KEY = 'groundwork-save';
+const LAST_SEED_KEY = 'groundwork-last-seed';
 const AUTOSAVE_INTERVAL = 10; // seconds
+
+function saveKeyFor(seed: string): string {
+  return `groundwork-save:${seed}`;
+}
+
+/**
+ * One-time migration: if the old shared-key save exists, move it into its own seed's slot (read
+ * from the save JSON itself, not from any current URL/last-seed state, since this predates the
+ * per-seed scheme entirely) and record that seed as last-played. Removes the legacy key either
+ * way so this only ever runs once. No-ops quietly on any storage/parse failure.
+ */
+function migrateLegacySave(): void {
+  try {
+    const raw = window.localStorage.getItem(LEGACY_SAVE_KEY);
+    if (raw === null) return;
+    const save = deserialize(raw);
+    if (save) {
+      window.localStorage.setItem(saveKeyFor(save.seed), raw);
+      window.localStorage.setItem(LAST_SEED_KEY, save.seed);
+    }
+    window.localStorage.removeItem(LEGACY_SAVE_KEY);
+  } catch {
+    // localStorage unavailable/corrupt — nothing to migrate.
+  }
+}
 
 function resolveSeed(): { seed: string; fromUrl: boolean } {
   const params = new URLSearchParams(window.location.search);
@@ -29,11 +60,8 @@ function resolveSeed(): { seed: string; fromUrl: boolean } {
   if (urlSeed) return { seed: urlSeed, fromUrl: true };
 
   try {
-    const raw = window.localStorage.getItem(SAVE_KEY);
-    if (raw) {
-      const save = deserialize(raw);
-      if (save) return { seed: save.seed, fromUrl: false };
-    }
+    const lastSeed = window.localStorage.getItem(LAST_SEED_KEY);
+    if (lastSeed) return { seed: lastSeed, fromUrl: false };
   } catch {
     // localStorage unavailable (private mode, etc.) — fall through to a fresh random seed
   }
@@ -75,7 +103,13 @@ function main(): void {
 
   const { renderer, scene, camera, sun, hemi } = rig;
 
+  migrateLegacySave();
   const { seed } = resolveSeed();
+  try {
+    window.localStorage.setItem(LAST_SEED_KEY, seed);
+  } catch {
+    // ignore — worst case a plain revisit falls back to a fresh random seed instead of resuming
+  }
 
   const bus = new EventBus();
   const hf = new Heightfield(seed, bus);
@@ -131,20 +165,29 @@ function main(): void {
       cameraRig.update(dt);
       roadRenderer.update(dt);
       drawTool.update(dt);
-      atmosphere.update(dt);
+      // Important 10: the day/night cycle is meant to accelerate with the HUD's speed control
+      // (1x/4x/16x, via `loop.timeScale`) the same way the fixed-step sim does — Atmosphere's own
+      // doc comment already (incorrectly) claimed timeScale was "baked in" to its dt, but this
+      // render callback computes `dt` straight from wall-clock time with no timeScale applied at
+      // all, so the day cycle previously ran at real-world speed regardless of the selected speed.
+      atmosphere.update(dt * loop.timeScale);
       constructionRenderer.update(dt, atmosphere.night);
       carRenderer.update(traffic.cars, atmosphere.night);
       sceneryRenderer.update(dt);
+      // Audio intentionally stays real-time: `update()` uses `dt` only for its own wall-clock
+      // scheduling (bird/cricket timers, pad chord crossfades), not to advance the day cycle —
+      // `timeOfDay` is read from `atmosphere.timeOfDay`, which is already correctly scaled above.
       audio.update(dt, atmosphere.timeOfDay, camera.position.x);
       renderer.render(scene, camera);
     },
   );
 
-  // Boot-load: restore from a same-seed save if one exists, with a graceful fallback to a fresh
-  // world on corrupt/missing/mismatched-seed data (deserialize already returns null for those).
+  // Boot-load: restore from this seed's own save slot if one exists, with a graceful fallback to
+  // a fresh world on corrupt/missing data (deserialize already returns null for those). Each seed
+  // has its own key, so a different seed's save is never touched.
   let restoredRoads = false;
   try {
-    const raw = window.localStorage.getItem(SAVE_KEY);
+    const raw = window.localStorage.getItem(saveKeyFor(seed));
     if (raw) {
       const save = deserialize(raw);
       if (save && save.seed === seed) {
@@ -167,11 +210,9 @@ function main(): void {
     canvas,
     audio,
     onNewWorld: (newSeed) => {
-      try {
-        window.localStorage.removeItem(SAVE_KEY);
-      } catch {
-        // ignore
-      }
+      // Each seed owns its own save slot (starting empty for a seed that's never been visited),
+      // so there's nothing to clear here — just navigate. `main()`'s boot sequence on the new
+      // page load resolves the seed from the URL and records it as last-played.
       const url = new URL(window.location.href);
       url.searchParams.set('seed', newSeed);
       window.location.search = url.searchParams.toString();
@@ -182,7 +223,7 @@ function main(): void {
   const save = () => {
     try {
       const json = serialize({ seed, timeOfDay: atmosphere.timeOfDay, graph, growth });
-      window.localStorage.setItem(SAVE_KEY, json);
+      window.localStorage.setItem(saveKeyFor(seed), json);
     } catch {
       // localStorage unavailable/full — autosave silently no-ops rather than crashing the game
     }

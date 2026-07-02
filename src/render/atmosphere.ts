@@ -78,7 +78,9 @@ const EXPOSURE_LAMBDA = 1.5; // ease rate, 1/s
 /**
  * Owns day/night cycling (sky, fog, sun/hemi light, renderer exposure), drifting cloud groups, and
  * a scheduled rain system. `update(dt)` is driven from the render callback (visual pacing only —
- * not part of the fixed-step sim), where `dt` already has the Loop's timeScale baked in.
+ * not part of the fixed-step sim); the caller (main.ts) is responsible for multiplying its
+ * wall-clock `dt` by `Loop.timeScale` before passing it in, so the day cycle speeds up along with
+ * the HUD's 1x/4x/16x control the same way the fixed-step sim does.
  */
 export class Atmosphere {
   timeOfDay = 0.35;
