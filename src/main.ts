@@ -1,5 +1,6 @@
 import { EventBus } from './core/events';
 import { Loop } from './core/loop';
+import { createRng } from './core/rng';
 import { Heightfield } from './sim/terrain/heightfield';
 import { createScene } from './render/scene';
 import { TerrainRenderer } from './render/terrainRenderer';
@@ -10,6 +11,8 @@ import { RoadGraph } from './sim/roads/graph';
 import { makeSampler } from './sim/roads/path';
 import { BuildQueue } from './sim/construction/queue';
 import { ConstructionRenderer } from './render/constructionRenderer';
+import { TrafficSim } from './sim/traffic/traffic';
+import { CarRenderer } from './render/carRenderer';
 
 function showNoGl(): void {
   const app = document.getElementById('app');
@@ -54,6 +57,10 @@ function main(): void {
   const buildQueue = new BuildQueue(graph, hf, bus);
   const constructionRenderer = new ConstructionRenderer(scene, bus, graph);
 
+  const traffic = new TrafficSim(graph, bus, createRng('traffic-' + hf.seed));
+  traffic.targetPopulation = 6; // Task 13 scales this with houses: 6 + houses, capped at 80
+  const carRenderer = new CarRenderer(scene);
+
   const cameraRig = new CameraRig(camera, canvas);
 
   // Draw tool owns LMB (survey preview + stakes + commit, demolish-click); exposed here so a
@@ -68,6 +75,7 @@ function main(): void {
   const loop = new Loop(
     (dt) => {
       buildQueue.update(dt);
+      traffic.update(dt);
     },
     () => {
       const now = performance.now();
@@ -78,6 +86,7 @@ function main(): void {
       drawTool.update(dt);
       // Task 14 wires real night flag
       constructionRenderer.update(dt, false);
+      carRenderer.update(traffic.cars, false);
       renderer.render(scene, camera);
     },
   );

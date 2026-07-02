@@ -1,0 +1,23 @@
+Car models: Kenney "Car Kit" (v3.1)
+Source: https://kenney.nl/assets/car-kit
+Author: Kenney (www.kenney.nl)
+
+License: Creative Commons Zero v1.0 Universal (CC0 1.0)
+https://creativecommons.org/publicdomain/zero/1.0/
+
+You can use this content for personal, educational, and commercial purposes,
+with no attribution required (crediting "Kenney" / "www.kenney.nl" is
+appreciated but not required).
+
+Files included in this directory (4 of the 45 models in the original pack,
+selected for small sedan/hatchback silhouettes suitable for ambient traffic):
+- sedan.glb
+- sedan-sports.glb
+- hatchback-sports.glb
+- taxi.glb
+- Textures/colormap.png (shared color-palette texture referenced by all four
+  models above)
+
+Downloaded verbatim from the official Kenney CDN
+(https://kenney.nl/media/pages/assets/car-kit/.../kenney_car-kit.zip) on
+2026-07-02; no modifications were made to the GLB or texture files themselves.
