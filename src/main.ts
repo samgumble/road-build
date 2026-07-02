@@ -3,7 +3,11 @@ import { Loop } from './core/loop';
 import { Heightfield } from './sim/terrain/heightfield';
 import { createScene } from './render/scene';
 import { TerrainRenderer } from './render/terrainRenderer';
+import { RoadRenderer } from './render/roadRenderer';
 import { CameraRig } from './input/cameraRig';
+import { RoadGraph } from './sim/roads/graph';
+import { makeSampler } from './sim/roads/path';
+import type { Stage } from './core/types';
 
 function showNoGl(): void {
   const app = document.getElementById('app');
@@ -44,7 +48,23 @@ function main(): void {
   const terrain = new TerrainRenderer(scene, hf, bus);
   void terrain;
 
+  const graph = new RoadGraph(bus, makeSampler(hf));
+  const roadRenderer = new RoadRenderer(scene, graph, bus, hf);
+
   const cameraRig = new CameraRig(camera, canvas);
+
+  // --- temporary debug hooks (Task 7 visual verification; remove once construction sim + UI land) ---
+  (window as unknown as { __debugRoad: (pts: [number, number][]) => number[] }).__debugRoad =
+    (pts) => graph.commitChain(pts.map(([x, z]) => ({ x, z })));
+
+  (window as unknown as { __debugStage: (edgeId: number, stage: Stage) => void }).__debugStage =
+    (edgeId, stage) => {
+      const edge = graph.edges.get(edgeId);
+      if (!edge) return;
+      edge.stage = stage;
+      bus.emit('construction:stage', { edgeId, stage });
+    };
+  // --- end temporary debug hooks ---
 
   let lastFrameTime = performance.now();
 
@@ -57,6 +77,7 @@ function main(): void {
       const dt = Math.min((now - lastFrameTime) / 1000, 0.25);
       lastFrameTime = now;
       cameraRig.update(dt);
+      roadRenderer.update(dt);
       renderer.render(scene, camera);
     },
   );
