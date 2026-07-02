@@ -149,13 +149,18 @@ export class BuildQueue {
     }
 
     const clampedT = Math.max(0, Math.min(edge.length, job.t));
-    const { pos, heading } = sampleAt(edge.samples, clampedT);
+    let { pos, heading } = sampleAt(edge.samples, clampedT);
 
     if (stage === 'graded') {
       const nearest = nearestSampleIndex(edge.samples, clampedT);
       if (!edge.samples[nearest]?.bridge) {
         this.hf.flattenCircle(pos.x, pos.z, pos.y, GRADE_RADIUS);
       }
+    }
+
+    // demolish crews face the direction of travel (reverse)
+    if (job.demolish) {
+      heading += Math.PI;
     }
 
     this.bus.emit('construction:progress', {
