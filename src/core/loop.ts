@@ -20,7 +20,10 @@ export class Loop {
       if (!this.running) return;
       this.acc += Math.min((now - this.last) / 1000, 0.25) * this.timeScale;
       this.last = now;
-      const { steps, remainder } = stepAccumulator(this.acc, SIM_DT, 8);
+      // Scale the cap with timeScale: an unscaled cap of 8 silently throttles high HUD speeds
+      // (e.g. 16x only ever running 8 of the 16 steps/frame it needs at 60Hz).
+      const cap = Math.ceil(8 * Math.max(1, this.timeScale));
+      const { steps, remainder } = stepAccumulator(this.acc, SIM_DT, cap);
       for (let i = 0; i < steps; i++) this.update(SIM_DT);
       this.acc = remainder;
       this.render(this.acc / SIM_DT);

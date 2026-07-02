@@ -32,7 +32,9 @@ export function serialize(world: SerializableWorld): string {
     timeOfDay: world.timeOfDay,
     edges: [...world.graph.edges.values()].map((e) => ({ ctrl: e.ctrl, stage: e.stage })),
     growth: {
-      dev: world.growth.devLevels.slice(),
+      // Quantize to 3 decimals: dev is a smooth 0..1 accumulator, so this keeps save strings
+      // compact without any perceptible loss of fidelity when it's restored.
+      dev: world.growth.devLevels.map((v) => Math.round(v * 1000) / 1000),
       spawned: world.growth.spawned.slice(),
     },
   };
@@ -64,6 +66,19 @@ export function deserialize(json: string): SaveV1 | null {
     !Array.isArray(p.growth.spawned)
   ) {
     return null;
+  }
+  for (const e of p.edges) {
+    if (
+      typeof e !== 'object' ||
+      e === null ||
+      !Array.isArray((e as { ctrl?: unknown }).ctrl) ||
+      !(e as { ctrl: unknown[] }).ctrl.every(
+        (c) => typeof c === 'object' && c !== null && typeof (c as P2).x === 'number' && typeof (c as P2).z === 'number',
+      ) ||
+      !STAGES.includes((e as { stage?: unknown }).stage as Stage)
+    ) {
+      return null;
+    }
   }
   return p as SaveV1;
 }
@@ -106,6 +121,11 @@ export function restoreWorld(save: SaveV1, deps: RestoreDeps): void {
     const edge = graph.edges.get(edgeId);
     if (!edge) continue;
     edge.stage = saved.stage;
+
+    // Finding 1: forcing `edge.stage` above freezes construction forever unless the crew is
+    // told to pick back up where the save left off — resume a build job starting at the stage
+    // after the restored one (no-op for an already-`painted` edge).
+    queue?.enqueueResume(edgeId);
 
     if (STAGES.indexOf(saved.stage) >= STAGES.indexOf('graded')) {
       for (const s of edge.samples) {

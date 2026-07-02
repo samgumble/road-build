@@ -33,6 +33,8 @@ type BuildableStage = Exclude<Stage, 'surveyed'>;
 interface Job {
   edgeId: number;
   demolish: boolean;
+  /** Set by `enqueueResume`: the STAGES index a resumed build job should start at (skips already-completed stages). */
+  resumeAt?: number;
 }
 
 interface ActiveJob extends Job {
@@ -82,6 +84,25 @@ export class BuildQueue {
 
   private enqueueBuild(edgeId: number): void {
     this.queue.push({ edgeId, demolish: false });
+    this.maybeStartNext();
+  }
+
+  /**
+   * Resumes construction of an edge restored mid-build (Task 15 finding): `restoreWorld` forces
+   * `edge.stage` directly from the save rather than replaying the crew through it, so without this
+   * the edge would sit frozen at that stage forever. Enqueues a build job that starts at the stage
+   * AFTER the edge's current (completed) stage — e.g. `stage === 'gravel'` resumes at `'paved'`
+   * work, t=0 — and runs through `painted` exactly like a normal build. `'painted'` is already
+   * terminal (no-op). `'surveyed'` resumes at `'graded'`, i.e. a normal full build. Does not re-run
+   * grading or terrain deform for stages already completed: `stageIndex` is set to the *next*
+   * stage, so `update()`'s grading pass only fires if that next stage is itself `'graded'`.
+   */
+  enqueueResume(edgeId: number): void {
+    const edge = this.graph.edges.get(edgeId);
+    if (!edge) return;
+    if (edge.stage === 'painted') return;
+    const nextIndex = STAGES.indexOf(edge.stage) + 1;
+    this.queue.push({ edgeId, demolish: false, resumeAt: nextIndex });
     this.maybeStartNext();
   }
 
@@ -136,7 +157,8 @@ export class BuildQueue {
         }
         this.active = { edgeId: job.edgeId, demolish: true, stageIndex, t: edge.length };
       } else {
-        this.active = { edgeId: job.edgeId, demolish: false, stageIndex: STAGES.indexOf('graded'), t: 0 };
+        const stageIndex = job.resumeAt ?? STAGES.indexOf('graded');
+        this.active = { edgeId: job.edgeId, demolish: false, stageIndex, t: 0 };
       }
     }
   }

@@ -10,4 +10,10 @@ describe('stepAccumulator', () => {
   it('caps runaway steps', () => {
     expect(stepAccumulator(10, 1 / 60, 8).steps).toBe(8);
   });
+  it('honors a scaled cap so high time-scale is not silently throttled', () => {
+    // At timeScale 16, Loop scales the cap to Math.ceil(8 * 16) = 128, so 16/60s of
+    // accumulated time (the amount produced by one real 60Hz frame at 16x) should admit
+    // all 16 steps instead of being clamped to the unscaled cap of 8.
+    expect(stepAccumulator(16 / 60, 1 / 60, Math.ceil(8 * 16)).steps).toBe(16);
+  });
 });

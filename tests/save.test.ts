@@ -4,6 +4,7 @@ import { Heightfield } from '../src/sim/terrain/heightfield';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { makeSampler } from '../src/sim/roads/path';
 import { GrowthSim } from '../src/sim/growth/growth';
+import { BuildQueue } from '../src/sim/construction/queue';
 import { EventBus } from '../src/core/events';
 import { createRng } from '../src/core/rng';
 
@@ -12,7 +13,8 @@ function freshWorld(seed: string) {
   const hf = new Heightfield(seed, bus);
   const graph = new RoadGraph(bus, makeSampler(hf));
   const growth = new GrowthSim(graph, hf, bus, createRng(seed));
-  return { bus, hf, graph, growth };
+  const queue = new BuildQueue(graph, hf, bus);
+  return { bus, hf, graph, growth, queue };
 }
 
 describe('save/load', () => {
@@ -35,5 +37,36 @@ describe('save/load', () => {
   it('returns null for garbage or wrong version', () => {
     expect(deserialize('not json')).toBeNull();
     expect(deserialize(JSON.stringify({ version: 99 }))).toBeNull();
+  });
+  it('returns null when an edge has an invalid stage or malformed ctrl', () => {
+    const base = {
+      version: 1,
+      seed: 'x',
+      timeOfDay: 0,
+      growth: { dev: [], spawned: [] },
+    };
+    expect(
+      deserialize(JSON.stringify({ ...base, edges: [{ ctrl: [{ x: 0, z: 0 }], stage: 'bogus' }] })),
+    ).toBeNull();
+    expect(
+      deserialize(JSON.stringify({ ...base, edges: [{ ctrl: [{ x: 0 }], stage: 'graded' }] })),
+    ).toBeNull();
+    expect(
+      deserialize(JSON.stringify({ ...base, edges: [{ ctrl: 'not-an-array', stage: 'graded' }] })),
+    ).toBeNull();
+  });
+  it('resumes construction of mid-stage edges after restore', () => {
+    const w = freshWorld('resume-test');
+    let anchor = { x: 0, z: 0 };
+    outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+      if (w.hf.isLand(x, z) && w.hf.isLand(x + 32, z)) { anchor = { x, z }; break outer; }
+    const [id] = w.graph.commitChain([anchor, { x: anchor.x + 32, z: anchor.z }]);
+    w.graph.edges.get(id)!.stage = 'gravel'; // simulate autosave mid-build
+    const json = serialize({ seed: 'resume-test', timeOfDay: 0.5, graph: w.graph, growth: w.growth });
+    const w2 = freshWorld('resume-test');
+    restoreWorld(deserialize(json)!, w2);
+    const [rid] = [...w2.graph.edges.keys()];
+    for (let i = 0; i < 60 * 120; i++) w2.queue.update(1 / 60);
+    expect(w2.graph.edges.get(rid)!.stage).toBe('painted');
   });
 });
