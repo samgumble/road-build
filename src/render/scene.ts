@@ -22,7 +22,7 @@ export function createScene(canvas: HTMLCanvasElement): SceneRig {
   scene.background = new THREE.Color('#bcd9e8');
   scene.fog = new THREE.Fog('#bcd9e8', 400, 900);
 
-  const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 2000);
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 2, 2000);
   camera.position.set(340, 260, 340);
   camera.lookAt(0, 0, 0);
 

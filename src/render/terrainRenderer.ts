@@ -49,7 +49,9 @@ export class TerrainRenderer {
       metalness: 0.0,
     });
     this.water = new THREE.Mesh(waterGeo, waterMat);
-    this.water.position.y = WATER_LEVEL;
+    // sit a hair below WATER_LEVEL so shoreline triangles crossing y=0 don't z-fight
+    this.water.position.y = WATER_LEVEL - 0.06;
+    this.water.renderOrder = 1;
     this.water.receiveShadow = true;
     scene.add(this.water);
 
