@@ -13,6 +13,8 @@ import { BuildQueue } from './sim/construction/queue';
 import { ConstructionRenderer } from './render/constructionRenderer';
 import { TrafficSim } from './sim/traffic/traffic';
 import { CarRenderer } from './render/carRenderer';
+import { GrowthSim } from './sim/growth/growth';
+import { SceneryRenderer } from './render/sceneryRenderer';
 
 function showNoGl(): void {
   const app = document.getElementById('app');
@@ -61,6 +63,9 @@ function main(): void {
   traffic.targetPopulation = 6; // Task 13 scales this with houses: 6 + houses, capped at 80
   const carRenderer = new CarRenderer(scene);
 
+  const growth = new GrowthSim(graph, hf, bus, createRng('growth-' + hf.seed));
+  const sceneryRenderer = new SceneryRenderer(scene, hf, bus);
+
   const cameraRig = new CameraRig(camera, canvas);
 
   // Draw tool owns LMB (survey preview + stakes + commit, demolish-click); exposed here so a
@@ -71,11 +76,19 @@ function main(): void {
   (window as unknown as { __drawTool: DrawTool }).__drawTool = drawTool;
 
   let lastFrameTime = performance.now();
+  let populationTimer = 0;
 
   const loop = new Loop(
     (dt) => {
       buildQueue.update(dt);
       traffic.update(dt);
+      growth.update(dt);
+
+      populationTimer += dt;
+      if (populationTimer >= 1) {
+        populationTimer -= 1;
+        traffic.targetPopulation = Math.min(80, 6 + growth.houseCount);
+      }
     },
     () => {
       const now = performance.now();
@@ -87,6 +100,7 @@ function main(): void {
       // Task 14 wires real night flag
       constructionRenderer.update(dt, false);
       carRenderer.update(traffic.cars, false);
+      sceneryRenderer.update(dt);
       renderer.render(scene, camera);
     },
   );

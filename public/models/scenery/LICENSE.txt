@@ -1,0 +1,36 @@
+Scenery models: Kenney "Nature Kit" (v2.1), "City Kit (Suburban)" (v2.0), and
+"City Kit (Commercial)" (v2.1)
+Source:
+- https://kenney.nl/assets/nature-kit
+- https://kenney.nl/assets/city-kit-suburban
+- https://kenney.nl/assets/city-kit-commercial
+Author: Kenney (www.kenney.nl)
+
+License: Creative Commons Zero v1.0 Universal (CC0 1.0)
+https://creativecommons.org/publicdomain/zero/1.0/
+
+You can use this content for personal, educational, and commercial purposes,
+with no attribution required (crediting "Kenney" / "www.kenney.nl" is
+appreciated but not required).
+
+Files included in this directory (a small subset of each pack, selected for
+tree/house/building silhouettes suitable for stylized development scenery):
+
+nature/ (from Nature Kit, self-contained flat-color materials, no textures)
+- tree_default.glb      (round deciduous tree)
+- tree_pineRoundC.glb   (rounded pine)
+- tree_pineTallA.glb    (tall pine)
+
+suburban/ (from City Kit (Suburban); models reference suburban/Textures/colormap.png)
+- building-type-a.glb   (small house)
+- building-type-c.glb   (small house, alternate roofline)
+- Textures/colormap.png
+
+commercial/ (from City Kit (Commercial); model references commercial/Textures/colormap.png)
+- building-skyscraper-e.glb (taller multi-story building)
+- Textures/colormap.png
+
+Downloaded verbatim from the official Kenney CDN on 2026-07-02; no
+modifications were made to the GLB or texture files themselves (only moved
+into per-pack subdirectories alongside their own Textures/colormap.png so each
+GLB's relative texture URI still resolves).
