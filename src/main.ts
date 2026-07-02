@@ -8,7 +8,7 @@ import { CameraRig } from './input/cameraRig';
 import { DrawTool } from './input/drawTool';
 import { RoadGraph } from './sim/roads/graph';
 import { makeSampler } from './sim/roads/path';
-import type { Stage } from './core/types';
+import { BuildQueue } from './sim/construction/queue';
 
 function showNoGl(): void {
   const app = document.getElementById('app');
@@ -50,29 +50,22 @@ function main(): void {
 
   const graph = new RoadGraph(bus, makeSampler(hf));
   const roadRenderer = new RoadRenderer(scene, graph, bus, hf);
+  const buildQueue = new BuildQueue(graph, hf, bus);
 
   const cameraRig = new CameraRig(camera, canvas);
 
   // Draw tool owns LMB (survey preview + stakes + commit, demolish-click); exposed here so a
   // later HUD task (Task 15) can flip `drawTool.mode` between 'draw' / 'demolish' / 'none'.
-  const drawTool = new DrawTool(canvas, camera, terrain.mesh, graph, hf, scene);
+  const drawTool = new DrawTool(canvas, camera, terrain.mesh, graph, hf, scene, (edgeId) =>
+    buildQueue.enqueueDemolish(edgeId),
+  );
   (window as unknown as { __drawTool: DrawTool }).__drawTool = drawTool;
-
-  // --- temporary debug hook (Task 7 visual verification; remove once construction sim lands) ---
-  (window as unknown as { __debugStage: (edgeId: number, stage: Stage) => void }).__debugStage =
-    (edgeId, stage) => {
-      const edge = graph.edges.get(edgeId);
-      if (!edge) return;
-      edge.stage = stage;
-      bus.emit('construction:stage', { edgeId, stage });
-    };
-  // --- end temporary debug hook ---
 
   let lastFrameTime = performance.now();
 
   const loop = new Loop(
-    () => {
-      // sim update — no gameplay systems yet
+    (dt) => {
+      buildQueue.update(dt);
     },
     () => {
       const now = performance.now();

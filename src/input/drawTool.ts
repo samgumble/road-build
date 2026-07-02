@@ -66,6 +66,7 @@ export class DrawTool {
     private graph: RoadGraph,
     private hf: Heightfield,
     private scene: THREE.Scene,
+    private demolish: (edgeId: number) => void = (edgeId) => graph.removeEdge(edgeId),
   ) {
     this.sampler = makeSampler(hf);
 
@@ -266,8 +267,7 @@ export class DrawTool {
   private tryDemolishAt(clientX: number, clientY: number): void {
     const found = this.findRoadEdgeAt(clientX, clientY);
     if (!found) return;
-    // Task 9 swaps this to queue.enqueueDemolish
-    this.graph.removeEdge(found.edgeId);
+    this.demolish(found.edgeId);
     this.hoverVisible = false;
     this.hoverRing.visible = false;
   }
