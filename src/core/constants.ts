@@ -1,0 +1,10 @@
+export const WORLD_SIZE = 512;
+export const GRID_SIZE = 129;
+export const CELL = WORLD_SIZE / (GRID_SIZE - 1); // 4
+export const SNAP = 8;
+export const WATER_LEVEL = 0;
+export const ROAD_WIDTH = 6;
+export const LANE_OFFSET = 1.5;
+export const MAX_ROAD_GRADE = 0.35;
+export const SIM_DT = 1 / 60;
+export const DAY_LENGTH = 240;
