@@ -5,6 +5,7 @@ import { createScene } from './render/scene';
 import { TerrainRenderer } from './render/terrainRenderer';
 import { RoadRenderer } from './render/roadRenderer';
 import { CameraRig } from './input/cameraRig';
+import { DrawTool } from './input/drawTool';
 import { RoadGraph } from './sim/roads/graph';
 import { makeSampler } from './sim/roads/path';
 import type { Stage } from './core/types';
@@ -46,17 +47,18 @@ function main(): void {
   const bus = new EventBus();
   const hf = new Heightfield('terra-1', bus);
   const terrain = new TerrainRenderer(scene, hf, bus);
-  void terrain;
 
   const graph = new RoadGraph(bus, makeSampler(hf));
   const roadRenderer = new RoadRenderer(scene, graph, bus, hf);
 
   const cameraRig = new CameraRig(camera, canvas);
 
-  // --- temporary debug hooks (Task 7 visual verification; remove once construction sim + UI land) ---
-  (window as unknown as { __debugRoad: (pts: [number, number][]) => number[] }).__debugRoad =
-    (pts) => graph.commitChain(pts.map(([x, z]) => ({ x, z })));
+  // Draw tool owns LMB (survey preview + stakes + commit, demolish-click); exposed here so a
+  // later HUD task (Task 15) can flip `drawTool.mode` between 'draw' / 'demolish' / 'none'.
+  const drawTool = new DrawTool(canvas, camera, terrain.mesh, graph, hf, scene);
+  (window as unknown as { __drawTool: DrawTool }).__drawTool = drawTool;
 
+  // --- temporary debug hook (Task 7 visual verification; remove once construction sim lands) ---
   (window as unknown as { __debugStage: (edgeId: number, stage: Stage) => void }).__debugStage =
     (edgeId, stage) => {
       const edge = graph.edges.get(edgeId);
@@ -64,7 +66,7 @@ function main(): void {
       edge.stage = stage;
       bus.emit('construction:stage', { edgeId, stage });
     };
-  // --- end temporary debug hooks ---
+  // --- end temporary debug hook ---
 
   let lastFrameTime = performance.now();
 
@@ -78,6 +80,7 @@ function main(): void {
       lastFrameTime = now;
       cameraRig.update(dt);
       roadRenderer.update(dt);
+      drawTool.update(dt);
       renderer.render(scene, camera);
     },
   );
