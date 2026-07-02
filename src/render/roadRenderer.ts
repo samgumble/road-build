@@ -420,7 +420,6 @@ export class RoadRenderer {
     if (!runs.length) return;
 
     const pts = cumulativeDistances(samples);
-    const perps = perpendicularsFor(pts);
 
     for (const run of runs) {
       // side rails: real 0.4 (wide) x 0.8 (tall) box cross-sections following the deck curve,
@@ -428,12 +427,13 @@ export class RoadRenderer {
       const railOffset = ROAD_WIDTH / 2 - 0.2;
       for (const side of [-1, 1]) {
         const railGeo = buildRailBoxGeometry(
-          pts,
-          perps,
+          samples,
+          side * railOffset,
+          BRIDGE_RAIL_WIDTH,
+          BRIDGE_RAIL_HEIGHT,
+          STAGE_YLIFT.paved,
           run.fromDist,
           run.toDist,
-          side * railOffset,
-          STAGE_YLIFT.paved,
         );
         const railMat = makeStandardMaterial(BRIDGE_COLOR);
         this.addMesh(v, railGeo, railMat);
@@ -495,33 +495,44 @@ export class RoadRenderer {
 /**
  * Builds a solid rectangular-cross-section "box rail" that follows the deck curve.
  *
- * The rail's centerline is the input polyline (`pts`) shifted sideways by `sideOffset` along
- * each sample's XZ perpendicular (`perps`). At each retained sample the cross-section is a
- * `BRIDGE_RAIL_WIDTH` (across, along the perpendicular) x `BRIDGE_RAIL_HEIGHT` (vertical) rectangle
- * whose bottom sits at `deckY + yLift` and whose top is `BRIDGE_RAIL_HEIGHT` above that. Consecutive
- * rings are stitched into quads (2 triangles each) for the outer, top, inner, and bottom faces; the
- * two open ends are capped with a single quad each. Vertex normals are computed afterward via
- * `computeVertexNormals()` for flat/box-like shading.
+ * `samples` is a plain array of deck points (`{x,y,z}`, in order along the curve); arclength
+ * distances and per-sample XZ perpendiculars are derived internally. The rail's centerline is
+ * that polyline shifted sideways by `sideOffset` along each sample's perpendicular. At each
+ * retained sample the cross-section is a `width` (across, along the perpendicular) x `height`
+ * (vertical) rectangle whose bottom sits at `deckY + yLift` and whose top is `height` above that.
+ * Consecutive rings are stitched into quads (2 triangles each) for the outer, top, inner, and
+ * bottom faces, each wound so its normal points away from the box's interior (outer -> +perp,
+ * top -> +Y, inner -> -perp, bottom -> -Y); the two open ends are capped with a single quad each,
+ * wound to face away from the box along -tangent (start) / +tangent (end). Vertex normals are
+ * computed afterward via `computeVertexNormals()` for flat/box-like shading.
+ *
+ * `from`/`to` optionally restrict the build to an arclength sub-range (defaults to the full
+ * length of `samples`).
  */
-function buildRailBoxGeometry(
-  pts: SamplePoint[],
-  perps: Array<{ px: number; pz: number }>,
-  from: number,
-  to: number,
+export function buildRailBoxGeometry(
+  samples: Array<{ x: number; y: number; z: number }>,
   sideOffset: number,
-  yLift: number,
+  width: number = BRIDGE_RAIL_WIDTH,
+  height: number = BRIDGE_RAIL_HEIGHT,
+  yLift: number = 0,
+  from?: number,
+  to?: number,
 ): THREE.BufferGeometry {
   const geo = new THREE.BufferGeometry();
-  if (pts.length < 2 || to <= from) return geo;
+  const pts = cumulativeDistances(samples.map((s) => ({ x: s.x, y: s.y, z: s.z, bridge: false })));
+  const perps = perpendicularsFor(pts);
+  const lo0 = from ?? 0;
+  const hi0 = to ?? (pts.length ? pts[pts.length - 1].dist : 0);
+  if (pts.length < 2 || hi0 <= lo0) return geo;
 
   const total = pts[pts.length - 1].dist;
-  const lo = Math.max(0, from);
-  const hi = Math.min(total, to);
+  const lo = Math.max(0, lo0);
+  const hi = Math.min(total, hi0);
   if (hi <= lo) return geo;
 
-  const half = BRIDGE_RAIL_WIDTH / 2;
+  const half = width / 2;
   const bottomY = yLift;
-  const topY = yLift + BRIDGE_RAIL_HEIGHT;
+  const topY = yLift + height;
 
   // Collect the ordered (point, perp) samples spanning [lo, hi], including interpolated
   // boundary samples at exactly lo and hi (mirrors buildRibbonGeometry's boundary handling).
@@ -601,21 +612,22 @@ function buildRailBoxGeometry(
     const ob0 = r0, ot0 = r0 + 1, it0 = r0 + 2, ib0 = r0 + 3;
     const ob1 = r1, ot1 = r1 + 1, it1 = r1 + 2, ib1 = r1 + 3;
 
-    // Outer face (facing +perp)
-    quad(ob0, ot0, ot1, ob1);
+    // Outer face (facing +perp, away from the rail's own centerline)
+    quad(ob0, ob1, ot1, ot0);
     // Top face (facing +Y)
-    quad(ot0, it0, it1, ot1);
-    // Inner face (facing -perp)
-    quad(it0, ib0, ib1, it1);
+    quad(ot0, ot1, it1, it0);
+    // Inner face (facing -perp, toward the rail's own centerline)
+    quad(it0, it1, ib1, ib0);
     // Bottom face (facing -Y)
-    quad(ib0, ob0, ob1, ib1);
+    quad(ib0, ib1, ob1, ob0);
   }
 
-  // End caps (start and end rings), each a single quad closing the rectangle.
+  // End caps (start and end rings), each a single quad closing the rectangle, wound to
+  // face away from the box along -tangent (start) / +tangent (end).
   const startR = ringIndices[0];
-  quad(startR + 3, startR + 2, startR + 1, startR); // inner-bottom, inner-top, outer-top, outer-bottom
+  quad(startR + 3, startR, startR + 1, startR + 2); // inner-bottom, outer-bottom, outer-top, inner-top
   const endR = ringIndices[ringIndices.length - 1];
-  quad(endR, endR + 1, endR + 2, endR + 3); // outer-bottom, outer-top, inner-top, inner-bottom
+  quad(endR, endR + 3, endR + 2, endR + 1); // outer-bottom, inner-bottom, inner-top, outer-top
 
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setIndex(indices);
