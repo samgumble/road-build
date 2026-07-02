@@ -90,6 +90,38 @@ export class GrowthSim {
     return this.records;
   }
 
+  /** Read-only view of the per-cell development accumulator, for save serialization. */
+  get devLevels(): ReadonlyArray<number> {
+    return Array.from(this.dev);
+  }
+
+  /**
+   * Restores sim state from a save (Task 15): replaces the `dev` accumulator and replays the
+   * `spawned` list directly into `records`/`houses`/`spawnMask` without re-emitting `growth:spawn`
+   * (the caller is responsible for restoring the renderer separately, e.g. via
+   * `SceneryRenderer.rebuild()`, so scenery pops back in with no animation). Thresholds already
+   * crossed by the restored `dev` level are marked in `spawnMask` so `update()` won't re-spawn them.
+   * Triggers a road-distance recompute on the next `update()` since the graph was just rebuilt too.
+   */
+  restore(dev: ArrayLike<number>, spawned: ReadonlyArray<SpawnRecord>): void {
+    this.dev.set(dev);
+    this.spawnMask.fill(0);
+    this.records = spawned.slice();
+    this.houses = this.records.filter((r) => r.kind === 'house').length;
+
+    for (let j = 0; j < GRID_SIZE; j++) {
+      for (let i = 0; i < GRID_SIZE; i++) {
+        const idx = cellIndex(i, j);
+        const level = this.dev[idx];
+        for (const th of THRESHOLDS) {
+          if (level >= th.value) this.spawnMask[idx] |= th.bit;
+        }
+      }
+    }
+
+    this.recomputePending = true;
+  }
+
   private recomputeRoadDist(): void {
     this.roadDist.fill(-1);
     const queue: number[] = [];

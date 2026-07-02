@@ -66,6 +66,20 @@ export class BuildQueue {
     return this.queue.length + (this.active ? 1 : 0);
   }
 
+  /**
+   * Drops any pending or active job for `edgeId` without touching the graph (Task 15 restore):
+   * `commitChain` auto-enqueues a fresh build job via `roads:edgeAdded`, but save/load forces the
+   * edge's stage directly, so that auto-enqueued job must be discarded rather than left to
+   * "rebuild" an edge that's already at its restored stage.
+   */
+  clearPending(edgeId: number): void {
+    this.queue = this.queue.filter((j) => j.edgeId !== edgeId);
+    if (this.active && this.active.edgeId === edgeId) {
+      this.active = null;
+      this.maybeStartNext();
+    }
+  }
+
   private enqueueBuild(edgeId: number): void {
     this.queue.push({ edgeId, demolish: false });
     this.maybeStartNext();

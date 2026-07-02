@@ -16,6 +16,29 @@ import { CarRenderer } from './render/carRenderer';
 import { GrowthSim } from './sim/growth/growth';
 import { SceneryRenderer } from './render/sceneryRenderer';
 import { Atmosphere } from './render/atmosphere';
+import { Hud, randomSeed } from './ui/hud';
+import { serialize, deserialize, restoreWorld } from './sim/save';
+
+const SAVE_KEY = 'groundwork-save';
+const AUTOSAVE_INTERVAL = 10; // seconds
+
+function resolveSeed(): { seed: string; fromUrl: boolean } {
+  const params = new URLSearchParams(window.location.search);
+  const urlSeed = params.get('seed');
+  if (urlSeed) return { seed: urlSeed, fromUrl: true };
+
+  try {
+    const raw = window.localStorage.getItem(SAVE_KEY);
+    if (raw) {
+      const save = deserialize(raw);
+      if (save) return { seed: save.seed, fromUrl: false };
+    }
+  } catch {
+    // localStorage unavailable (private mode, etc.) — fall through to a fresh random seed
+  }
+
+  return { seed: randomSeed(), fromUrl: false };
+}
 
 function showNoGl(): void {
   const app = document.getElementById('app');
@@ -51,8 +74,10 @@ function main(): void {
 
   const { renderer, scene, camera, sun, hemi } = rig;
 
+  const { seed } = resolveSeed();
+
   const bus = new EventBus();
-  const hf = new Heightfield('terra-1', bus);
+  const hf = new Heightfield(seed, bus);
   const terrain = new TerrainRenderer(scene, hf, bus);
 
   const graph = new RoadGraph(bus, makeSampler(hf));
@@ -72,12 +97,11 @@ function main(): void {
   const atmosphere = new Atmosphere(scene, sun, hemi, renderer, bus, createRng('atmosphere-' + hf.seed));
   atmosphere.setCameraTarget(cameraRig.target);
 
-  // Draw tool owns LMB (survey preview + stakes + commit, demolish-click); exposed here so a
-  // later HUD task (Task 15) can flip `drawTool.mode` between 'draw' / 'demolish' / 'none'.
+  // Draw tool owns LMB (survey preview + stakes + commit, demolish-click); `drawTool.mode` is
+  // flipped between 'draw' / 'demolish' / 'none' by the HUD toolbar below.
   const drawTool = new DrawTool(canvas, camera, terrain.mesh, graph, hf, scene, (edgeId) =>
     buildQueue.enqueueDemolish(edgeId),
   );
-  (window as unknown as { __drawTool: DrawTool }).__drawTool = drawTool;
 
   let lastFrameTime = performance.now();
   let populationTimer = 0;
@@ -108,6 +132,59 @@ function main(): void {
       renderer.render(scene, camera);
     },
   );
+
+  // Boot-load: restore from a same-seed save if one exists, with a graceful fallback to a fresh
+  // world on corrupt/missing/mismatched-seed data (deserialize already returns null for those).
+  let restoredRoads = false;
+  try {
+    const raw = window.localStorage.getItem(SAVE_KEY);
+    if (raw) {
+      const save = deserialize(raw);
+      if (save && save.seed === seed) {
+        restoreWorld(save, { bus, hf, graph, growth, queue: buildQueue });
+        sceneryRenderer.rebuild(growth.spawned);
+        atmosphere.timeOfDay = save.timeOfDay;
+        restoredRoads = save.edges.length > 0;
+      }
+    }
+  } catch {
+    // Corrupt localStorage entry or storage unavailable — proceed with the freshly generated world.
+  }
+
+  const hud = new Hud({
+    bus,
+    drawTool,
+    loop,
+    seed,
+    renderFrame: () => renderer.render(scene, camera),
+    canvas,
+    onNewWorld: (newSeed) => {
+      try {
+        window.localStorage.removeItem(SAVE_KEY);
+      } catch {
+        // ignore
+      }
+      const url = new URL(window.location.href);
+      url.searchParams.set('seed', newSeed);
+      window.location.search = url.searchParams.toString();
+    },
+  });
+  hud.suppressHintIfRoadsExist(restoredRoads);
+
+  const save = () => {
+    try {
+      const json = serialize({ seed, timeOfDay: atmosphere.timeOfDay, graph, growth });
+      window.localStorage.setItem(SAVE_KEY, json);
+    } catch {
+      // localStorage unavailable/full — autosave silently no-ops rather than crashing the game
+    }
+  };
+
+  window.setInterval(save, AUTOSAVE_INTERVAL * 1000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') save();
+  });
+
   loop.start();
 }
 
