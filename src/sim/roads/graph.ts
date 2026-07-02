@@ -88,6 +88,7 @@ export class RoadGraph {
       const a = this.addNode(sub[0]);
       const b = this.addNode(sub[sub.length - 1]);
       if (a === b) continue;
+      if (sub.length === 2 && this.hasEdgeBetween(a, b)) continue;
       const id = this.makeEdge(a, b, sub, 'surveyed');
       ids.push(id);
       this.bus.emit('roads:edgeAdded', { edgeId: id });
@@ -110,6 +111,13 @@ export class RoadGraph {
     }
     this.bus.emit('roads:edgeRemoved', { edgeId });
     this.bus.emit('roads:changed', {});
+  }
+
+  private hasEdgeBetween(a: number, b: number): boolean {
+    for (const e of this.edges.values()) {
+      if ((e.a === a && e.b === b) || (e.a === b && e.b === a)) return true;
+    }
+    return false;
   }
 
   edgesAtNode(nodeId: number): number[] {

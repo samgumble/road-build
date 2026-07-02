@@ -35,6 +35,17 @@ describe('RoadGraph', () => {
     expect(g.edges.size).toBe(3);               // two halves + the new road
     expect(g.nodes.size).toBe(4);
   });
+  it('does not create a duplicate parallel edge when a chain retraces an existing edge between two interior points', () => {
+    const g = mk();
+    g.commitChain([{ x: 0, z: 0 }, { x: 8, z: 0 }, { x: 16, z: 0 }, { x: 24, z: 0 }, { x: 32, z: 0 }]);
+    g.commitChain([{ x: 8, z: 16 }, { x: 8, z: 0 }, { x: 24, z: 0 }, { x: 24, z: 16 }]);
+    // original split into 3 at the two cut points, plus the two new stubs = 5 edges
+    expect(g.edges.size).toBe(5);
+    // no two edges share the same unordered node pair
+    const pairs = [...g.edges.values()].map((e) => [e.a, e.b].sort().join('-'));
+    expect(new Set(pairs).size).toBe(pairs.length);
+    expect(g.nodes.size).toBe(6);
+  });
   it('removeEdge prunes orphan nodes and emits events', () => {
     const bus = new EventBus();
     const g = new RoadGraph(bus, stubSampler);
