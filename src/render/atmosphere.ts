@@ -136,7 +136,7 @@ export class Atmosphere {
   }
 
   get night(): boolean {
-    return sunElevation(this.timeOfDay) < 0;
+    return this.wasNight;
   }
 
   private buildClouds(): void {
