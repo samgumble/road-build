@@ -9,7 +9,7 @@ import type { Heightfield } from '../sim/terrain/heightfield';
 const REBUILD_THROTTLE = 0.15; // seconds, per edge, during progress events
 const SHEEN_DURATION = 25; // seconds for fresh-asphalt roughness lerp
 
-const STAGE_COLOR: Record<Stage, string> = {
+export const STAGE_COLOR: Record<Stage, string> = {
   surveyed: '#e8641b',
   graded: '#8a6f4d',
   gravel: '#9b958a',
@@ -23,8 +23,8 @@ const STAGE_COLOR: Record<Stage, string> = {
 // module. Mirroring it lets the road ribbon show a slightly darker "already compacted" shade
 // behind the roller's position and the lighter freshly-laid color ahead of it, without having to
 // thread the roller's position through the construction:progress event contract.
-const ROLLER_TRAIL_DISTANCE = 8;
-const PAVED_COMPACTED_COLOR = '#2f3234'; // paved, darkened ~20% — compacted asphalt behind the roller
+export const ROLLER_TRAIL_DISTANCE = 8;
+export const PAVED_COMPACTED_COLOR = '#2f3234'; // paved, darkened ~20% — compacted asphalt behind the roller
 
 const STAGE_YLIFT: Record<Stage, number> = {
   surveyed: 0.02,
