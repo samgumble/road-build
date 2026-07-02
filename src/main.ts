@@ -15,6 +15,7 @@ import { TrafficSim } from './sim/traffic/traffic';
 import { CarRenderer } from './render/carRenderer';
 import { GrowthSim } from './sim/growth/growth';
 import { SceneryRenderer } from './render/sceneryRenderer';
+import { Atmosphere } from './render/atmosphere';
 
 function showNoGl(): void {
   const app = document.getElementById('app');
@@ -48,7 +49,7 @@ function main(): void {
     return;
   }
 
-  const { renderer, scene, camera } = rig;
+  const { renderer, scene, camera, sun, hemi } = rig;
 
   const bus = new EventBus();
   const hf = new Heightfield('terra-1', bus);
@@ -67,6 +68,9 @@ function main(): void {
   const sceneryRenderer = new SceneryRenderer(scene, hf, bus);
 
   const cameraRig = new CameraRig(camera, canvas);
+
+  const atmosphere = new Atmosphere(scene, sun, hemi, renderer, bus, createRng('atmosphere-' + hf.seed));
+  atmosphere.setCameraTarget(cameraRig.target);
 
   // Draw tool owns LMB (survey preview + stakes + commit, demolish-click); exposed here so a
   // later HUD task (Task 15) can flip `drawTool.mode` between 'draw' / 'demolish' / 'none'.
@@ -97,9 +101,9 @@ function main(): void {
       cameraRig.update(dt);
       roadRenderer.update(dt);
       drawTool.update(dt);
-      // Task 14 wires real night flag
-      constructionRenderer.update(dt, false);
-      carRenderer.update(traffic.cars, false);
+      atmosphere.update(dt);
+      constructionRenderer.update(dt, atmosphere.night);
+      carRenderer.update(traffic.cars, atmosphere.night);
       sceneryRenderer.update(dt);
       renderer.render(scene, camera);
     },
