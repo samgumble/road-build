@@ -9,6 +9,7 @@ import { DrawTool } from './input/drawTool';
 import { RoadGraph } from './sim/roads/graph';
 import { makeSampler } from './sim/roads/path';
 import { BuildQueue } from './sim/construction/queue';
+import { ConstructionRenderer } from './render/constructionRenderer';
 
 function showNoGl(): void {
   const app = document.getElementById('app');
@@ -51,6 +52,7 @@ function main(): void {
   const graph = new RoadGraph(bus, makeSampler(hf));
   const roadRenderer = new RoadRenderer(scene, graph, bus, hf);
   const buildQueue = new BuildQueue(graph, hf, bus);
+  const constructionRenderer = new ConstructionRenderer(scene, bus, graph);
 
   const cameraRig = new CameraRig(camera, canvas);
 
@@ -74,6 +76,8 @@ function main(): void {
       cameraRig.update(dt);
       roadRenderer.update(dt);
       drawTool.update(dt);
+      // Task 14 wires real night flag
+      constructionRenderer.update(dt, false);
       renderer.render(scene, camera);
     },
   );
