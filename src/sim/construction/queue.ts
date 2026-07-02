@@ -57,7 +57,20 @@ export class BuildQueue {
     private hf: Heightfield,
     private bus: EventBus,
   ) {
-    this.bus.on('roads:edgeAdded', ({ edgeId }) => this.enqueueBuild(edgeId));
+    // Important 2: `splitEdge` (see graph.ts) inherits the split edge's stage into both halves —
+    // splitting a painted (or otherwise partially-built) road happens whenever a newly-drawn chain
+    // crosses/branches off an existing road, via `commitChain`. Unconditionally enqueuing a fresh
+    // 'graded'-start build job here would tear a completed road back down to dirt and rebuild it
+    // from scratch for both halves. Branch on the edge's actual stage: a genuinely new edge is
+    // always born 'surveyed' (see `RoadGraph.makeEdge`'s callers), so only that stage gets a normal
+    // build job; anything already past 'surveyed' (i.e. a split-off half of a previously-built
+    // road) resumes via `enqueueResume`, which is a no-op for an already-'painted' half.
+    this.bus.on('roads:edgeAdded', ({ edgeId }) => {
+      const edge = this.graph.edges.get(edgeId);
+      if (!edge) return;
+      if (edge.stage === 'surveyed') this.enqueueBuild(edgeId);
+      else this.enqueueResume(edgeId);
+    });
   }
 
   get busy(): boolean {
@@ -115,22 +128,38 @@ export class BuildQueue {
         // t currently measures forward progress into `stageIndex`; walking in reverse from here
         // is fine as-is — the reverse loop in update() treats t as "remaining distance in this
         // stage's pass" once demolish is true, so we keep t as the current forward progress and
-        // count down from it.
+        // count down from it. Verified this also holds for a job that reached "active" via
+        // `enqueueResume`'s `resumeAt` seeding (restore mid-build, see save.ts): `resumeAt` only
+        // ever seeds `stageIndex` (which stage we're in) with `t` starting at 0 for that stage
+        // (maybeStartNext's else-branch always sets `t: 0`) — `t` is never seeded as a global
+        // arclength offset. So regardless of how this job became active, `t` is always "forward
+        // distance into the *current* stageIndex's pass," which is exactly what the reverse walk
+        // below expects; no special-casing needed for resumed jobs.
       }
       return;
     }
 
-    // If a build job for this edge is still only queued (not started), it hasn't touched the
-    // graph beyond 'surveyed' — drop the pending build job and remove the edge immediately
-    // (still at the born stage, so there's nothing to walk back through).
+    // If a build job for this edge is still only queued (not started) AND the edge itself hasn't
+    // progressed past 'surveyed', there's genuinely nothing built yet — drop the pending build job
+    // and remove the edge immediately (instant-remove shortcut, no demolition walk needed).
+    // Important 2: a pending job can also exist for an edge that's already NOT 'surveyed' — e.g.
+    // a `splitEdge` half that inherited a 'painted'/'gravel'/etc. stage and got an `enqueueResume`
+    // job queued behind an unrelated active job. That edge has real built structure to walk back
+    // through, so it must get a proper demolition (the branch below), not the instant-remove
+    // shortcut, even though its job is technically still "pending".
+    const edge = this.graph.edges.get(edgeId);
     const pendingIdx = this.queue.findIndex((j) => j.edgeId === edgeId && !j.demolish);
-    if (pendingIdx !== -1) {
+    if (pendingIdx !== -1 && edge?.stage === 'surveyed') {
       this.queue.splice(pendingIdx, 1);
-      if (this.graph.edges.has(edgeId)) {
-        this.graph.removeEdge(edgeId);
-        this.bus.emit('construction:stage', { edgeId, stage: 'removed' });
-      }
+      this.graph.removeEdge(edgeId);
+      this.bus.emit('construction:stage', { edgeId, stage: 'removed' });
       return;
+    }
+    if (pendingIdx !== -1) {
+      // Non-surveyed edge with a pending (not yet started) resume/build job: drop that pending
+      // job — the demolish job queued below will handle it — so the crew doesn't try to resume
+      // building an edge that's about to be torn down out from under it.
+      this.queue.splice(pendingIdx, 1);
     }
 
     // Otherwise: already-built (or partially built and now idle, which shouldn't happen since
@@ -232,6 +261,14 @@ export class BuildQueue {
         job.t = 0;
       }
     } else if (job.demolish && job.t <= 0) {
+      // Important 4: cars only route over 'painted' edges (see TrafficSim's lane rebuild), and
+      // that lane/route cache is only recomputed on `roads:changed`. Previously this event only
+      // fired once, at final removal — so a demolition crew could walk an edge backward from
+      // 'painted' through 'paved'/'gravel'/'graded' while traffic kept routing cars straight
+      // through the (now-torn-up) road the whole time. The very first backward step off
+      // 'painted' is exactly the moment the edge stops being drivable, so that's when
+      // TrafficSim needs to rebuild lanes and despawn cars on it — not later at removal.
+      const wasPainted = edge.stage === 'painted';
       const prevIndex = job.stageIndex - 1;
       if (prevIndex < STAGES.indexOf('graded')) {
         this.graph.removeEdge(job.edgeId);
@@ -242,6 +279,7 @@ export class BuildQueue {
         const prevStage = STAGES[prevIndex] as Stage;
         edge.stage = prevStage;
         this.bus.emit('construction:stage', { edgeId: job.edgeId, stage: prevStage });
+        if (wasPainted) this.bus.emit('roads:changed', {});
         job.stageIndex = prevIndex;
         job.t = edge.length;
       }

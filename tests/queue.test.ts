@@ -6,17 +6,21 @@ import { makeSampler } from '../src/sim/roads/path';
 import { EventBus } from '../src/core/events';
 import type { Stage } from '../src/core/types';
 
+function findAnchor(hf: Heightfield, span: number): { x: number; z: number } {
+  let anchor = { x: 0, z: 0 };
+  outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+    if (hf.isLand(x, z) && hf.isLand(x + span, z)) { anchor = { x, z }; break outer; }
+  return anchor;
+}
+
 function setup() {
   const bus = new EventBus();
   const hf = new Heightfield('q-test', bus);
   const graph = new RoadGraph(bus, makeSampler(hf));
   const queue = new BuildQueue(graph, hf, bus);
-  // find land chain
-  let anchor = { x: 0, z: 0 };
-  outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
-    if (hf.isLand(x, z) && hf.isLand(x + 32, z)) { anchor = { x, z }; break outer; }
+  const anchor = findAnchor(hf, 32);
   const [edgeId] = graph.commitChain([anchor, { x: anchor.x + 32, z: anchor.z }]);
-  return { bus, hf, graph, queue, edgeId };
+  return { bus, hf, graph, queue, edgeId, anchor };
 }
 
 const run = (queue: BuildQueue, seconds: number) => {
@@ -48,5 +52,103 @@ describe('BuildQueue', () => {
     run(queue, 120);
     expect(stages[stages.length - 1]).toBe('removed');
     expect(graph.edges.has(edgeId)).toBe(false);
+  });
+  it('demolish emits roads:changed as soon as the edge drops from painted, not only at final removal', () => {
+    const { bus, queue, edgeId } = setup();
+    run(queue, 120); // fully built to 'painted'
+    let changedCount = 0;
+    let firstChangeStage: Stage | 'removed' | null = null;
+    const stagesAtChange: (Stage | 'removed')[] = [];
+    let lastStage: Stage | 'removed' = 'painted';
+    bus.on('construction:stage', (e) => { lastStage = e.stage; });
+    bus.on('roads:changed', () => {
+      changedCount++;
+      if (firstChangeStage === null) firstChangeStage = lastStage;
+      stagesAtChange.push(lastStage);
+    });
+    queue.enqueueDemolish(edgeId);
+    run(queue, 120); // walk all the way down to removed
+    // Traffic (TrafficSim.onRoadsChanged) must be told the instant the road stops being
+    // drivable — i.e. the first backward stage transition off 'painted' (to 'paved') — not only
+    // once at the very end when the edge is fully removed.
+    expect(changedCount).toBeGreaterThanOrEqual(1);
+    expect(firstChangeStage).toBe('paved');
+  });
+  it('splitting a fully-painted edge does not tear it down and rebuild it', () => {
+    const bus = new EventBus();
+    const hf = new Heightfield('q-test-split', bus);
+    const graph = new RoadGraph(bus, makeSampler(hf));
+    const queue = new BuildQueue(graph, hf, bus);
+    const anchor = findAnchor(hf, 32);
+    const mid = { x: anchor.x + 16, z: anchor.z };
+    const end = { x: anchor.x + 32, z: anchor.z };
+
+    // 3-point chain so `mid` is a genuine interior control point that a later chain can split at.
+    const [edgeId] = graph.commitChain([anchor, mid, end]);
+    run(queue, 120);
+    expect(graph.edges.get(edgeId)!.stage).toBe('painted');
+
+    // Commit a chain from the midpoint outward, off to the side — this splits the painted edge
+    // into two halves (see graph.test.ts's "splits an existing edge" case); the split halves
+    // inherit the parent's 'painted' stage.
+    graph.commitChain([mid, { x: mid.x, z: mid.z + 32 }]);
+
+    expect(graph.edges.has(edgeId)).toBe(false); // original replaced by the split
+    const halves = [...graph.edges.values()].filter(
+      (e) =>
+        e.ctrl.length === 2 &&
+        e.ctrl.some((c) => c.x === mid.x && c.z === mid.z) &&
+        e.ctrl.every((c) => c.z === anchor.z), // excludes the new perpendicular stub (z varies)
+    );
+    expect(halves.length).toBe(2); // left half + right half of the original road
+
+    run(queue, 5); // give the crew plenty of time to (wrongly) start rebuilding if it were going to
+
+    // Both split halves of the original road must remain 'painted' — not torn back down to
+    // 'graded'/'gravel'/'paved' and rebuilt. (The new perpendicular stub road is a genuinely new
+    // 'surveyed' edge and legitimately gets built by the crew — that's correct, not the bug under
+    // test — so it's excluded from `halves` above and from these assertions.)
+    for (const e of halves) expect(e.stage).toBe('painted');
+    // No job was ever enqueued/started for either restored-painted half specifically.
+    expect(queue.queueLength).toBeLessThanOrEqual(1); // at most the legitimate new stub-road build job
+  });
+  it('demolishing a non-surveyed edge with only a pending (unstarted) job still walks it down properly', () => {
+    const bus = new EventBus();
+    const hf = new Heightfield('q-test-split-demolish', bus);
+    const graph = new RoadGraph(bus, makeSampler(hf));
+    const queue = new BuildQueue(graph, hf, bus);
+    const anchor = findAnchor(hf, 32);
+    const mid = { x: anchor.x + 16, z: anchor.z };
+    const end = { x: anchor.x + 32, z: anchor.z };
+
+    const [edgeId] = graph.commitChain([anchor, mid, end]);
+    run(queue, 120); // fully build the original edge to 'painted'
+    expect(graph.edges.get(edgeId)!.stage).toBe('painted');
+
+    // Split it — both halves inherit 'painted' and get pending `enqueueResume` jobs queued (no-op
+    // resume jobs since they're already painted, but still technically "pending" entries).
+    graph.commitChain([mid, { x: mid.x, z: mid.z + 32 }]);
+    const halfIds = [...graph.edges.keys()].filter((id) => {
+      const e = graph.edges.get(id)!;
+      return (
+        e.ctrl.length === 2 &&
+        e.ctrl.some((c) => c.x === mid.x && c.z === mid.z) &&
+        e.ctrl.every((c) => c.z === anchor.z) // excludes the new perpendicular stub (z varies)
+      );
+    });
+    expect(halfIds.length).toBe(2);
+    const targetId = halfIds[0];
+
+    const stages: (Stage | 'removed')[] = [];
+    bus.on('construction:stage', (e) => { if (e.edgeId === targetId) stages.push(e.stage); });
+
+    queue.enqueueDemolish(targetId);
+    run(queue, 120);
+
+    // A proper demolition walk must have stepped back through the built stages (not an instant
+    // remove straight to 'removed' with no intermediate stage events).
+    expect(stages[stages.length - 1]).toBe('removed');
+    expect(stages.length).toBeGreaterThan(1);
+    expect(graph.edges.has(targetId)).toBe(false);
   });
 });
