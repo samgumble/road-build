@@ -18,6 +18,7 @@ import { SceneryRenderer } from './render/sceneryRenderer';
 import { Atmosphere } from './render/atmosphere';
 import { Hud, randomSeed } from './ui/hud';
 import { serialize, deserialize, restoreWorld } from './sim/save';
+import { AmbientAudio } from './audio/ambient';
 
 const SAVE_KEY = 'groundwork-save';
 const AUTOSAVE_INTERVAL = 10; // seconds
@@ -97,6 +98,11 @@ function main(): void {
   const atmosphere = new Atmosphere(scene, sun, hemi, renderer, bus, createRng('atmosphere-' + hf.seed));
   atmosphere.setCameraTarget(cameraRig.target);
 
+  const audio = new AmbientAudio(bus);
+  // Autoplay policy: the AudioContext can only be created from a user gesture, so we build it
+  // lazily on the first pointerdown anywhere on the canvas and never again.
+  canvas.addEventListener('pointerdown', () => audio.start(), { once: true });
+
   // Draw tool owns LMB (survey preview + stakes + commit, demolish-click); `drawTool.mode` is
   // flipped between 'draw' / 'demolish' / 'none' by the HUD toolbar below.
   const drawTool = new DrawTool(canvas, camera, terrain.mesh, graph, hf, scene, (edgeId) =>
@@ -129,6 +135,7 @@ function main(): void {
       constructionRenderer.update(dt, atmosphere.night);
       carRenderer.update(traffic.cars, atmosphere.night);
       sceneryRenderer.update(dt);
+      audio.update(dt, atmosphere.timeOfDay, camera.position.x);
       renderer.render(scene, camera);
     },
   );
@@ -158,6 +165,7 @@ function main(): void {
     seed,
     renderFrame: () => renderer.render(scene, camera),
     canvas,
+    audio,
     onNewWorld: (newSeed) => {
       try {
         window.localStorage.removeItem(SAVE_KEY);

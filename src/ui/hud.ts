@@ -2,6 +2,7 @@ import type { EventBus } from '../core/events';
 import type { Stage } from '../core/types';
 import type { DrawTool, DrawToolMode } from '../input/drawTool';
 import type { Loop } from '../core/loop';
+import type { AmbientAudio } from '../audio/ambient';
 
 const ADJECTIVES = [
   'amber', 'quiet', 'copper', 'dusty', 'stone', 'cedar', 'misty', 'golden', 'rusty', 'granite',
@@ -76,6 +77,7 @@ interface HudDeps {
   seed: string;
   renderFrame: () => void;
   canvas: HTMLCanvasElement;
+  audio: AmbientAudio;
   onNewWorld: (seed: string) => void;
 }
 
@@ -100,6 +102,8 @@ export class Hud {
   private newWorldBtn!: HTMLButtonElement;
   private newWorldPanel!: HTMLElement;
   private newWorldInput!: HTMLInputElement;
+
+  private muteBtn!: HTMLButtonElement;
 
   private stageByEdge = new Map<number, Stage | 'removed'>();
 
@@ -281,14 +285,24 @@ export class Hud {
   }
 
   private buildMuteButton(): HTMLElement {
-    // Placeholder: audio isn't wired up until Task 16. Disabled so it reads as "not yet active"
-    // rather than a broken control.
-    const btn = el('button', { type: 'button', textContent: 'Mute', disabled: true }, {
+    const btn = el('button', { type: 'button', textContent: 'Mute' }, {
       ...baseButtonStyle(),
-      opacity: '0.4',
-      cursor: 'not-allowed',
+      borderBottom: '2px solid transparent',
     });
+    btn.addEventListener('click', () => {
+      this.deps.audio.muted = !this.deps.audio.muted;
+      this.refreshMuteButton();
+    });
+    this.muteBtn = btn;
+    this.refreshMuteButton();
     return btn;
+  }
+
+  private refreshMuteButton(): void {
+    const muted = this.deps.audio.muted;
+    this.muteBtn.textContent = muted ? 'Sound Off' : 'Mute';
+    this.muteBtn.style.borderBottomColor = muted ? ACCENT : 'transparent';
+    this.muteBtn.style.color = muted ? ACCENT : TEXT;
   }
 
   private takePhoto(): void {
