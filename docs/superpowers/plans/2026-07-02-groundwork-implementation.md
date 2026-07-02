@@ -13,7 +13,7 @@
 - All sim code (`src/core/`, `src/sim/`) imports **nothing from `three`** — it must run under Vitest in Node.
 - Determinism: identical seed ⇒ identical heightfield, growth, and RNG streams.
 - TypeScript `strict: true`. No `any` except where a comment justifies it.
-- No binary assets: all geometry procedural, all audio synthesized, no image/audio files.
+- Assets ARE permitted where they improve the experience (user directive 2026-07-02, supersedes the spec's no-assets rule): CC0-licensed (e.g., Kenney packs) or self-generated only; keep the deployed payload lean (prefer <10 MB total); every asset-loading path needs a graceful procedural fallback. Where assets add nothing, stay procedural.
 - World constants (exact values, defined once in `src/core/constants.ts`):
   `WORLD_SIZE = 512`, `GRID_SIZE = 129`, `CELL = 4`, `SNAP = 8`, `WATER_LEVEL = 0`, `ROAD_WIDTH = 6`, `LANE_OFFSET = 1.5`, `MAX_ROAD_GRADE = 0.35`, `SIM_DT = 1/60`, `DAY_LENGTH = 240` (seconds per full day).
 - Coordinate system: X/Z horizontal, Y up. Cars drive on the right.
