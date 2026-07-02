@@ -166,16 +166,40 @@ export class DrawTool {
       this.hoverRing.visible = false;
     };
 
+    // Browser/OS can cancel a drag mid-flight (e.g. touch gesture reinterpreted, pen leaving
+    // range, window losing focus). Abort cleanly: release capture, reset chain state, and fade
+    // out the in-progress preview exactly like an invalid pointerup would.
+    const onPointerCancel = () => {
+      if (!this.dragging) return;
+      this.dragging = false;
+      if (this.pointerId !== null) {
+        try {
+          if (el.hasPointerCapture(this.pointerId)) {
+            el.releasePointerCapture(this.pointerId);
+          }
+        } catch {
+          // pointer capture already released/invalid — nothing to clean up
+        }
+      }
+      this.pointerId = null;
+      this.chainValid = false;
+      this.startFade();
+      this.chain = [];
+      this.hoverRing.visible = false;
+    };
+
     el.addEventListener('pointerdown', onPointerDown);
     el.addEventListener('pointermove', onPointerMove);
     el.addEventListener('pointerup', onPointerUp);
     el.addEventListener('pointerleave', onPointerLeave);
+    el.addEventListener('pointercancel', onPointerCancel);
 
     this.disposers.push(
       () => el.removeEventListener('pointerdown', onPointerDown),
       () => el.removeEventListener('pointermove', onPointerMove),
       () => el.removeEventListener('pointerup', onPointerUp),
       () => el.removeEventListener('pointerleave', onPointerLeave),
+      () => el.removeEventListener('pointercancel', onPointerCancel),
     );
   }
 
@@ -211,7 +235,10 @@ export class DrawTool {
   /** Raycasts road groups (tagged `userData.edgeId`) under the pointer, walking up `.parent`. */
   private findRoadEdgeAt(clientX: number, clientY: number): { edgeId: number; point: THREE.Vector3 } | null {
     this.raycaster.setFromCamera(this.pointerToNdc(clientX, clientY), this.camera);
-    const hits = this.raycaster.intersectObjects(this.scene.children, true);
+    // Scope the raycast to road groups only (not terrain/water/preview) — recomputed each call
+    // since edges come and go and this must never be cached across calls.
+    const roadGroups = this.scene.children.filter((obj) => obj.userData && obj.userData.edgeId !== undefined);
+    const hits = this.raycaster.intersectObjects(roadGroups, true);
     for (const hit of hits) {
       let obj: THREE.Object3D | null = hit.object;
       while (obj) {
