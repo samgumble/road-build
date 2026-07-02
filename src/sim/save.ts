@@ -113,6 +113,14 @@ export function restoreWorld(save: SaveV1, deps: RestoreDeps): void {
   const offset = ROAD_WIDTH / 2 - 0.8;
 
   for (const saved of save.edges) {
+    // DOCUMENTED-SKIP: only the first id returned by `commitChain` is used below. A normal save
+    // never produces a chain that itself gets split into multiple edges on restore (each saved
+    // edge's `ctrl` is exactly one already-committed edge's control chain, and interior points
+    // don't re-trigger a split against a graph that's being rebuilt in the same order they were
+    // originally created), but a hand-crafted/corrupted save whose `ctrl` deliberately crosses an
+    // already-restored edge could return >1 id here, silently dropping the extra piece(s)'
+    // stage-forcing below. Not handling that: it's an edge case only reachable via a malformed
+    // save file, not normal play, and the fix would add real complexity for no in-game benefit.
     const [edgeId] = graph.commitChain(saved.ctrl);
     if (edgeId === undefined) continue; // degenerate chain (shouldn't happen for a valid save)
 
@@ -121,6 +129,16 @@ export function restoreWorld(save: SaveV1, deps: RestoreDeps): void {
     const edge = graph.edges.get(edgeId);
     if (!edge) continue;
     edge.stage = saved.stage;
+
+    // Critical 1: `commitChain` above only emitted `construction:stage`-less events (edges start
+    // life at 'surveyed', with no stage event of their own), so `RoadRenderer` — which only
+    // re-renders a stage's appearance in response to `construction:stage` / `construction:progress`
+    // — has no idea the stage was just force-set above and keeps drawing the edge as fresh survey
+    // dashes. Emit the event ourselves so the renderer (and anything else listening, e.g. the HUD's
+    // ticker) picks up the restored stage immediately. Safe pre-user-gesture: AmbientAudio's
+    // `construction:stage` handler no-ops without an AudioContext, and the HUD isn't constructed
+    // yet at this point in main.ts's boot sequence.
+    bus.emit('construction:stage', { edgeId, stage: saved.stage });
 
     // Finding 1: forcing `edge.stage` above freezes construction forever unless the crew is
     // told to pick back up where the save left off — resume a build job starting at the stage

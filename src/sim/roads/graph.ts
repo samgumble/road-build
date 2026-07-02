@@ -56,6 +56,13 @@ export class RoadGraph {
   }
 
   splitEdge(edgeId: number, ctrlIndex: number): { nodeId: number; left: number; right: number } {
+    // DOCUMENTED-SKIP: unlike `commitChain`/`removeEdge`, this doesn't also emit `roads:changed` —
+    // only the per-edge `roads:edgeRemoved`/`roads:edgeAdded` pair below. Callers that split as part
+    // of a larger chain commit (the normal path, via `commitChain`) get a `roads:changed` from that
+    // outer call anyway; a bare/direct `splitEdge` call would miss the lane/growth rebuild it
+    // implies. This is a rare corner (direct callers outside `commitChain` are test-only today) and
+    // the fix — emitting `roads:changed` here too — would mean a double rebuild on the far more
+    // common commitChain path, which isn't worth the extra recompute cost for this edge case.
     const e = this.edges.get(edgeId)!;
     this.unindexEdge(e);
     this.edges.delete(edgeId);
