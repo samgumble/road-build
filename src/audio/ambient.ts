@@ -149,12 +149,16 @@ export class AmbientAudio {
   private cricketBurstRemaining = 0;
   private cricketPulsePhase = 0;
 
-  // Construction
+  // Construction (Task 25: one rumble voice total, shared across every crew — see
+  // `nearestActiveCrewX` — rather than one per crew, keeping this simple per the binding spec).
   private engineGain: GainNode | null = null;
   private enginePanner: StereoPannerNode | null = null;
-  private lastProgressAt = -Infinity;
-  private lastProgressPanX = 0;
-  private lastProgressDemolish = false;
+  /** Last-seen progress per crew (0-based index, matching `construction:progress`'s `crew`
+   * field): `at` is this crew's own recency clock (so one crew going idle doesn't reset another's),
+   * `x`/`demolish` are that crew's most recent reported position/demolish flag. `crew: -1` (the
+   * sim's synthetic "no live crew" sentinel — see queue.ts) never reaches here, since only
+   * `construction:progress` feeds this map and that event is never emitted with crew -1. */
+  private crewProgress: Map<number, { at: number; x: number; demolish: boolean }> = new Map();
   private clockTime = 0; // ctx.currentTime substitute tracked via update(dt), used for gating
 
   private beeperGain: GainNode | null = null;
@@ -403,10 +407,11 @@ export class AmbientAudio {
 
   // ---- Event handlers -----------------------------------------------------
 
-  private onConstructionProgress(payload: { pos: { x: number }; demolish: boolean }): void {
-    this.lastProgressAt = this.clockTime;
-    this.lastProgressDemolish = payload.demolish;
-    this.lastProgressPanX = payload.pos.x;
+  private onConstructionProgress(payload: { pos: { x: number }; demolish: boolean; crew: number }): void {
+    // crew: -1 never reaches here (see crewProgress's doc comment) but guard anyway rather than
+    // indexing a bogus map entry.
+    if (payload.crew < 0) return;
+    this.crewProgress.set(payload.crew, { at: this.clockTime, x: payload.pos.x, demolish: payload.demolish });
   }
 
   private onConstructionStage(payload: { stage: string }): void {
@@ -851,13 +856,35 @@ export class AmbientAudio {
     };
   }
 
+  /**
+   * Task 25: with up to MAX_CREWS crews potentially active at once, picks whichever crew is
+   * currently BOTH active (reported progress within ENGINE_GATE_RELEASE) AND nearest to the
+   * camera on the x axis, and returns its position/demolish flag — the single shared rumble voice
+   * follows that one crew, panning toward whichever is loudest/closest rather than trying to
+   * layer multiple engine sounds (kept simple per the binding spec: "one rumble voice, pan to the
+   * loudest/nearest active crew"). Returns null if no crew is currently active.
+   */
+  private nearestActiveCrew(cameraX: number): { x: number; demolish: boolean } | null {
+    let best: { x: number; demolish: boolean } | null = null;
+    let bestDist = Infinity;
+    for (const { at, x, demolish } of this.crewProgress.values()) {
+      if (this.clockTime - at >= ENGINE_GATE_RELEASE) continue; // this crew's gone idle
+      const dist = Math.abs(x - cameraX);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = { x, demolish };
+      }
+    }
+    return best;
+  }
+
   private updateConstruction(dt: number, cameraX: number): void {
     const ctx = this.ctx;
     if (!ctx || !this.engineGain || !this.enginePanner || !this.beeperGain || !this.beeperPanner) return;
 
     const now = ctx.currentTime;
-    const recency = this.clockTime - this.lastProgressAt;
-    const active = recency < ENGINE_GATE_RELEASE;
+    const nearest = this.nearestActiveCrew(cameraX);
+    const active = nearest !== null;
 
     const targetGain = active ? dbToGain(ENGINE_GAIN_DB) : 0;
     const cur = this.engineGain.gain.value;
@@ -867,15 +894,16 @@ export class AmbientAudio {
     this.engineGain.gain.setValueAtTime(nextGain, now);
 
     if (active) {
-      const pan = clamp((this.lastProgressPanX - cameraX) / PAN_DIVISOR, -PAN_CLAMP, PAN_CLAMP);
+      const pan = clamp((nearest.x - cameraX) / PAN_DIVISOR, -PAN_CLAMP, PAN_CLAMP);
       this.enginePanner.pan.cancelScheduledValues(now);
       this.enginePanner.pan.setValueAtTime(pan, now);
       this.beeperPanner.pan.cancelScheduledValues(now);
       this.beeperPanner.pan.setValueAtTime(pan, now);
     }
 
-    // Reverse beeper: square-wave duty-cycle gate, only while an active job is a demolish job.
-    const beeperActive = active && this.lastProgressDemolish;
+    // Reverse beeper: square-wave duty-cycle gate, only while the nearest active crew's job is a
+    // demolish job.
+    const beeperActive = active && nearest.demolish;
     if (beeperActive) {
       this.beeperPhase += dt * BEEPER_HZ;
       if (this.beeperPhase >= 1) this.beeperPhase -= Math.floor(this.beeperPhase);

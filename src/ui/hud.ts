@@ -29,6 +29,12 @@ const STAGE_TICKER: Record<Stage, string> = {
 };
 const CREW_IDLE = 'CREW IDLE';
 
+/** Task 25: up to this many crew ticker lines are shown, one per active crew (indices 0..N-1,
+ * matching `BuildQueue.MAX_CREWS`'s 0-based `crew` field on construction events). Kept as a local
+ * constant rather than importing MAX_CREWS from the sim so the UI layer doesn't need a sim-layer
+ * dependency purely for a display cap — if MAX_CREWS ever changes, bump this alongside it. */
+const MAX_CREW_LINES = 3;
+
 const PANEL_BG = '#1d1f21';
 const BORDER = '#3a3d40';
 const ACCENT = '#e8641b';
@@ -91,7 +97,9 @@ const SAVE_KEY = 'groundwork-save';
  */
 export class Hud {
   private root: HTMLElement;
-  private tickerEl!: HTMLElement;
+  private tickerContainer!: HTMLElement;
+  private tickerLineEls: HTMLElement[] = [];
+  private idleLineEl!: HTMLElement;
   private hintEl!: HTMLElement;
   private hintShown = true;
 
@@ -105,7 +113,12 @@ export class Hud {
 
   private muteBtn!: HTMLButtonElement;
 
-  private stageByEdge = new Map<number, Stage | 'removed'>();
+  /** This crew's currently-reported stage, keyed by 0-based crew index (Task 25); a crew has no
+   * entry while idle (no job assigned) or once its job reaches a terminal stage ('painted'/
+   * 'removed'). Populated from `construction:stage` events — `crew: -1` (the sim's synthetic
+   * "no live crew" sentinel for instant-remove/save-restore-sync emits, see queue.ts) is ignored,
+   * since it never represents an actual ticker-worthy crew. */
+  private stageByCrew = new Map<number, Stage>();
 
   constructor(private deps: HudDeps) {
     const hud = document.getElementById('hud');
@@ -129,10 +142,22 @@ export class Hud {
     });
     panel.appendChild(seedLine);
 
-    this.tickerEl = el('div', { textContent: CREW_IDLE }, {
-      ...labelStyle(), color: TEXT_DIM,
-    });
-    panel.appendChild(this.tickerEl);
+    // Up to MAX_CREW_LINES ticker lines (Task 25), one per active crew — built once and hidden
+    // individually rather than recreated per update, same "build once, toggle visibility" pattern
+    // the render layer uses for its per-crew rigs.
+    this.tickerContainer = el('div', {}, { display: 'flex', flexDirection: 'column', gap: '2px' });
+    for (let i = 0; i < MAX_CREW_LINES; i++) {
+      const line = el('div', { textContent: '' }, { ...labelStyle(), color: TEXT_DIM, display: 'none' });
+      this.tickerLineEls.push(line);
+      this.tickerContainer.appendChild(line);
+    }
+    this.tickerContainer.appendChild(
+      // Fallback single "CREW IDLE" line, shown only when every crew line is hidden (no crew has
+      // ever done anything yet, or all crews have gone idle) — collapses away as soon as any crew
+      // line appears.
+      (this.idleLineEl = el('div', { textContent: CREW_IDLE }, { ...labelStyle(), color: TEXT_DIM })),
+    );
+    panel.appendChild(this.tickerContainer);
 
     this.root.appendChild(panel);
 
@@ -319,34 +344,43 @@ export class Hud {
   }
 
   private wireEvents(): void {
-    this.deps.bus.on('construction:stage', ({ edgeId, stage }) => {
-      // Minor 8: 'removed' is exactly the case `roads:edgeRemoved` below already handles by
-      // deleting the entry — re-adding it here (with a 'removed' value, no less) would leak a
-      // permanent entry for an edge that no longer exists, regardless of handler registration
-      // order relative to `roads:edgeRemoved`.
-      if (stage === 'removed') return;
-      this.stageByEdge.set(edgeId, stage);
+    this.deps.bus.on('construction:stage', ({ crew, stage }) => {
+      // crew: -1 is the sim's synthetic "no live crew" sentinel (instant pending-job removal,
+      // save-restore's stage-sync emit — see queue.ts) — never a real crew ticker line.
+      if (crew < 0) return;
+      // A crew reaching a terminal stage frees up that ticker line — collapse it rather than
+      // showing a stale "PAINTING LINES…" for a crew that's actually gone back to idle.
+      if (stage === 'removed' || stage === 'painted') {
+        this.stageByCrew.delete(crew);
+      } else {
+        this.stageByCrew.set(crew, stage);
+      }
       this.updateTicker();
     });
-    this.deps.bus.on('roads:edgeAdded', ({ edgeId }) => {
-      if (!this.stageByEdge.has(edgeId)) this.stageByEdge.set(edgeId, 'surveyed');
-      this.updateTicker();
+    this.deps.bus.on('roads:edgeAdded', () => {
       this.dismissHint();
-    });
-    this.deps.bus.on('roads:edgeRemoved', ({ edgeId }) => {
-      this.stageByEdge.delete(edgeId);
-      this.updateTicker();
     });
   }
 
+  /** Renders one line per crew with an entry in `stageByCrew` (indices in ascending crew order,
+   * up to MAX_CREW_LINES), collapsing the single fallback "CREW IDLE" line as soon as any crew has
+   * a line showing, and collapsing every per-crew line back down once all crews go idle. */
   private updateTicker(): void {
-    let text = CREW_IDLE;
-    for (const stage of this.stageByEdge.values()) {
-      if (stage === 'removed' || stage === 'painted') continue;
-      text = STAGE_TICKER[stage];
-      break;
+    const activeCrews = [...this.stageByCrew.entries()].sort(([a], [b]) => a - b);
+
+    for (let i = 0; i < this.tickerLineEls.length; i++) {
+      const line = this.tickerLineEls[i];
+      const entry = activeCrews[i];
+      if (entry) {
+        const [crew, stage] = entry;
+        line.textContent = `CREW ${crew + 1} ${STAGE_TICKER[stage]}`;
+        line.style.display = '';
+      } else {
+        line.style.display = 'none';
+      }
     }
-    this.tickerEl.textContent = text;
+
+    this.idleLineEl.style.display = activeCrews.length === 0 ? '' : 'none';
   }
 
   private dismissHint(): void {

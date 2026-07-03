@@ -7,6 +7,15 @@ import { Heightfield } from '../sim/terrain/heightfield';
 import { damp, easeOutCubic, easeOutBack, clamp01 } from './easing';
 import { ROAD_WIDTH, WORLD_SIZE } from '../core/constants';
 import { RoadRenderer, getBridgeRunInfo, BRIDGE_PYLON_SPACING, STAGE_COLOR } from './roadRenderer';
+import { MAX_CREWS } from '../sim/construction/queue';
+
+/** Vehicle kinds that get their own rig SET per crew (Task 25). 'crane' is deliberately excluded —
+ * it remains a single shared rig globally (bridges are rare; if two crews hit bridge runs at the
+ * same time, the second crew's spans still settle correctly, just without the crane visual — see
+ * `ConstructionRenderer`'s class doc). */
+const PER_CREW_KINDS: Exclude<VehicleKind, 'crane'>[] = [
+  'excavator', 'truck', 'paver', 'roller', 'liner', 'surveyor',
+];
 
 const ROAD_WIDTH_HALF = ROAD_WIDTH / 2;
 
@@ -1233,37 +1242,61 @@ interface BridgeCrossing {
 }
 
 /**
- * Renders the active construction crew's vehicle for each in-progress job, plus the trailing
- * roller during `paved` and dust/steam particle effects. One `VehicleRig` per `VehicleKind` is
- * built once at startup and hidden; only the vehicle(s) relevant to the currently-streaming
- * `construction:progress` events are shown, damping toward the reported position/heading and
- * fading in/out via scale so nothing pops.
+ * Everything that's replicated per construction crew (Task 25): a full vehicle rig set (one
+ * `VehicleRig` per non-crane `VehicleKind`, built once and hidden until that crew has a job), the
+ * trailing roller, per-crew site dressing (cones + stockpile), and a per-crew floodlight. Built
+ * `MAX_CREWS` times up front — "instancing not required, rigs are cheap primitives" per the
+ * binding spec — and simply hidden (scale 0.001, `visible = false`) while a crew is idle.
+ */
+interface CrewSlot {
+  rigs: Record<Exclude<VehicleKind, 'crane'>, VehicleRig>;
+  states: Map<VehicleKind, VehicleState>;
+  roller: VehicleState;
+  lastSeenAt: Map<VehicleKind, number>;
+  lastRollerSeenAt: number;
+  dustTimer: number;
+  steamTimer: number;
+  cones: ConePool;
+  stockpile: StockpileRig;
+  stockpileVisibility: number;
+  stockpileEdgeId: number | null;
+  floodlight: FloodlightRig;
+  floodlightVisibility: number;
+  // scratch fields for updateSiteDressing -> cones.update handoff (avoids a per-frame allocation)
+  dressingActive: boolean;
+  dressingPos: THREE.Vector3;
+  dressingHeading: number;
+}
+
+/**
+ * Renders every active construction crew's vehicle for each in-progress job (Task 25: up to
+ * `MAX_CREWS` concurrent crews, each with its own full rig set/dressing/floodlight — see
+ * `CrewSlot`), plus the trailing roller during `paved` and dust/steam particle effects. Only the
+ * vehicle(s) relevant to that crew's currently-streaming `construction:progress` events are shown,
+ * damping toward the reported position/heading and fading in/out via scale so nothing pops.
+ *
+ * The bridge crane (Task 22) is the one deliberate exception to "everything is per-crew": it stays
+ * a single shared rig, since bridges are rare and this keeps draw calls/complexity down. If two
+ * crews are simultaneously mid-'gravel' inside a bridge run, the second crew's spans still settle
+ * (the sim-side masking/settling logic is per-edge, not per-crane), it just doesn't get its own
+ * crane visual while the first crew's crossing is animating.
  */
 export class ConstructionRenderer {
-  private rigs: Record<VehicleKind, VehicleRig>;
-  private states: Map<VehicleKind, VehicleState> = new Map();
-  private roller: VehicleState;
+  private crews: CrewSlot[] = [];
 
   private dustPool: ParticlePool;
   private steamPool: ParticlePool;
   private gravelPool: ParticlePool;
   private tireMarks: TireMarkPool;
   private stakes: StakePool;
-  private cones: ConePool;
-  private stockpile: StockpileRig;
-  private stockpileVisibility = 0; // eased 0..1
-  private stockpileEdgeId: number | null = null; // which job's start point the stockpile currently marks
-  private dustTimer = 0;
-  private steamTimer = 0;
-
-  private floodlight: FloodlightRig;
-  private floodlightVisibility = 0; // eased 0..1, drives light intensity + head emissive
 
   private clock = 0;
-  // last-seen progress event per non-roller vehicle kind, used to detect "job stopped this frame"
-  private lastSeenAt: Map<VehicleKind, number> = new Map();
-  private lastRollerSeenAt = -Infinity;
   private readonly IDLE_TIMEOUT = 0.2; // seconds without a progress event => job considered done
+
+  // Shared crane rig (see class doc above): stationed by whichever crew currently owns the one
+  // active forward bridge crossing (see updateBridgeCrossings).
+  private craneRig: VehicleRig;
+  private craneState: VehicleState;
 
   // Bridge construction theater (Task 22): at most one active crossing per edge (a bridge run
   // being actively crossed by 'gravel'-stage progress right now); cleared once the crossing's
@@ -1280,45 +1313,26 @@ export class ConstructionRenderer {
     private hf: Heightfield,
     private roadRenderer: RoadRenderer,
   ) {
-    this.rigs = {
-      excavator: buildExcavator(),
-      truck: buildTruck(),
-      paver: buildPaver(),
-      roller: buildRoller(),
-      liner: buildLiner(),
-      surveyor: buildSurveyor(),
-      crane: buildCrane(),
-    };
-    for (const kind of Object.keys(this.rigs) as VehicleKind[]) {
-      const rig = this.rigs[kind];
-      rig.group.visible = false;
-      rig.group.scale.setScalar(0.001);
-      this.scene.add(rig.group);
+    for (let crew = 0; crew < MAX_CREWS; crew++) {
+      this.crews.push(this.makeCrewSlot());
     }
 
-    // 'roller' is never itself a target `vehicle` on a progress event (queue.ts only ever emits
-    // excavator/truck/paver/liner) — it only trails the paver during 'paved', so its state is
-    // driven exclusively by the synthetic trailing-position logic in onProgress()/update() below.
-    this.roller = this.makeState(this.rigs.roller);
+    this.craneRig = buildCrane();
+    this.craneRig.group.visible = false;
+    this.craneRig.group.scale.setScalar(0.001);
+    this.scene.add(this.craneRig.group);
+    this.craneState = this.makeState(this.craneRig);
 
     this.dustPool = new ParticlePool(DUST_POOL_SIZE, DUST_SIZE, DUST_COLOR, DUST_LIFETIME);
     this.steamPool = new ParticlePool(STEAM_POOL_SIZE, STEAM_SIZE, STEAM_COLOR, STEAM_LIFETIME);
     this.gravelPool = new ParticlePool(80, 1.0, GRAVEL_COLOR, 0.9);
     this.tireMarks = new TireMarkPool(TIRE_MARK_POOL_SIZE);
     this.stakes = new StakePool(STAKE_POOL_SIZE);
-    this.cones = new ConePool();
-    this.stockpile = buildStockpile();
-    this.stockpile.group.visible = false;
-    this.stockpile.group.scale.setScalar(0.001);
     this.scene.add(this.dustPool.points);
     this.scene.add(this.steamPool.points);
     this.scene.add(this.gravelPool.points);
     this.scene.add(this.tireMarks.mesh);
     this.scene.add(this.stakes.mesh);
-    this.scene.add(this.cones.mesh);
-    this.scene.add(this.stockpile.group);
-
-    this.floodlight = buildFloodlight(this.scene);
 
     const craneSegmentParts = buildCraneSegment();
     this.craneSegment = craneSegmentParts.mesh;
@@ -1334,6 +1348,59 @@ export class ConstructionRenderer {
     bus.on('construction:stage', (e) => {
       if (e.stage === 'painted' || e.stage === 'removed') this.stakes.removeAll(e.edgeId);
     });
+  }
+
+  /** Builds one crew's full rig set + site dressing + floodlight, adds everything to the scene
+   * hidden, and returns the assembled `CrewSlot`. */
+  private makeCrewSlot(): CrewSlot {
+    const rigs = {
+      excavator: buildExcavator(),
+      truck: buildTruck(),
+      paver: buildPaver(),
+      roller: buildRoller(),
+      liner: buildLiner(),
+      surveyor: buildSurveyor(),
+    };
+    for (const kind of PER_CREW_KINDS) {
+      const rig = rigs[kind];
+      rig.group.visible = false;
+      rig.group.scale.setScalar(0.001);
+      this.scene.add(rig.group);
+    }
+
+    const cones = new ConePool();
+    this.scene.add(cones.mesh);
+
+    const stockpile = buildStockpile();
+    stockpile.group.visible = false;
+    stockpile.group.scale.setScalar(0.001);
+    this.scene.add(stockpile.group);
+
+    const floodlight = buildFloodlight(this.scene);
+
+    // 'roller' is never itself a target `vehicle` on a progress event (queue.ts only ever emits
+    // excavator/truck/paver/liner) — it only trails the paver during 'paved', so its state is
+    // driven exclusively by the synthetic trailing-position logic in onProgress()/update() below.
+    const roller = this.makeState(rigs.roller);
+
+    return {
+      rigs,
+      states: new Map(),
+      roller,
+      lastSeenAt: new Map(),
+      lastRollerSeenAt: -Infinity,
+      dustTimer: 0,
+      steamTimer: 0,
+      cones,
+      stockpile,
+      stockpileVisibility: 0,
+      stockpileEdgeId: null,
+      floodlight,
+      floodlightVisibility: 0,
+      dressingActive: false,
+      dressingPos: new THREE.Vector3(),
+      dressingHeading: 0,
+    };
   }
 
   private makeState(rig: VehicleRig): VehicleState {
@@ -1379,11 +1446,14 @@ export class ConstructionRenderer {
     };
   }
 
-  private stateFor(kind: VehicleKind): VehicleState {
-    let s = this.states.get(kind);
+  /** Looks up (lazily creating) crew `crew`'s VehicleState for `kind`. `kind` must be one of the
+   * per-crew kinds (not 'crane' — see `this.craneState`). */
+  private stateFor(crew: number, kind: Exclude<VehicleKind, 'crane'>): VehicleState {
+    const slot = this.crews[crew];
+    let s = slot.states.get(kind);
     if (!s) {
-      s = this.makeState(this.rigs[kind]);
-      this.states.set(kind, s);
+      s = this.makeState(slot.rigs[kind]);
+      slot.states.set(kind, s);
     }
     return s;
   }
@@ -1466,10 +1536,17 @@ export class ConstructionRenderer {
     heading: number;
     vehicle: VehicleKind;
     demolish: boolean;
+    crew: number;
   }): void {
-    const state = this.stateFor(e.vehicle);
+    // crew: -1 is the sim's "no live crew" sentinel (synchronous instant-remove / save-restore
+    // sync emits — see queue.ts) and never carries a real `construction:progress` event (only
+    // `construction:stage` uses it), but guard anyway rather than indexing crews[-1].
+    if (e.crew < 0 || e.crew >= this.crews.length) return;
+    const slot = this.crews[e.crew];
+
+    const state = this.stateFor(e.crew, e.vehicle as Exclude<VehicleKind, 'crane'>);
     this.applyProgressTarget(state, e.edgeId, new THREE.Vector3(e.pos.x, e.pos.y, e.pos.z), e.heading);
-    this.lastSeenAt.set(e.vehicle, this.clock);
+    slot.lastSeenAt.set(e.vehicle, this.clock);
     state.stage = e.stage;
     state.demolish = e.demolish;
 
@@ -1483,15 +1560,18 @@ export class ConstructionRenderer {
     // Site dressing (deliverable 5): a fixed stockpile prop marks the job's start point for the
     // job's whole duration (any stage, any vehicle) — captured once per edge and held until a
     // different edge's job takes over or the job goes idle (handled in update()'s fade logic).
-    if (edge && this.stockpileEdgeId !== e.edgeId) {
-      this.stockpileEdgeId = e.edgeId;
+    // Per-crew (Task 25): each crew's own stockpile marks ITS OWN current job's start point.
+    if (edge && slot.stockpileEdgeId !== e.edgeId) {
+      slot.stockpileEdgeId = e.edgeId;
       const start = edge.samples[0];
-      this.stockpile.group.position.set(start.x, start.y, start.z);
-      this.stockpile.group.rotation.y = -e.heading;
+      slot.stockpile.group.position.set(start.x, start.y, start.z);
+      slot.stockpile.group.rotation.y = -e.heading;
     }
 
     // Survey stakes (deliverable 2): the surveyor plants a real stake every STAKE_SPACING as it
     // passes; grading later sweeps them away as the work front overtakes the surveyed line.
+    // Stakes are a shared pool keyed by edgeId (not crew) — two crews never share an edge, so no
+    // cross-crew collision is possible here.
     if (e.vehicle === 'surveyor' && edge) {
       const y = this.hf.heightAt(e.pos.x, e.pos.z);
       this.stakes.plant(e.edgeId, e.t, e.pos.x, y, e.pos.z);
@@ -1507,11 +1587,11 @@ export class ConstructionRenderer {
       const rollerT = Math.max(0, e.t - ROLLER_TRAIL_DISTANCE);
       const { pos, heading } = sampleAt(edge.samples, rollerT);
       const rollerHeading = e.demolish ? heading + Math.PI : heading;
-      this.applyProgressTarget(this.roller, e.edgeId, new THREE.Vector3(pos.x, pos.y, pos.z), rollerHeading);
-      this.lastRollerSeenAt = this.clock;
-      this.roller.stage = 'paved';
-      this.roller.demolish = e.demolish;
-      this.roller.onBridge = nearestSampleBridge(edge.samples, rollerT);
+      this.applyProgressTarget(slot.roller, e.edgeId, new THREE.Vector3(pos.x, pos.y, pos.z), rollerHeading);
+      slot.lastRollerSeenAt = this.clock;
+      slot.roller.stage = 'paved';
+      slot.roller.demolish = e.demolish;
+      slot.roller.onBridge = nearestSampleBridge(edge.samples, rollerT);
     }
 
     // Truck shuttle theater (deliverable 3): during 'graded' and 'paved' stages queue.ts never
@@ -1520,7 +1600,7 @@ export class ConstructionRenderer {
     // same synthesis pattern used for the roller above. Sim timing (job.t/stage transitions) is
     // completely untouched; this only ever feeds the truck's *cosmetic* target position.
     if (e.stage === 'graded' && !e.demolish && edge) {
-      const truckState = this.stateFor('truck');
+      const truckState = this.stateFor(e.crew, 'truck');
       // idle a short distance behind the excavator, off to the dump side, facing back toward it
       const perpX = -Math.sin(e.heading);
       const perpZ = Math.cos(e.heading);
@@ -1533,7 +1613,7 @@ export class ConstructionRenderer {
       // The truck stays "alive" (not idle-timed-out) for the whole graded job regardless of
       // shuttle phase — only its idle-anchor *position* is gated on shuttlePhase === 'idle';
       // while departing/away/returning, updateTruckShuttle drives targetPos/targetHeading instead.
-      this.lastSeenAt.set('truck', this.clock);
+      slot.lastSeenAt.set('truck', this.clock);
       if (truckState.shuttlePhase === 'idle') {
         this.applyProgressTarget(truckState, e.edgeId, new THREE.Vector3(tx, ty, tz), truckHeading);
       } else {
@@ -1544,7 +1624,7 @@ export class ConstructionRenderer {
       truckState.onBridge = nearestSampleBridge(edge.samples, e.t);
       truckState.shuttleReturnPos.set(tx, ty, tz);
     } else if (e.stage === 'paved' && !e.demolish && edge) {
-      const truckState = this.stateFor('truck');
+      const truckState = this.stateFor(e.crew, 'truck');
       // dock nose-to-hopper just behind the paver (paver travel direction is +heading, hopper is
       // at its front, so the truck backs up to it from behind).
       const dockDist = 3.2;
@@ -1552,7 +1632,7 @@ export class ConstructionRenderer {
       const tz = e.pos.z - Math.sin(e.heading) * dockDist;
       const ty = this.hf.heightAt(tx, tz);
       this.applyProgressTarget(truckState, e.edgeId, new THREE.Vector3(tx, ty, tz), e.heading);
-      this.lastSeenAt.set('truck', this.clock);
+      slot.lastSeenAt.set('truck', this.clock);
       truckState.stage = 'paved';
       truckState.demolish = false;
       truckState.onBridge = nearestSampleBridge(edge.samples, e.t);
@@ -1562,6 +1642,9 @@ export class ConstructionRenderer {
     // stations the crane and lowers deck segments span-by-span; the deck ribbon stays masked (see
     // roadRenderer.setBridgeMask) until each span settles. Demolition's reverse teardown is a
     // simple fade (no crane) per the binding spec, handled by `updateBridgeCrossings`'s recede path.
+    // The crane rig itself is shared globally (see class doc) — `bridgeCrossings` stays keyed by
+    // edgeId only; `updateBridgeCrossings` picks one crossing per frame to actually show the crane
+    // on if more than one edge happens to be mid-crossing at once.
     if (e.stage === 'gravel' && edge) {
       this.onGravelBridgeProgress(e.edgeId, edge, e.t, e.demolish);
     }
@@ -1816,94 +1899,113 @@ export class ConstructionRenderer {
     rig.body.rotation.z = state.slopeRoll;
   }
 
+  /**
+   * Advances every crew's vehicles/dressing/floodlight independently (Task 25), then the shared
+   * systems (crane theater, particle pools, tire marks, stakes) once globally.
+   */
   update(dt: number, night: boolean): void {
     this.clock += dt;
 
     // Bridge crane theater (Task 22) is stepped before the generic per-kind loop below so its
     // `applyProgressTarget`/liveness bookkeeping (synthesized here, same pattern as the truck
     // shuttle/roller — queue.ts never emits a real `vehicle: 'crane'` progress event) is in place
-    // before `stepVehicle('crane', ...)` runs this same frame.
+    // before `stepVehicle` for the crane runs this same frame.
     this.updateBridgeCrossings(dt);
+    const craneActive = this.clock - this.craneSeenAt <= this.IDLE_TIMEOUT;
+    this.stepVehicle(this.craneState, dt, craneActive);
+    this.craneRig.beaconMat.emissiveIntensity = this.beaconIntensity(night);
 
-    // determine which vehicle kinds are "active" this frame: they received a progress event
-    // within IDLE_TIMEOUT seconds (guards against a single stray frame gap causing a pop).
-    for (const [kind, state] of this.states) {
-      const lastSeen = kind === 'crane' ? this.craneSeenAt : (this.lastSeenAt.get(kind) ?? -Infinity);
-      const active = this.clock - lastSeen <= this.IDLE_TIMEOUT;
-      this.stepVehicle(state, dt, active);
-    }
-    const rollerActive = this.clock - this.lastRollerSeenAt <= this.IDLE_TIMEOUT;
-    this.stepVehicle(this.roller, dt, rollerActive);
-
-    // beacon pulse: sin-based intensity 0.4..1.6 at 2Hz, doubled at night
-    const pulsePhase = Math.sin(2 * Math.PI * BEACON_HZ * this.clock);
-    const beaconIntensity = (1.0 + 0.6 * pulsePhase) * (night ? 2 : 1);
-    for (const kind of Object.keys(this.rigs) as VehicleKind[]) {
-      this.rigs[kind].beaconMat.emissiveIntensity = beaconIntensity;
+    for (let crew = 0; crew < this.crews.length; crew++) {
+      this.updateCrew(crew, dt, night);
     }
 
-    const excavatorState = this.states.get('excavator');
-    const excavatorActive =
-      this.clock - (this.lastSeenAt.get('excavator') ?? -Infinity) <= this.IDLE_TIMEOUT;
-    this.updateExcavator(excavatorState, excavatorActive, dt);
-
-    const truckState = this.states.get('truck');
-    const truckActive = this.clock - (this.lastSeenAt.get('truck') ?? -Infinity) <= this.IDLE_TIMEOUT;
-    this.updateTruck(truckState, truckActive, dt);
-    this.updateTruckShuttle(dt, excavatorActive);
-    this.updateTruckPavedDock(dt, truckActive);
-
-    const paverState = this.states.get('paver');
-    const paverActive = this.clock - (this.lastSeenAt.get('paver') ?? -Infinity) <= this.IDLE_TIMEOUT;
-    this.updatePaverMat(paverState, paverActive, dt);
-
-    this.updateRoller(dt, rollerActive);
-
-    this.updateTireMarks(dt);
-    this.updateFloodlight(dt, night);
-    this.updateSiteDressing(dt);
-
+    // Shared per-frame updates (Task 25: pools/marks/stakes are shared capacity pools, not
+    // per-crew — every crew stamps/spawns into the same ones).
     this.dustPool.update(dt);
     this.steamPool.update(dt);
     this.gravelPool.update(dt);
     this.tireMarks.update(dt);
     this.stakes.update(dt);
-    this.cones.update(dt, this.dressingActive, this.dressingPos, this.dressingHeading);
   }
 
-  // scratch fields for updateSiteDressing -> cones.update handoff (avoids a per-frame allocation)
-  private dressingActive = false;
-  private dressingPos = new THREE.Vector3();
-  private dressingHeading = 0;
+  private beaconIntensity(night: boolean): number {
+    // beacon pulse: sin-based intensity 0.4..1.6 at 2Hz, doubled at night
+    const pulsePhase = Math.sin(2 * Math.PI * BEACON_HZ * this.clock);
+    return (1.0 + 0.6 * pulsePhase) * (night ? 2 : 1);
+  }
+
+  /** Advances one crew's vehicles, site dressing, and floodlight for one frame. */
+  private updateCrew(crew: number, dt: number, night: boolean): void {
+    const slot = this.crews[crew];
+
+    // determine which vehicle kinds are "active" this frame: they received a progress event
+    // within IDLE_TIMEOUT seconds (guards against a single stray frame gap causing a pop).
+    for (const [kind, state] of slot.states) {
+      const lastSeen = slot.lastSeenAt.get(kind) ?? -Infinity;
+      const active = this.clock - lastSeen <= this.IDLE_TIMEOUT;
+      this.stepVehicle(state, dt, active);
+    }
+    const rollerActive = this.clock - slot.lastRollerSeenAt <= this.IDLE_TIMEOUT;
+    this.stepVehicle(slot.roller, dt, rollerActive);
+
+    const beaconIntensity = this.beaconIntensity(night);
+    for (const kind of PER_CREW_KINDS) {
+      slot.rigs[kind].beaconMat.emissiveIntensity = beaconIntensity;
+    }
+
+    const excavatorState = slot.states.get('excavator');
+    const excavatorActive =
+      this.clock - (slot.lastSeenAt.get('excavator') ?? -Infinity) <= this.IDLE_TIMEOUT;
+    this.updateExcavator(slot, excavatorState, excavatorActive, dt);
+
+    const truckState = slot.states.get('truck');
+    const truckActive = this.clock - (slot.lastSeenAt.get('truck') ?? -Infinity) <= this.IDLE_TIMEOUT;
+    this.updateTruck(slot, truckState, truckActive, dt);
+    this.updateTruckShuttle(slot, dt, excavatorActive);
+    this.updateTruckPavedDock(slot, dt, truckActive);
+
+    const paverState = slot.states.get('paver');
+    const paverActive = this.clock - (slot.lastSeenAt.get('paver') ?? -Infinity) <= this.IDLE_TIMEOUT;
+    this.updatePaverMat(slot, paverState, paverActive, dt);
+
+    this.updateRoller(slot, dt, rollerActive);
+
+    this.updateTireMarks(slot, dt);
+    this.updateFloodlight(slot, dt, night);
+    this.updateSiteDressing(slot, dt);
+  }
 
   /**
-   * Site dressing (deliverable 5): finds whichever vehicle is currently the "primary" active one
-   * (same anchor-picking approach as updateFloodlight) to serve as the work front for bracketing
-   * cones, and fades the job-start stockpile in/out with whether ANY job is currently active
-   * (cones/stockpile both belong to "a job is in progress somewhere", not any one vehicle kind).
+   * Site dressing (deliverable 5): finds whichever of THIS CREW's vehicles is currently the
+   * "primary" active one (same anchor-picking approach as updateFloodlight) to serve as the work
+   * front for bracketing cones, and fades the job-start stockpile in/out with whether ANY job is
+   * currently active on this crew (cones/stockpile both belong to "this crew has a job in
+   * progress", not any one vehicle kind).
    */
-  private updateSiteDressing(dt: number): void {
+  private updateSiteDressing(slot: CrewSlot, dt: number): void {
     let anchor: VehicleState | null = null;
-    for (const [kind, state] of this.states) {
-      const lastSeen = this.lastSeenAt.get(kind) ?? -Infinity;
+    for (const [kind, state] of slot.states) {
+      const lastSeen = slot.lastSeenAt.get(kind) ?? -Infinity;
       if (this.clock - lastSeen <= this.IDLE_TIMEOUT && state.hasTarget) {
         anchor = state;
         break;
       }
     }
 
-    this.dressingActive = anchor !== null;
+    slot.dressingActive = anchor !== null;
     if (anchor) {
-      this.dressingPos.copy(anchor.curPos);
-      this.dressingHeading = anchor.curHeading;
+      slot.dressingPos.copy(anchor.curPos);
+      slot.dressingHeading = anchor.curHeading;
     }
 
     const jobActive = anchor !== null;
-    this.stockpileVisibility = damp(this.stockpileVisibility, jobActive ? 1 : 0, 1 / FADE_DURATION, dt);
-    const scale = easeOutCubic(clamp01(this.stockpileVisibility));
-    this.stockpile.group.visible = scale > 0.001;
-    this.stockpile.group.scale.setScalar(Math.max(0.001, scale));
-    if (!jobActive) this.stockpileEdgeId = null; // free the anchor once fully faded/no job running
+    slot.stockpileVisibility = damp(slot.stockpileVisibility, jobActive ? 1 : 0, 1 / FADE_DURATION, dt);
+    const scale = easeOutCubic(clamp01(slot.stockpileVisibility));
+    slot.stockpile.group.visible = scale > 0.001;
+    slot.stockpile.group.scale.setScalar(Math.max(0.001, scale));
+    if (!jobActive) slot.stockpileEdgeId = null; // free the anchor once fully faded/no job running
+
+    slot.cones.update(dt, slot.dressingActive, slot.dressingPos, slot.dressingHeading);
   }
 
   /**
@@ -1914,8 +2016,8 @@ export class ConstructionRenderer {
    * eases toward a neutral carry pose instead of digging mid-teleport, and the cycle resumes from
    * wherever it left off once the vehicle is back to normal, small-per-frame motion.
    */
-  private updateExcavator(state: VehicleState | undefined, active: boolean, dt: number): void {
-    const rig = this.rigs.excavator;
+  private updateExcavator(slot: CrewSlot, state: VehicleState | undefined, active: boolean, dt: number): void {
+    const rig = slot.rigs.excavator;
     if (!state) {
       rig.boom!.rotation.z = damp(rig.boom!.rotation.z, CARRY_BOOM_Z, RELOCATE_LAMBDA, dt);
       rig.stick!.rotation.z = damp(rig.stick!.rotation.z, CARRY_STICK_Z, RELOCATE_LAMBDA, dt);
@@ -1970,7 +2072,7 @@ export class ConstructionRenderer {
           // Truck shuttle theater (deliverable 3): each dig-cycle dump lands a load of spoil in
           // the idling truck's bed, purely cosmetic — the excavator keeps digging on its own
           // sim-driven schedule whether or not the truck happens to be present at all.
-          if (state.stage === 'graded' && !state.demolish) this.truckReceiveDump();
+          if (state.stage === 'graded' && !state.demolish) this.truckReceiveDump(slot);
         }
       } else {
         // swing back: cab yaws back to center, arm returns toward the carry pose
@@ -2000,13 +2102,13 @@ export class ConstructionRenderer {
     }
 
     if (active) {
-      this.dustTimer += dt;
-      if (this.dustTimer >= DUST_INTERVAL) {
-        this.dustTimer = 0;
+      slot.dustTimer += dt;
+      if (slot.dustTimer >= DUST_INTERVAL) {
+        slot.dustTimer = 0;
         this.emitDust(state.curPos.x, state.curPos.y, state.curPos.z);
       }
     } else {
-      this.dustTimer = 0;
+      slot.dustTimer = 0;
     }
   }
 
@@ -2016,8 +2118,8 @@ export class ConstructionRenderer {
    * BED_TIP_ANGLE and back down every BED_TIP_INTERVAL seconds, eased over BED_TIP_DURATION each
    * way, with a gravel-colored particle burst at the tailgate while tipped.
    */
-  private updateTruck(state: VehicleState | undefined, active: boolean, dt: number): void {
-    const rig = this.rigs.truck;
+  private updateTruck(slot: CrewSlot, state: VehicleState | undefined, active: boolean, dt: number): void {
+    const rig = slot.rigs.truck;
     if (!state || !active || state.stage !== 'gravel' || state.demolish) {
       if (state) {
         state.bedTipTimer = 0;
@@ -2079,8 +2181,8 @@ export class ConstructionRenderer {
   /** Called from `updateExcavator`'s dig-cycle dump moment while the excavator is grading and the
    * truck is idling beside it: grows the truck bed's spoil mound one step, and once it's received
    * SPOIL_DUMPS_TO_FILL loads, kicks off the "full — drive off to dump" phase. Purely cosmetic. */
-  private truckReceiveDump(): void {
-    const truck = this.states.get('truck');
+  private truckReceiveDump(slot: CrewSlot): void {
+    const truck = slot.states.get('truck');
     if (!truck || truck.shuttlePhase !== 'idle') return;
     truck.dumpCountThisLoad += 1;
     truck.spoilLevel = clamp01(truck.dumpCountThisLoad / SPOIL_DUMPS_TO_FILL);
@@ -2106,8 +2208,8 @@ export class ConstructionRenderer {
    * itself is completely unaffected — it keeps digging on the sim's own schedule whether or not
    * the truck happens to be present, per the spec's "sim timing unchanged".
    */
-  private updateTruckShuttle(dt: number, excavatorActive: boolean): void {
-    const truck = this.states.get('truck');
+  private updateTruckShuttle(slot: CrewSlot, dt: number, excavatorActive: boolean): void {
+    const truck = slot.states.get('truck');
     if (!truck || !truck.hasTarget) return;
 
     if (truck.shuttlePhase === 'idle') return;
@@ -2123,7 +2225,7 @@ export class ConstructionRenderer {
       return;
     }
 
-    const rig = this.rigs.truck;
+    const rig = slot.rigs.truck;
 
     if (truck.shuttlePhase === 'departing') {
       truck.targetPos.copy(truck.shuttleAwayPos);
@@ -2175,9 +2277,9 @@ export class ConstructionRenderer {
    * fires during 'gravel'. The truck's dock *position* itself is synthesized in onProgress; this
    * only drives the bed pivot while it's stage 'paved' and actively parked there.
    */
-  private updateTruckPavedDock(dt: number, truckActive: boolean): void {
-    const truck = this.states.get('truck');
-    const rig = this.rigs.truck;
+  private updateTruckPavedDock(slot: CrewSlot, dt: number, truckActive: boolean): void {
+    const truck = slot.states.get('truck');
+    const rig = slot.rigs.truck;
     const docked = !!truck && truckActive && truck.stage === 'paved' && !truck.demolish;
     const targetAngle = docked ? PAVED_DOCK_TIP_ANGLE * (0.5 + 0.5 * Math.sin(this.clock * PAVED_DOCK_TIP_LAMBDA * Math.PI * 2)) : 0;
     // Ownership split with updateTruck: updateTruck now explicitly skips writing bedPivot during
@@ -2194,8 +2296,8 @@ export class ConstructionRenderer {
    * (paved stage) and fades back out once the paver stops (the real ribbon geometry takes over
    * that stretch of road, so the mat shouldn't linger).
    */
-  private updatePaverMat(state: VehicleState | undefined, active: boolean, dt: number): void {
-    const rig = this.rigs.paver;
+  private updatePaverMat(slot: CrewSlot, state: VehicleState | undefined, active: boolean, dt: number): void {
+    const rig = slot.rigs.paver;
     const laying = !!state && active && state.stage === 'paved';
     const targetOpacity = laying ? 0.85 : 0;
     rig.matMat!.opacity = damp(rig.matMat!.opacity, targetOpacity, 1 / MAT_FADE_TIME, dt);
@@ -2208,38 +2310,39 @@ export class ConstructionRenderer {
    * oscillation displacement (reuses the same wheel-spin mechanism as stepVehicle, applied here
    * as an additional offset on top of the damped trail position).
    */
-  private updateRoller(dt: number, active: boolean): void {
-    const rig = this.rigs.roller;
+  private updateRoller(slot: CrewSlot, dt: number, active: boolean): void {
+    const rig = slot.rigs.roller;
     if (!active) {
-      this.steamTimer = 0;
+      slot.steamTimer = 0;
       return;
     }
 
-    const prevOffset = this.roller.rollerOscOffset;
-    this.roller.rollerOscOffset += this.roller.rollerOscDir * ROLLER_OSCILLATION_SPEED * dt;
-    if (this.roller.rollerOscOffset > ROLLER_OSCILLATION_RANGE) {
-      this.roller.rollerOscOffset = ROLLER_OSCILLATION_RANGE;
-      this.roller.rollerOscDir = -1;
-    } else if (this.roller.rollerOscOffset < -ROLLER_OSCILLATION_RANGE) {
-      this.roller.rollerOscOffset = -ROLLER_OSCILLATION_RANGE;
-      this.roller.rollerOscDir = 1;
+    const roller = slot.roller;
+    const prevOffset = roller.rollerOscOffset;
+    roller.rollerOscOffset += roller.rollerOscDir * ROLLER_OSCILLATION_SPEED * dt;
+    if (roller.rollerOscOffset > ROLLER_OSCILLATION_RANGE) {
+      roller.rollerOscOffset = ROLLER_OSCILLATION_RANGE;
+      roller.rollerOscDir = -1;
+    } else if (roller.rollerOscOffset < -ROLLER_OSCILLATION_RANGE) {
+      roller.rollerOscOffset = -ROLLER_OSCILLATION_RANGE;
+      roller.rollerOscDir = 1;
     }
 
-    const offsetDelta = this.roller.rollerOscOffset - prevOffset;
-    const forwardX = Math.cos(this.roller.curHeading);
-    const forwardZ = Math.sin(this.roller.curHeading);
-    rig.group.position.x += forwardX * this.roller.rollerOscOffset;
-    rig.group.position.z += forwardZ * this.roller.rollerOscOffset;
+    const offsetDelta = roller.rollerOscOffset - prevOffset;
+    const forwardX = Math.cos(roller.curHeading);
+    const forwardZ = Math.sin(roller.curHeading);
+    rig.group.position.x += forwardX * roller.rollerOscOffset;
+    rig.group.position.z += forwardZ * roller.rollerOscOffset;
     // face the direction it's currently oscillating toward so it visibly reads as passes, not drift
-    rig.group.rotation.y = -(this.roller.rollerOscDir > 0 ? this.roller.curHeading : this.roller.curHeading + Math.PI);
+    rig.group.rotation.y = -(roller.rollerOscDir > 0 ? roller.curHeading : roller.curHeading + Math.PI);
 
     for (const w of rig.wheels) {
       w.mesh.rotation.x += Math.abs(offsetDelta) / w.radius;
     }
 
-    this.steamTimer += dt;
-    if (this.steamTimer >= STEAM_INTERVAL) {
-      this.steamTimer = 0;
+    slot.steamTimer += dt;
+    if (slot.steamTimer >= STEAM_INTERVAL) {
+      slot.steamTimer = 0;
       this.emitSteam(rig.group.position.x, rig.group.position.y, rig.group.position.z);
     }
   }
@@ -2279,13 +2382,17 @@ export class ConstructionRenderer {
       const edge = this.graph.edges.get(edgeId);
       if (!edge) continue;
 
-      // Station the crane at the run's near end, facing along the run.
+      // Station the crane at the run's near end, facing along the run. The crane rig is shared
+      // globally (see class doc) — if more than one edge is mid-crossing at once, whichever
+      // crossing this loop iterates last "wins" the crane visual for this frame; every crossing's
+      // own mask/settle logic is unaffected either way (that's driven by `roadRenderer`, not the
+      // crane rig itself), so a second simultaneous crossing's spans still settle correctly, just
+      // without their own crane visual — the documented Task 25 simplification.
       const { pos: stationPos, heading: stationHeading } = sampleAt(edge.samples, crossing.runFromDist);
-      const craneState = this.stateFor('crane');
-      this.applyProgressTarget(craneState, edgeId, new THREE.Vector3(stationPos.x, stationPos.y, stationPos.z), stationHeading);
-      craneState.stage = 'gravel';
-      craneState.demolish = false;
-      craneState.onBridge = false; // the crane itself sits on the approach, not the deck
+      this.applyProgressTarget(this.craneState, edgeId, new THREE.Vector3(stationPos.x, stationPos.y, stationPos.z), stationHeading);
+      this.craneState.stage = 'gravel';
+      this.craneState.demolish = false;
+      this.craneState.onBridge = false; // the crane itself sits on the approach, not the deck
 
       // Advance the current span's descend -> settle-bounce animation.
       if (crossing.activeSpanIdx !== null) {
@@ -2298,16 +2405,15 @@ export class ConstructionRenderer {
         }
       }
 
-      this.applyCraneArticulation(craneState.rig, edge, crossing, dt);
+      this.applyCraneArticulation(this.craneRig, edge, crossing, dt);
     }
 
     if (!anyForwardActive) {
       // No forward (build) crossing active anywhere: make sure the crane segment mesh is hidden
       // rather than left showing a stale descended segment from the last crossing it animated.
-      const rig = this.rigs.crane;
       this.craneSegmentMat.opacity = damp(this.craneSegmentMat.opacity, 0, 1 / FADE_DURATION, dt);
       if (this.craneSegmentMat.opacity <= 0.01) this.craneSegment.visible = false;
-      if (rig.craneCable) rig.craneCable.scale.y = damp(rig.craneCable.scale.y, 0.001, 8, dt);
+      if (this.craneRig.craneCable) this.craneRig.craneCable.scale.y = damp(this.craneRig.craneCable.scale.y, 0.001, 8, dt);
     }
   }
 
@@ -2384,8 +2490,8 @@ export class ConstructionRenderer {
    * active vehicle stamps at most once every TIRE_MARK_INTERVAL seconds so the ≤256 pool covers a
    * good stretch of road without instantly cycling through on a single pass.
    */
-  private updateTireMarks(dt: number): void {
-    for (const state of [...this.states.values(), this.roller]) {
+  private updateTireMarks(slot: CrewSlot, dt: number): void {
+    for (const state of [...slot.states.values(), slot.roller]) {
       if (!state.hasTarget) continue;
       const marking = (state.stage === 'graded' || state.stage === 'gravel') && state.curSpeed > 0.2;
       if (!marking) {
@@ -2409,10 +2515,10 @@ export class ConstructionRenderer {
    * Positioned just off to the side of whichever vehicle is currently the primary one (first
    * active found).
    */
-  private updateFloodlight(dt: number, night: boolean): void {
+  private updateFloodlight(slot: CrewSlot, dt: number, night: boolean): void {
     let anchor: VehicleState | null = null;
-    for (const [kind, state] of this.states) {
-      const lastSeen = this.lastSeenAt.get(kind) ?? -Infinity;
+    for (const [kind, state] of slot.states) {
+      const lastSeen = slot.lastSeenAt.get(kind) ?? -Infinity;
       if (this.clock - lastSeen <= this.IDLE_TIMEOUT && state.hasTarget) {
         anchor = state;
         break;
@@ -2421,62 +2527,71 @@ export class ConstructionRenderer {
 
     const wantVisible = night && anchor !== null;
     const target = wantVisible ? 1 : 0;
-    this.floodlightVisibility = damp(this.floodlightVisibility, target, 1 / FLOODLIGHT_EASE, dt);
+    slot.floodlightVisibility = damp(slot.floodlightVisibility, target, 1 / FLOODLIGHT_EASE, dt);
 
-    const visible = this.floodlightVisibility > 0.01;
-    this.floodlight.group.visible = visible;
+    const visible = slot.floodlightVisibility > 0.01;
+    slot.floodlight.group.visible = visible;
     if (visible && anchor) {
       const perpX = -Math.sin(anchor.curHeading);
       const perpZ = Math.cos(anchor.curHeading);
-      this.floodlight.group.position.set(
+      slot.floodlight.group.position.set(
         anchor.curPos.x + perpX * 6,
         anchor.curPos.y,
         anchor.curPos.z + perpZ * 6,
       );
-      this.floodlight.group.rotation.y = -anchor.curHeading + Math.PI / 2;
+      slot.floodlight.group.rotation.y = -anchor.curHeading + Math.PI / 2;
     }
 
-    this.floodlight.light.intensity = this.floodlightVisibility * 6;
-    this.floodlight.headMat.emissiveIntensity = this.floodlightVisibility * 2.2;
+    slot.floodlight.light.intensity = slot.floodlightVisibility * 6;
+    slot.floodlight.headMat.emissiveIntensity = slot.floodlightVisibility * 2.2;
+  }
+
+  private disposeRig(rig: VehicleRig): void {
+    this.scene.remove(rig.group);
+    rig.group.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.geometry.dispose();
+      }
+    });
+    for (const m of rig.materials) m.dispose();
+    rig.beaconMat.dispose();
   }
 
   dispose(): void {
-    for (const kind of Object.keys(this.rigs) as VehicleKind[]) {
-      const rig = this.rigs[kind];
-      this.scene.remove(rig.group);
-      rig.group.traverse((obj) => {
-        if (obj instanceof THREE.Mesh) {
-          obj.geometry.dispose();
-        }
+    for (const slot of this.crews) {
+      for (const kind of PER_CREW_KINDS) {
+        this.disposeRig(slot.rigs[kind]);
+      }
+
+      this.scene.remove(slot.cones.mesh);
+      slot.cones.dispose();
+
+      this.scene.remove(slot.stockpile.group);
+      slot.stockpile.group.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) obj.geometry.dispose();
       });
-      for (const m of rig.materials) m.dispose();
-      rig.beaconMat.dispose();
+      for (const m of slot.stockpile.materials) m.dispose();
+
+      this.scene.remove(slot.floodlight.group);
+      slot.floodlight.group.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) obj.geometry.dispose();
+      });
+      slot.floodlight.headMat.dispose();
+      slot.floodlight.poleMat.dispose();
     }
+
+    this.disposeRig(this.craneRig);
+
     this.scene.remove(this.dustPool.points);
     this.scene.remove(this.steamPool.points);
     this.scene.remove(this.gravelPool.points);
     this.scene.remove(this.tireMarks.mesh);
     this.scene.remove(this.stakes.mesh);
-    this.scene.remove(this.cones.mesh);
     this.dustPool.dispose();
     this.steamPool.dispose();
     this.gravelPool.dispose();
     this.tireMarks.dispose();
     this.stakes.dispose();
-    this.cones.dispose();
-
-    this.scene.remove(this.stockpile.group);
-    this.stockpile.group.traverse((obj) => {
-      if (obj instanceof THREE.Mesh) obj.geometry.dispose();
-    });
-    for (const m of this.stockpile.materials) m.dispose();
-
-    this.scene.remove(this.floodlight.group);
-    this.floodlight.group.traverse((obj) => {
-      if (obj instanceof THREE.Mesh) obj.geometry.dispose();
-    });
-    this.floodlight.headMat.dispose();
-    this.floodlight.poleMat.dispose();
 
     this.scene.remove(this.craneSegment);
     this.craneSegment.geometry.dispose();
