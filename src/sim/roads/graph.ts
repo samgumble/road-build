@@ -22,6 +22,31 @@ export class RoadGraph {
     return { x: Math.round(x / SNAP) * SNAP || 0, z: Math.round(z / SNAP) * SNAP || 0 };
   }
 
+  /**
+   * Magnetic snap for the draw tool (Fix: "separate roads should snap together"): finds the
+   * nearest existing NODE or edge-interior CONTROL POINT within `radius` of (x, z) and returns
+   * its exact position, so a new chain drawn near — but not exactly on — an existing junction or
+   * mid-edge point still lands precisely on it (commitChain's cut-detection then forms a proper
+   * junction). Falls back to the bare grid snap when nothing existing is within radius. Pure:
+   * only reads `nodes`/`edges`, never mutates.
+   */
+  magnetSnap(x: number, z: number, radius: number): P2 {
+    let best: P2 | null = null;
+    let bestDist = radius;
+    for (const n of this.nodes.values()) {
+      const d = Math.hypot(n.x - x, n.z - z);
+      if (d <= bestDist) { bestDist = d; best = { x: n.x, z: n.z }; }
+    }
+    for (const e of this.edges.values()) {
+      for (let i = 1; i < e.ctrl.length - 1; i++) {
+        const p = e.ctrl[i];
+        const d = Math.hypot(p.x - x, p.z - z);
+        if (d <= bestDist) { bestDist = d; best = { x: p.x, z: p.z }; }
+      }
+    }
+    return best ?? RoadGraph.snap(x, z);
+  }
+
   private polyLength(s: RoadSample[]): number {
     let L = 0;
     for (let i = 1; i < s.length; i++) L += Math.hypot(s[i].x - s[i-1].x, s[i].y - s[i-1].y, s[i].z - s[i-1].z);

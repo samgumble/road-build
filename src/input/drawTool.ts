@@ -15,6 +15,10 @@ const HOVER_YLIFT = 0.15;
 const HOVER_BREATHE_HZ = 0.5;
 const HOVER_BREATHE_AMOUNT = 0.05;
 const FADE_DURATION = 0.3; // seconds
+// Magnetic snap radius (Fix: "separate roads should snap together") — wide enough to catch a
+// cursor that's a bit off an existing junction/mid-edge point (grid cells are 8u) without pulling
+// in unrelated nodes across a normal street spacing.
+const MAGNET_RADIUS = 6;
 
 const STAKE_DUST_COUNT = 200; // pool capacity — plenty for rapid-fire stake planting during a drag
 const STAKE_DUST_BURST = 5; // particles spawned per planted stake
@@ -211,7 +215,7 @@ export class DrawTool {
       el.setPointerCapture(e.pointerId);
       this.hoverRing.visible = false;
 
-      const p = RoadGraph.snap(hit.x, hit.z);
+      const p = this.graph.magnetSnap(hit.x, hit.z, MAGNET_RADIUS);
       this.chain = [p];
       this.updatePreview();
       this.spawnStakeDust(p.x, p.z);
@@ -230,7 +234,7 @@ export class DrawTool {
 
       const hit = this.groundPointAt(e.clientX, e.clientY);
       if (!hit) return;
-      const p = RoadGraph.snap(hit.x, hit.z);
+      const p = this.graph.magnetSnap(hit.x, hit.z, MAGNET_RADIUS);
       const last = this.chain[this.chain.length - 1];
       if (last && last.x === p.x && last.z === p.z) return;
       this.chain.push(p);
@@ -324,7 +328,7 @@ export class DrawTool {
       this.hoverRing.visible = false;
       return;
     }
-    const p = RoadGraph.snap(hit.x, hit.z);
+    const p = this.graph.magnetSnap(hit.x, hit.z, MAGNET_RADIUS);
     const y = this.hf.heightAt(p.x, p.z) + HOVER_YLIFT;
     this.hoverBase.set(p.x, y, p.z);
     this.hoverRing.material = this.hoverRingMat;

@@ -57,4 +57,27 @@ describe('RoadGraph', () => {
     expect(g.nodes.size).toBe(0);
     expect(g.edges.size).toBe(0);
   });
+
+  describe('magnetSnap', () => {
+    it('returns an existing node exact position when within radius', () => {
+      const g = mk();
+      g.commitChain([{ x: 0, z: 0 }, { x: 16, z: 0 }]);
+      // node sits at (16, 0); a cursor a few units off should snap to it exactly,
+      // not to the bare grid point nearest the cursor itself.
+      expect(g.magnetSnap(18, 2, 6)).toEqual({ x: 16, z: 0 });
+    });
+    it('returns an edge interior control point when that is nearest', () => {
+      const g = mk();
+      g.commitChain([{ x: 0, z: 0 }, { x: 8, z: 0 }, { x: 16, z: 0 }]);
+      // (8,0) is an interior ctrl point (not a node) of the single edge; a cursor near it
+      // should snap onto it.
+      expect(g.magnetSnap(9, 1, 6)).toEqual({ x: 8, z: 0 });
+    });
+    it('falls back to grid snap when nothing is within radius', () => {
+      const g = mk();
+      g.commitChain([{ x: 0, z: 0 }, { x: 16, z: 0 }]);
+      // far away from any existing node/ctrl point — should fall back to RoadGraph.snap.
+      expect(g.magnetSnap(200, 200, 6)).toEqual(RoadGraph.snap(200, 200));
+    });
+  });
 });
