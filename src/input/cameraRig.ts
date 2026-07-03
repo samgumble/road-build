@@ -98,16 +98,19 @@ export class CameraRig {
       const prevRadius = this.goalRadius;
       this.goalRadius = THREE.MathUtils.clamp(this.goalRadius * factor, MIN_RADIUS, MAX_RADIUS);
 
-      // Dolly toward cursor: shift goalTarget slightly along the ray under the cursor.
+      // Dolly toward cursor: shift goalTarget slightly along the ray under the cursor. When the
+      // ray has no usable terrain intersection (cursor over open sky, or a near-horizon grazing
+      // ray whose intersection would land implausibly far away — see rayGroundIntersection's
+      // MAX_RADIUS*2 cap), fall back to dollying toward the camera's current look-target instead
+      // of leaving goalTarget untouched — this keeps the zoom-toward-cursor *feel* consistent
+      // without ever being able to fling the camera off toward a degenerate point.
       const ndc = this.pointerToNdc(e.clientX, e.clientY);
       const dir = this.ndcToWorldDir(ndc);
-      const groundPoint = this.rayGroundIntersection(dir);
-      if (groundPoint) {
-        const radiusDelta = prevRadius - this.goalRadius;
-        const t = THREE.MathUtils.clamp(radiusDelta / prevRadius, -0.5, 0.5);
-        const toPoint = new THREE.Vector3().subVectors(groundPoint, this.goalTarget);
-        this.goalTarget.addScaledVector(toPoint, t);
-      }
+      const groundPoint = this.rayGroundIntersection(dir) ?? this.goalTarget.clone();
+      const radiusDelta = prevRadius - this.goalRadius;
+      const t = THREE.MathUtils.clamp(radiusDelta / prevRadius, -0.5, 0.5);
+      const toPoint = new THREE.Vector3().subVectors(groundPoint, this.goalTarget);
+      this.goalTarget.addScaledVector(toPoint, t);
     };
 
     const onKeyDown = (e: KeyboardEvent) => {
@@ -170,11 +173,26 @@ export class CameraRig {
     return v.sub(this.camera.position).normalize();
   }
 
+  /**
+   * Camera fix (Addendum A Task 21 deliverable 6): the wheel-dolly used to fling the camera when
+   * the cursor ray grazed near the horizon. The strict "points at open sky" case (`dir.y >= 0`,
+   * ray never crosses y=0) was already guarded below and is harmless on its own. The actual bug
+   * was near-miss rays just *below* the horizon: `dir.y` a tiny negative number (cursor near the
+   * top of the screen while the camera is looking nearly flat) drives `t = -origin.y/dir.y` to a
+   * huge value, so `groundPoint` lands thousands of units away. `onWheel` blends toward that point
+   * with a factor clamped to [-0.5, 0.5], but the vector being blended is itself enormous, so a
+   * single wheel tick could still yank `goalTarget` far off, and it compounds on repeated ticks at
+   * the same grazing angle. Reject any intersection whose distance from the camera exceeds
+   * MAX_RADIUS * 2 (comfortably covers every legitimate on-screen ground point at any allowed
+   * zoom level) — beyond that it's functionally "hit the sky", so onWheel's existing `if
+   * (groundPoint)` null-check already does the right thing: dolly the zoom without touching
+   * goalTarget instead of flinging it toward a degenerate point.
+   */
   private rayGroundIntersection(dir: THREE.Vector3): THREE.Vector3 | null {
     const origin = this.camera.position;
     if (Math.abs(dir.y) < 1e-6) return null;
     const t = -origin.y / dir.y;
-    if (t < 0) return null;
+    if (t < 0 || t > MAX_RADIUS * 2) return null;
     return new THREE.Vector3().copy(origin).addScaledVector(dir, t);
   }
 
