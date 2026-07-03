@@ -20,6 +20,15 @@ const STAGE_VEHICLE: Record<Exclude<Stage, 'surveyed'>, VehicleKind> = {
   painted: 'liner',
 };
 
+// --- Survey work phase (Task 21) ------------------------------------------------------------
+// Every fresh build job begins with a survey pass — a `surveyor` vehicle walks the edge once at
+// SURVEY_SPEED before any graded work starts. Edges are already born 'surveyed' (see
+// `RoadGraph.makeEdge`), so this phase never triggers a `construction:stage` transition; it just
+// gives the renderer a leading unit + planted stakes to animate ahead of the excavator. Demolish
+// jobs (walking a built road back down) and resumed jobs starting at/after 'graded' (i.e. anything
+// already past 'surveyed', per `enqueueResume`) skip it entirely — there's nothing left to survey.
+const SURVEY_SPEED = 20;
+
 // The brief's sketch mentions `ROAD_WIDTH * 1.4`, but that footprint (8.4 units either side of a
 // 6-unit road) is wide enough that a single forward pass repeatedly overwrites the same grid
 // cells with different vehicle-height targets as it moves through curved elevation, causing the
@@ -40,6 +49,11 @@ interface Job {
 interface ActiveJob extends Job {
   stageIndex: number; // index into STAGES of the stage currently being built/undone
   t: number; // arclength progress within the current stage's pass
+  /** true while the job is still in its pre-graded survey pass (see SURVEY_SPEED above); once the
+   * surveyor reaches the edge's end this flips false and normal staged building begins at
+   * stageIndex/t as already set. Always false for demolish jobs and for resumed jobs (they start
+   * at/after 'graded', i.e. already past the point a survey pass would cover). */
+  surveying: boolean;
 }
 
 /**
@@ -184,10 +198,13 @@ export class BuildQueue {
           // enqueueDemolish drops pending builds instead of queuing a demolish job for them).
           continue;
         }
-        this.active = { edgeId: job.edgeId, demolish: true, stageIndex, t: edge.length };
+        this.active = { edgeId: job.edgeId, demolish: true, stageIndex, t: edge.length, surveying: false };
       } else {
         const stageIndex = job.resumeAt ?? STAGES.indexOf('graded');
-        this.active = { edgeId: job.edgeId, demolish: false, stageIndex, t: 0 };
+        // Only a genuinely fresh build (no `resumeAt`) gets a survey pass — a resumed job by
+        // definition starts at/after 'graded', i.e. the edge is already past 'surveyed'.
+        const surveying = job.resumeAt === undefined;
+        this.active = { edgeId: job.edgeId, demolish: false, stageIndex, t: 0, surveying };
       }
     }
   }
@@ -200,6 +217,28 @@ export class BuildQueue {
       // Edge disappeared out from under us (externally removed) — drop and move on.
       this.active = null;
       this.maybeStartNext();
+      return;
+    }
+
+    if (job.surveying) {
+      job.t += SURVEY_SPEED * dt;
+      const clampedT = Math.max(0, Math.min(edge.length, job.t));
+      const { pos, heading } = sampleAt(edge.samples, clampedT);
+      this.bus.emit('construction:progress', {
+        edgeId: job.edgeId,
+        stage: 'surveyed',
+        t: clampedT,
+        pos,
+        heading,
+        vehicle: 'surveyor',
+        demolish: false,
+      });
+      if (job.t >= edge.length) {
+        // Survey pass complete — no stage transition (the edge is already 'surveyed'); hand off
+        // to normal graded-stage building starting fresh from t=0.
+        job.surveying = false;
+        job.t = 0;
+      }
       return;
     }
 

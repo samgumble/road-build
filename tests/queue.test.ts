@@ -167,4 +167,82 @@ describe('BuildQueue', () => {
     expect(stages.length).toBeGreaterThan(1);
     expect(graph.edges.has(targetId)).toBe(false);
   });
+
+  describe('survey work phase', () => {
+    it('a fresh build starts with surveyor progress events, then transitions to excavator', () => {
+      const { bus, queue, edgeId } = setup();
+      const vehiclesInOrder: string[] = [];
+      bus.on('construction:progress', (e) => {
+        if (e.edgeId !== edgeId) return;
+        if (vehiclesInOrder[vehiclesInOrder.length - 1] !== e.vehicle) vehiclesInOrder.push(e.vehicle);
+      });
+      run(queue, 1); // just enough to observe the very start of the job
+      expect(vehiclesInOrder[0]).toBe('surveyor');
+      run(queue, 120); // run out the rest of the build
+      expect(vehiclesInOrder).toContain('excavator');
+      expect(vehiclesInOrder.indexOf('surveyor')).toBeLessThan(vehiclesInOrder.indexOf('excavator'));
+    });
+
+    it('surveyor progress events report stage "surveyed"', () => {
+      const { bus, queue, edgeId } = setup();
+      let sawSurveyedStage = false;
+      bus.on('construction:progress', (e) => {
+        if (e.edgeId === edgeId && e.vehicle === 'surveyor') {
+          expect(e.stage).toBe('surveyed');
+          sawSurveyedStage = true;
+        }
+      });
+      run(queue, 1);
+      expect(sawSurveyedStage).toBe(true);
+    });
+
+    it('the survey phase does not trigger a stage transition event (edges are already born surveyed)', () => {
+      const { bus, queue, edgeId } = setup();
+      const stageEvents: Stage[] = [];
+      bus.on('construction:stage', (e) => { if (e.edgeId === edgeId) stageEvents.push(e.stage as Stage); });
+      run(queue, 1); // still within the survey phase (20 u/s over a 32-unit edge => ~1.6s)
+      expect(stageEvents).not.toContain('surveyed');
+    });
+
+    it('a full build still completes through all stages to painted', () => {
+      const { bus, queue, edgeId, graph } = setup();
+      const stages: (Stage | 'removed')[] = [];
+      bus.on('construction:stage', (e) => { if (e.edgeId === edgeId) stages.push(e.stage); });
+      run(queue, 120);
+      expect(stages).toEqual(['graded', 'gravel', 'paved', 'painted']);
+      expect(graph.edges.get(edgeId)!.stage).toBe('painted');
+    });
+
+    it('resuming a build from a stage past surveyed (e.g. gravel) emits no surveyor events', () => {
+      const bus = new EventBus();
+      const hf = new Heightfield('q-test-resume-survey', bus);
+      const graph = new RoadGraph(bus, makeSampler(hf));
+      const queue = new BuildQueue(graph, hf, bus);
+      const anchor = findAnchor(hf, 32);
+      const [edgeId] = graph.commitChain([anchor, { x: anchor.x + 32, z: anchor.z }]);
+
+      // Simulate a restore mid-build (Task 15 style): force the edge to 'gravel' directly (as
+      // restoreWorld does) rather than replaying the crew, then resume via enqueueResume.
+      queue.clearPending(edgeId); // drop the auto-enqueued fresh build job first
+      graph.edges.get(edgeId)!.stage = 'gravel';
+      queue.enqueueResume(edgeId);
+
+      let sawSurveyor = false;
+      bus.on('construction:progress', (e) => { if (e.vehicle === 'surveyor') sawSurveyor = true; });
+      run(queue, 120);
+      expect(sawSurveyor).toBe(false);
+      expect(graph.edges.get(edgeId)!.stage).toBe('painted');
+    });
+
+    it('demolish jobs emit no surveyor events', () => {
+      const { bus, queue, graph, edgeId } = setup();
+      run(queue, 120); // fully build first
+      queue.enqueueDemolish(edgeId);
+      let sawSurveyor = false;
+      bus.on('construction:progress', (e) => { if (e.vehicle === 'surveyor') sawSurveyor = true; });
+      run(queue, 120);
+      expect(sawSurveyor).toBe(false);
+      expect(graph.edges.has(edgeId)).toBe(false);
+    });
+  });
 });
