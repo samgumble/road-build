@@ -11,15 +11,19 @@ interface Stop {
 }
 
 // Sky/fog color stops across the day cycle (matches the brief's palette).
+// Task 23: user reported night reading as too dark ("moonless pit"). Lifted the two deep-night
+// stops from '#0e1220' to '#151b30' — a touch more blue and noticeably higher luminance (roughly
+// +40% per channel) — while leaving dusk/dawn stops untouched, so the mood shifts from "pitch
+// black" to "clear night with ambient skyglow" without flattening the day/night contrast.
 const SKY_STOPS: Stop[] = [
-  { t: 0.0, color: new THREE.Color('#0e1220') }, // deep night
-  { t: 0.22, color: new THREE.Color('#0e1220') }, // still night just before dawn
+  { t: 0.0, color: new THREE.Color('#151b30') }, // deep night
+  { t: 0.22, color: new THREE.Color('#151b30') }, // still night just before dawn
   { t: 0.28, color: new THREE.Color('#f5a35c') }, // dawn
   { t: 0.4, color: new THREE.Color('#bfd9e8') }, // day
   { t: 0.72, color: new THREE.Color('#bfd9e8') }, // day
   { t: 0.82, color: new THREE.Color('#e07a3f') }, // dusk
-  { t: 0.92, color: new THREE.Color('#0e1220') }, // night
-  { t: 1.0, color: new THREE.Color('#0e1220') },
+  { t: 0.92, color: new THREE.Color('#151b30') }, // night
+  { t: 1.0, color: new THREE.Color('#151b30') },
 ];
 
 const SUN_WARM = new THREE.Color('#fff3d6');
@@ -72,7 +76,9 @@ const RAIN_MAX_DURATION = 60;
 const NIGHT_HYSTERESIS = 0.02;
 
 const EXPOSURE_DAY = 1.0;
-const EXPOSURE_NIGHT = 0.65;
+// Task 23: raised from 0.65 so ACES tone mapping doesn't crush night scenes to near-black;
+// 0.75 keeps a clear day/night exposure difference while making terrain silhouettes readable.
+const EXPOSURE_NIGHT = 0.75;
 const EXPOSURE_LAMBDA = 1.5; // ease rate, 1/s
 
 /**
@@ -323,8 +329,10 @@ export class Atmosphere {
     );
     this.sun.target.position.set(0, 0, 0);
 
-    // Hemisphere light 0.15 (night) -> 0.55 (day).
-    this.hemi.intensity = THREE.MathUtils.lerp(0.15, 0.55, elevation01);
+    // Hemisphere light 0.24 (night) -> 0.55 (day). Task 23: floor raised from 0.15 so the darkest
+    // part of the night still has enough ambient skyglow to read terrain silhouettes, without
+    // raising the daytime end (keeps day/night contrast, i.e. the "mood", intact).
+    this.hemi.intensity = THREE.MathUtils.lerp(0.24, 0.55, elevation01);
   }
 
   private applyExposure(dt: number): void {

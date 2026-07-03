@@ -13,17 +13,46 @@ const FALLBACK_PALETTE = [
   0x8a8f94, 0x5c6b73, 0x9c8060, 0x6e5a4e, 0x7a3b3b, 0x455a4a, 0x3f4a5a, 0xb5ab94,
 ];
 
-const HEADLIGHT_COLOR = 0xfff6d8;
-const HEADLIGHT_SIZE = 0.22;
+// Task 23: user reported headlights ("tiny emissive white quads") were too subtle to read at
+// night. Enlarged + brightened the glow quads (warm white, high emissiveIntensity-equivalent via
+// toneMapped:false MeshBasicMaterial so ACES doesn't crush it under the darker night exposure),
+// added a red tail-light pair sharing the same InstancedMesh via per-instance vertex color (still
+// within the "<=2 additional InstancedMeshes" budget alongside the new light-cone mesh below), and
+// added an instanced fake "beam" cone quad per car.
+const HEADLIGHT_COLOR = new THREE.Color(0xfff8e0);
+const TAILLIGHT_COLOR = new THREE.Color(0xff2f1f);
+const HEADLIGHT_SIZE = 0.34; // was 0.22 — small enough to previously bloom-read as a faint dot
 const HEADLIGHT_Y = 0.45; // height above car origin (car origin sits on the road surface)
-const HEADLIGHT_FORWARD = 2.0; // distance ahead of car center along heading
+const HEADLIGHT_FORWARD = 2.05; // distance ahead of car center along heading
 const HEADLIGHT_SIDE = 0.55; // lateral offset from center
+const TAILLIGHT_SIZE = 0.24;
+const TAILLIGHT_BACK = 2.05; // distance behind car center along heading
+const TAILLIGHT_SIDE = 0.5;
+
+// Light-cone "fake beam": a flat trapezoid quad projecting ahead of the car at ground level,
+// additive-blended and translucent so it reads as a soft headlight pool on the road without any
+// real per-car lights (which would blow the instancing/draw-call budget). Authored in local space
+// with the car at the origin facing local +X (narrow edge at the car, wide edge BEAM_LENGTH
+// ahead), then oriented per-instance the same way the headlight quads are.
+const BEAM_LENGTH = 7; // u, "projecting ~7u ahead" per spec
+const BEAM_NEAR_HALF_WIDTH = 0.5; // half-width of the near (car-side) edge
+const BEAM_FAR_HALF_WIDTH = 2.4; // half-width of the far edge — spreads like a real headlight cone
+const BEAM_Y = 0.03; // just above ground to avoid z-fighting with road/terrain
+const BEAM_COLOR = 0xffdca0;
+const BEAM_OPACITY = 0.22;
+
+// Night amount (0..1) eases toward the boolean `night` flag over this many seconds, so headlights/
+// beams/tail lights fade in and out rather than popping instantly at the day/night threshold.
+const NIGHT_EASE_SECONDS = 1.5;
 
 const dummyMatrix = new THREE.Matrix4();
 const dummyPos = new THREE.Vector3();
 const dummyQuat = new THREE.Quaternion();
 const dummyScale = new THREE.Vector3(1, 1, 1);
 const upAxis = new THREE.Vector3(0, 1, 0);
+// Scratch objects for the glow quads (reused across cars/frames to avoid per-car allocation).
+const glowQuat = new THREE.Quaternion();
+const glowScale = new THREE.Vector3(1, 1, 1);
 
 /** One instanced-mesh "variant" pool: either a loaded GLTF car shape or the fallback box shape. */
 interface VariantMesh {
@@ -38,32 +67,76 @@ interface VariantMesh {
  * fail to load for any reason, falls back to a simple box+cabin InstancedMesh (capacity 100) with
  * per-instance `instanceColor` from a muted palette, so the game never breaks.
  *
- * A second small InstancedMesh renders emissive headlight quads at the front of each car,
- * shown only when `night` is true in `update(cars, night)`.
+ * A second InstancedMesh ("glows") renders emissive headlight (warm white, front) and tail light
+ * (red, rear) quads for each car, distinguished per-instance via `instanceColor`; a third
+ * InstancedMesh ("beams") renders an additive-blended fake light-cone projecting ahead of each
+ * car. Both are shown/faded via an internally-eased night amount driven by the boolean `night`
+ * passed to `update(cars, night)` (see NIGHT_EASE_SECONDS) — two additional InstancedMeshes total,
+ * within budget.
  */
 export class CarRenderer {
   private variants: VariantMesh[] = [];
   private usingFallback = false;
   private ready = false;
 
-  private headlights: THREE.InstancedMesh;
-  private headlightGeo: THREE.BufferGeometry;
-  private headlightMat: THREE.MeshBasicMaterial;
+  private glows: THREE.InstancedMesh;
+  private glowGeo: THREE.BufferGeometry;
+  private glowMat: THREE.MeshBasicMaterial;
+
+  private beams: THREE.InstancedMesh;
+  private beamGeo: THREE.BufferGeometry;
+  private beamMat: THREE.MeshBasicMaterial;
+
+  private nightAmount = 0; // eased 0..1, see NIGHT_EASE_SECONDS
 
   constructor(private scene: THREE.Scene) {
-    // Headlights: capacity covers 2 lights per car across the full combined capacity.
+    // Glows (headlights + tail lights): capacity covers 2 headlight + 2 tail instances per car
+    // across the full combined capacity.
     const totalCapacity = CAR_CAPACITY_PER_VARIANT * VARIANT_FILES.length;
-    this.headlightGeo = new THREE.PlaneGeometry(HEADLIGHT_SIZE, HEADLIGHT_SIZE);
-    this.headlightMat = new THREE.MeshBasicMaterial({
-      color: HEADLIGHT_COLOR,
+    this.glowGeo = new THREE.PlaneGeometry(HEADLIGHT_SIZE, HEADLIGHT_SIZE);
+    this.glowMat = new THREE.MeshBasicMaterial({
+      // Base color white: InstancedMesh.instanceColor multiplies in automatically (three.js
+      // enables USE_INSTANCING_COLOR whenever instanceColor is non-null, no vertexColors flag
+      // needed) — per-instance color below drives the actual hue (warm white vs red).
+      color: 0xffffff,
       toneMapped: false,
       transparent: true,
       opacity: 0.95,
+      depthWrite: false,
     });
-    this.headlights = new THREE.InstancedMesh(this.headlightGeo, this.headlightMat, totalCapacity * 2);
-    this.headlights.count = 0;
-    this.headlights.frustumCulled = false;
-    this.scene.add(this.headlights);
+    this.glows = new THREE.InstancedMesh(this.glowGeo, this.glowMat, totalCapacity * 4);
+    this.glows.instanceColor = new THREE.InstancedBufferAttribute(
+      new Float32Array(totalCapacity * 4 * 3),
+      3,
+    );
+    this.glows.count = 0;
+    this.glows.frustumCulled = false;
+    this.scene.add(this.glows);
+
+    // Beams: one flat trapezoid per car, authored pointing local +X (see BEAM_* consts), additive
+    // and depthWrite:false so overlapping beams blend rather than z-fight.
+    this.beamGeo = new THREE.BufferGeometry();
+    const bp = new Float32Array([
+      0, BEAM_Y, -BEAM_NEAR_HALF_WIDTH,
+      0, BEAM_Y, BEAM_NEAR_HALF_WIDTH,
+      BEAM_LENGTH, BEAM_Y, BEAM_FAR_HALF_WIDTH,
+      BEAM_LENGTH, BEAM_Y, -BEAM_FAR_HALF_WIDTH,
+    ]);
+    this.beamGeo.setAttribute('position', new THREE.BufferAttribute(bp, 3));
+    this.beamGeo.setIndex([0, 1, 2, 0, 2, 3]);
+    this.beamMat = new THREE.MeshBasicMaterial({
+      color: BEAM_COLOR,
+      toneMapped: false,
+      transparent: true,
+      opacity: BEAM_OPACITY,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    });
+    this.beams = new THREE.InstancedMesh(this.beamGeo, this.beamMat, totalCapacity);
+    this.beams.frustumCulled = false;
+    this.beams.count = 0;
+    this.scene.add(this.beams);
 
     this.loadGltfVariants().catch(() => {
       this.buildFallback();
@@ -191,14 +264,25 @@ export class CarRenderer {
 
   /**
    * Writes each car's transform into its variant's InstancedMesh (variant = `car.id % variants`),
-   * and (when `night`) two headlight quad instances near the front of each car. Cars beyond a
-   * variant's capacity are silently dropped (targetPopulation is capped well below capacity).
+   * plus (faded by an internally-eased night amount, see NIGHT_EASE_SECONDS) headlight/tail-light
+   * glow quads and a light-cone beam quad per car. Cars beyond a variant's capacity are silently
+   * dropped (targetPopulation is capped well below capacity). `dt` is wall-clock seconds, used
+   * only to ease the night fade — matches the render loop's own dt (see main.ts).
    */
-  update(cars: ReadonlyArray<TrafficCar>, night: boolean): void {
+  update(cars: ReadonlyArray<TrafficCar>, night: boolean, dt: number): void {
+    const target = night ? 1 : 0;
+    const rate = NIGHT_EASE_SECONDS > 0 ? dt / NIGHT_EASE_SECONDS : 1;
+    if (this.nightAmount < target) this.nightAmount = Math.min(target, this.nightAmount + rate);
+    else if (this.nightAmount > target) this.nightAmount = Math.max(target, this.nightAmount - rate);
+
     if (!this.ready || this.variants.length === 0) return;
 
     const perVariantIndex = new Array(this.variants.length).fill(0);
-    let headlightIndex = 0;
+    let glowIndex = 0;
+    let beamIndex = 0;
+    const lightsVisible = this.nightAmount > 0.001;
+    const headColor = HEADLIGHT_COLOR;
+    const tailColor = TAILLIGHT_COLOR;
 
     for (const car of cars) {
       const variantIdx = car.id % this.variants.length;
@@ -223,21 +307,48 @@ export class CarRenderer {
         variant.mesh.setColorAt(slot, c);
       }
 
-      if (night) {
+      if (lightsVisible) {
         const fx = Math.cos(car.heading);
         const fz = Math.sin(car.heading);
         const sx = -Math.sin(car.heading);
         const sz = Math.cos(car.heading);
+        glowQuat.setFromAxisAngle(upAxis, -car.heading + Math.PI / 2);
+
         for (const side of [-1, 1]) {
-          if (headlightIndex >= this.headlights.instanceMatrix.count) break;
-          const hx = car.pos.x + fx * HEADLIGHT_FORWARD + sx * HEADLIGHT_SIDE * side;
-          const hz = car.pos.z + fz * HEADLIGHT_FORWARD + sz * HEADLIGHT_SIDE * side;
-          const hy = car.pos.y + HEADLIGHT_Y;
-          dummyPos.set(hx, hy, hz);
-          dummyQuat.setFromAxisAngle(upAxis, -car.heading + Math.PI / 2);
+          if (glowIndex < this.glows.instanceMatrix.count) {
+            const hx = car.pos.x + fx * HEADLIGHT_FORWARD + sx * HEADLIGHT_SIDE * side;
+            const hz = car.pos.z + fz * HEADLIGHT_FORWARD + sz * HEADLIGHT_SIDE * side;
+            const hy = car.pos.y + HEADLIGHT_Y;
+            dummyPos.set(hx, hy, hz);
+            dummyMatrix.compose(dummyPos, glowQuat, dummyScale);
+            this.glows.setMatrixAt(glowIndex, dummyMatrix);
+            this.glows.setColorAt(glowIndex, headColor);
+            glowIndex++;
+          }
+        }
+        for (const side of [-1, 1]) {
+          if (glowIndex < this.glows.instanceMatrix.count) {
+            const tx = car.pos.x - fx * TAILLIGHT_BACK + sx * TAILLIGHT_SIDE * side;
+            const tz = car.pos.z - fz * TAILLIGHT_BACK + sz * TAILLIGHT_SIDE * side;
+            const ty = car.pos.y + HEADLIGHT_Y;
+            dummyPos.set(tx, ty, tz);
+            const s = TAILLIGHT_SIZE / HEADLIGHT_SIZE;
+            glowScale.set(s, s, s);
+            dummyMatrix.compose(dummyPos, glowQuat, glowScale);
+            this.glows.setMatrixAt(glowIndex, dummyMatrix);
+            this.glows.setColorAt(glowIndex, tailColor);
+            glowIndex++;
+          }
+        }
+
+        if (beamIndex < this.beams.instanceMatrix.count) {
+          // Beam geometry's forward axis is local +X, matching the fallback box-car convention
+          // (see the `yaw` computation above, which uses -car.heading for +X-forward geometry).
+          dummyPos.set(car.pos.x, car.pos.y, car.pos.z);
+          dummyQuat.setFromAxisAngle(upAxis, -car.heading);
           dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
-          this.headlights.setMatrixAt(headlightIndex, dummyMatrix);
-          headlightIndex++;
+          this.beams.setMatrixAt(beamIndex, dummyMatrix);
+          beamIndex++;
         }
       }
     }
@@ -249,9 +360,18 @@ export class CarRenderer {
       if (v.mesh.instanceColor) v.mesh.instanceColor.needsUpdate = true;
     }
 
-    this.headlights.visible = night;
-    this.headlights.count = night ? headlightIndex : 0;
-    this.headlights.instanceMatrix.needsUpdate = true;
+    // Eased fade: opacity ramps with nightAmount (not a hard on/off), matching the 1-2s ease the
+    // spec calls for; mesh stays visible through the fade and only fully hides at amount<=0.
+    this.glows.visible = lightsVisible;
+    this.glows.count = lightsVisible ? glowIndex : 0;
+    this.glows.instanceMatrix.needsUpdate = true;
+    if (this.glows.instanceColor) this.glows.instanceColor.needsUpdate = true;
+    this.glowMat.opacity = 0.95 * this.nightAmount;
+
+    this.beams.visible = lightsVisible;
+    this.beams.count = lightsVisible ? beamIndex : 0;
+    this.beams.instanceMatrix.needsUpdate = true;
+    this.beamMat.opacity = BEAM_OPACITY * this.nightAmount;
   }
 
   dispose(): void {
@@ -262,8 +382,11 @@ export class CarRenderer {
       if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
       else mat.dispose();
     }
-    this.scene.remove(this.headlights);
-    this.headlightGeo.dispose();
-    this.headlightMat.dispose();
+    this.scene.remove(this.glows);
+    this.glowGeo.dispose();
+    this.glowMat.dispose();
+    this.scene.remove(this.beams);
+    this.beamGeo.dispose();
+    this.beamMat.dispose();
   }
 }

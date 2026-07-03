@@ -172,7 +172,7 @@ function main(): void {
       // all, so the day cycle previously ran at real-world speed regardless of the selected speed.
       atmosphere.update(dt * loop.timeScale);
       constructionRenderer.update(dt, atmosphere.night);
-      carRenderer.update(traffic.cars, atmosphere.night);
+      carRenderer.update(traffic.cars, atmosphere.night, dt);
       sceneryRenderer.update(dt);
       // Audio intentionally stays real-time: `update()` uses `dt` only for its own wall-clock
       // scheduling (bird/cricket timers, pad chord crossfades), not to advance the day cycle —
