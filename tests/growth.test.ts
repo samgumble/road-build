@@ -25,10 +25,16 @@ describe('GrowthSim', () => {
     const { bus, sim } = world();
     const kinds: string[] = [];
     bus.on('growth:spawn', (e) => kinds.push(e.kind));
-    for (let i = 0; i < 60 * 300; i++) sim.update(1 / 60); // 5 sim-minutes
+    // Task 23 slowed development pacing (first house no sooner than ~3 sim-min, first building no
+    // sooner than ~5 sim-min — see growth.ts's THRESHOLDS/DEV_RATE_BASE doc comments), so the old
+    // 5 sim-minute run no longer reliably observes houses. Extended to 7 sim-minutes, which
+    // comfortably clears the ~231s first-house / ~324s first-building marks measured by direct
+    // simulation while keeping the assertions themselves unchanged in strength.
+    for (let i = 0; i < 60 * 420; i++) sim.update(1 / 60); // 7 sim-minutes
     expect(kinds.filter((k) => k === 'tree').length).toBeGreaterThan(0);
     const firstTree = kinds.indexOf('tree'), firstHouse = kinds.indexOf('house');
-    if (firstHouse !== -1) expect(firstTree).toBeLessThan(firstHouse);
+    expect(firstHouse).toBeGreaterThan(-1); // pacing slowed but houses must still appear in 7 sim-min
+    expect(firstTree).toBeLessThan(firstHouse);
     expect(sim.houseCount).toBe(kinds.filter((k) => k === 'house').length);
   });
   it('spawns nothing with no painted roads', () => {

@@ -8,9 +8,24 @@ const HALF = WORLD_SIZE / 2;
 
 const RECOMPUTE_INTERVAL = 2; // sim-seconds, throttle for distance-field recompute on roads:changed
 const MAX_ROAD_DIST_CELLS = 6; // ~24u; cells beyond this never accumulate development
-const DEV_RATE_BASE = 0.008;
+// Tuned (Task 23) against user feedback that development felt "too eager": at a fresh road's
+// closest ring (d=0) with the per-cell RATE_VARIANCE multiplier below, this rate lands first
+// trees ~65-115s, first fields ~135-230s, first houses no sooner than ~230s (~3.8 sim-min), first
+// buildings no sooner than ~320s (~5.4 sim-min) — measured by direct simulation, see the numbers
+// documented alongside THRESHOLDS below. Previously 0.008, which put houses under 1.5 sim-min.
+const DEV_RATE_BASE = 0.0026;
 const DEV_RATE_DIST_DIVISOR = 7;
 const MAX_SLOPE = 0.5;
+
+// Per-cell multiplier applied to DEV_RATE_BASE, rolled once per cell the first time it starts
+// accumulating (see `rateMult` below) and held fixed thereafter. Widens the range in
+// DEV_RATE_BASE's doc comment from a single fixed pace into a spread of paces so neighboring
+// cells along the same road don't cross thresholds in lockstep (previously every cell at a given
+// distance-ring advanced identically, reading as a synchronized "wave" of development sweeping
+// outward). +/-25% keeps the earliest/latest cells within the target windows while still visibly
+// staggering which cell "wins" next.
+const RATE_VARIANCE_MIN = 0.75;
+const RATE_VARIANCE_MAX = 1.25;
 
 const JITTER = 2.2; // u — wide enough relative to CELL (4u) that neighboring cells' trees don't line up into a hedge
 // u, spawns are pushed away from road samples closer than this. House/building pads flatten a
@@ -49,11 +64,23 @@ interface Threshold {
 
 // Order matters: checked ascending so lower thresholds are guaranteed to have already fired
 // (and thus their spawn events precede) higher ones for any given cell.
+//
+// Tuned (Task 23) alongside DEV_RATE_BASE/RATE_VARIANCE_* so a cell at the closest road ring
+// (d=0) crosses thresholds at, across the +/-25% per-cell rate variance (direct simulation, 200
+// cells, dt=1/60):
+//   tree:      first ~68s,  median ~86s   (target 45-90s)
+//   field:     first ~139s, median ~176s  (target ~2 sim-min)
+//   house:     first ~231s, median ~293s  (target >= 3 sim-min / 180s)
+//   building:  first ~323s, median ~357s  (target >= 5 sim-min / 300s; only ~half of cells
+//              reach 'building' within the 400s simulation window, matching buildings being the
+//              rarest/last stage)
+// Previously 0.25/0.5/0.75/0.95 with a fixed (no-variance) 0.008 rate, which put houses under 1.5
+// sim-minutes and buildings under 2.
 const THRESHOLDS: Threshold[] = [
-  { value: 0.25, bit: 1 << 0, kind: 'tree' },
-  { value: 0.5, bit: 1 << 1, kind: 'field' },
+  { value: 0.22, bit: 1 << 0, kind: 'tree' },
+  { value: 0.45, bit: 1 << 1, kind: 'field' },
   { value: 0.75, bit: 1 << 2, kind: 'house' },
-  { value: 0.95, bit: 1 << 3, kind: 'building' },
+  { value: 1.05, bit: 1 << 3, kind: 'building' },
 ];
 
 export interface SpawnRecord {
@@ -87,6 +114,10 @@ export class GrowthSim {
   private dev = new Float32Array(GRID_SIZE * GRID_SIZE);
   private spawnMask = new Uint8Array(GRID_SIZE * GRID_SIZE);
   private roadDist = new Int16Array(GRID_SIZE * GRID_SIZE).fill(-1);
+  // Per-cell rate multiplier (RATE_VARIANCE_MIN..MAX), rolled lazily on first accumulation and
+  // held fixed thereafter — 0 means "not yet rolled" (see rateMultFor), which is safe since actual
+  // multipliers never reach 0.
+  private rateMult = new Float32Array(GRID_SIZE * GRID_SIZE);
 
   private simTime = 0;
   private lastRecomputeAt = -Infinity;
@@ -247,7 +278,13 @@ export class GrowthSim {
         if (!this.hf.isLand(x, z)) continue;
         if (this.hf.slopeAt(x, z) > MAX_SLOPE) continue;
 
-        const rate = DEV_RATE_BASE * (1 - d / DEV_RATE_DIST_DIVISOR);
+        let mult = this.rateMult[idx];
+        if (mult === 0) {
+          mult = RATE_VARIANCE_MIN + this.rng() * (RATE_VARIANCE_MAX - RATE_VARIANCE_MIN);
+          this.rateMult[idx] = mult;
+        }
+
+        const rate = DEV_RATE_BASE * mult * (1 - d / DEV_RATE_DIST_DIVISOR);
         if (rate <= 0) continue;
         this.dev[idx] += dt * rate;
 
