@@ -1566,3 +1566,27 @@ Post-v1 upgrade of the construction theater. Zen constraints remain binding: no 
 - Rails appear with a quick settle after each span; existing bridge geometry/disposal rules unchanged.
 
 Each task: implementer → review gate → fix loop, as before. Visual verification with screenshots is mandatory; regression tests where sim is touched (survey phase: queue tests for phase ordering and resume/demolish skip).
+
+---
+
+# Addendum B — Construction 10x round 2 (approved by Sam 2026-07-03: parallel crews + richer realism)
+
+Zen constraints and sim/render split remain binding. Perf: ≥55 fps, draw calls ≤ 250.
+
+### Task 25: Multi-crew construction
+
+**Files:** `src/sim/construction/queue.ts` (+tests), `src/core/events.ts` (additive field), `src/render/constructionRenderer.ts`, `src/ui/hud.ts`
+- Sim: `BuildQueue` runs up to `MAX_CREWS = 3` concurrent jobs (one per crew slot). FIFO assignment to free crews; demolish jobs take the next free crew (or convert their edge's active job in place, as today). `construction:progress`/`construction:stage` gain an additive `crew: number` field (0-based). All existing single-crew semantics per job unchanged (survey phase, stage speeds, grading, resume, demolish conversion).
+- TDD: two queued edges build CONCURRENTLY (both advance in the same update window); three-plus queue drains as crews free; per-crew event attribution correct; save/restore resumes across multiple crews; demolish-jumps-queue still holds.
+- Render: per-crew rig sets (3× the vehicle roster, built once, hidden when crew idle — instancing not required, rigs are cheap primitives; verify draw-call budget). Site dressing (cones/stockpile/floodlight) per active crew. Vehicle state maps keyed by (crew, kind).
+- HUD ticker: show up to 3 crew lines (CREW 1 PAVING… / CREW 2 GRADING…), collapse when idle.
+
+### Task 26: Richer site realism
+
+**Files:** `src/render/constructionRenderer.ts` (mostly), `src/audio/ambient.ts` (light touches)
+- Worker figures (≤6 prims each, 2-3 per active crew): a flagger near the cones (slow wave cycle), a spotter walking alongside the active vehicle, a worker with shovel idling by the stockpile. Simple bone-less bob/step animation; fade with the crew.
+- Equipment variety: motor grader (blade) joins the gravel stage trailing the truck's drops and leveling them (visual only); plate-compactor prop near fresh paint.
+- Exhaust: small dark puff particles from vehicle stacks while working (existing pool mechanism).
+- Material logistics dressing: stockpile visibly depletes as stages consume it; paint stencil frame around the liner's nozzle; wet-sheen on fresh center dashes (mirror the fresh-asphalt roughness lerp).
+- Audio: soft radio-chatter blips (filtered noise bursts, −30dB) occasionally from the active crew; shovel/scrape one-shot tied to grader passes. Keep all of it subtle.
+- Everything eases; crew fade rules apply to workers/props.
