@@ -27,6 +27,17 @@ const stubSampler = (ctrl: P2[]): RoadSample[] => {
   return out;
 };
 
+// Same shape as stubSampler, but flags a contiguous middle run of samples as `bridge: true` so
+// `findBridgeRuns`/`buildBridgeParts` plant pylons along it — used to exercise the restored-bridge
+// pylon-seeding regression (see roadRenderer.ts's `onStage`).
+const bridgeStubSampler = (ctrl: P2[]): RoadSample[] => {
+  const out = stubSampler(ctrl);
+  const lo = Math.floor(out.length * 0.25);
+  const hi = Math.floor(out.length * 0.75);
+  for (let i = lo; i < hi; i++) out[i] = { ...out[i], bridge: true };
+  return out;
+};
+
 function meshColorHex(mesh: THREE.Mesh): number {
   return (mesh.material as THREE.MeshStandardMaterial).color.getHex();
 }
@@ -35,10 +46,10 @@ function colorToHex(cssHex: string): number {
   return new THREE.Color(cssHex).getHex();
 }
 
-function buildWorld(seed: string) {
+function buildWorld(seed: string, sampler: (ctrl: P2[]) => RoadSample[] = stubSampler) {
   const bus = new EventBus();
   const hf = new Heightfield(seed, bus);
-  const graph = new RoadGraph(bus, stubSampler);
+  const graph = new RoadGraph(bus, sampler);
   const scene = new THREE.Scene();
   const renderer = new RoadRenderer(scene, graph, bus, hf);
   const growth = new GrowthSim(graph, hf, bus, createRng(seed));
@@ -74,5 +85,37 @@ describe('restoreWorld render sync', () => {
     const allSurveyed = colors.length > 0 && colors.every((c) => c === surveyedHex);
     expect(allSurveyed).toBe(false);
     expect(colors).not.toContain(surveyedHex);
+  });
+
+  it('restored bridge edges render pylons fully risen, not zero-scale', () => {
+    // Build a source world with a bridge run in the middle of the edge, paint it fully (well past
+    // 'graded', so pylons should be fully risen by the time it's saved), and serialize it.
+    const w1 = buildWorld('restore-bridge-test', bridgeStubSampler);
+    const [edgeId] = w1.graph.commitChain([{ x: 0, z: 0 }, { x: 64, z: 0 }]);
+    w1.graph.edges.get(edgeId)!.stage = 'painted';
+    const json = serialize({ seed: 'restore-bridge-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth });
+    const save = deserialize(json)!;
+
+    // Fresh world + fresh scene + fresh RoadRenderer, then restore into it. This is the path where
+    // `ensureVisual` first runs from `roads:edgeAdded` inside `commitChain`, with `edge.stage` still
+    // 'surveyed' — the bug this test guards against.
+    const w2 = buildWorld('restore-bridge-test', bridgeStubSampler);
+    restoreWorld(save, { bus: w2.bus, hf: w2.hf, graph: w2.graph, growth: w2.growth });
+
+    const restoredEdgeId = [...w2.graph.edges.keys()][0];
+    const group = w2.scene.children.find((c) => c.userData.edgeId === restoredEdgeId) as THREE.Group;
+    expect(group).toBeTruthy();
+
+    const pylonMeshes = group.children.filter(
+      (c): c is THREE.Mesh => c instanceof THREE.Mesh && c.geometry instanceof THREE.CylinderGeometry,
+    );
+
+    // The bridge run must have produced at least one pylon...
+    expect(pylonMeshes.length).toBeGreaterThan(0);
+    // ...and every pylon must be rendered at full rise (scale.y ~= 1), not stuck at the
+    // zero-height fallback (`Math.max(0.001, riseU)` with `riseU` never advancing past 0).
+    for (const mesh of pylonMeshes) {
+      expect(mesh.scale.y).toBeCloseTo(1, 2);
+    }
   });
 });

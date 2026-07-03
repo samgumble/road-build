@@ -514,6 +514,33 @@ export class RoadRenderer {
       const vv = this.ensureVisual(edge);
       vv.freshAsphaltAt = this.clockSeconds;
     }
+    // Bug fix (Task 22 critical finding): `ensureVisual`'s `gradedT` seed
+    // (`edge.stage === 'surveyed' ? 0 : edge.length`) can never actually fire from anything but 0,
+    // because `ensureVisual` is always first reached via `roads:edgeAdded`, which fires inside
+    // `commitChain` while `edge.stage` is unconditionally still `'surveyed'` — including during
+    // `restoreWorld`, which commits the chain FIRST and only forces `edge.stage` (then emits this
+    // very `construction:stage` event) afterward. Left alone, a restored bridge at gravel-or-later
+    // permanently renders with zero pylons (the "already past graded" branch in `ensureVisual` is
+    // dead code). Heal it here instead: once this edge's stage reaches 'graded' or later, seed
+    // `gradedT` to the full edge length and mark every pylon-rise entry for this edge as fully risen
+    // BEFORE `rebuild()` below reads them. This runs on every `construction:stage` emit, not just
+    // restore's, but that's harmless — by the time a normal build reaches a real stage-completion
+    // event, `onProgress`'s per-station tracking already drove `gradedT`/`pylonRise` to the same
+    // "fully risen" values, so this is a no-op there. Fresh-draw rise animation is untouched: it's
+    // driven entirely by `construction:progress` events via `onProgress`/`advanceBridgeEases`, which
+    // this handler never touches.
+    if (STAGES.indexOf(stage) >= STAGES.indexOf('graded')) {
+      const vv = this.ensureVisual(edge);
+      vv.gradedT = edge.length;
+      vv.gradedDemolish = false;
+      const runs = getBridgeRunInfo(edge.samples);
+      for (const run of runs) {
+        for (const station of run.pylonStations) {
+          const key = stationKey(edgeId, station);
+          this.pylonRise.set(key, { elapsed: PYLON_RISE_DURATION, rising: true });
+        }
+      }
+    }
     this.rebuild(edge);
   }
 
