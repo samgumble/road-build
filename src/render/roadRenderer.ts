@@ -36,7 +36,9 @@ const STAGE_YLIFT: Record<Stage, number> = {
 
 const SURVEY_WIDTH = 0.8;
 const SURVEY_OPACITY = 0.55;
-const CENTERLINE_WIDTH = 0.35;
+// Widened from 0.35 (playtest fix: dashes were vanishing at distance — partly a raw pixel-coverage
+// issue at long camera range, addressed together with the stronger polygon offset below).
+const CENTERLINE_WIDTH = 0.5;
 const CENTERLINE_COLOR = '#e8e4d8';
 const CENTERLINE_YLIFT = 0.24;
 
@@ -304,7 +306,23 @@ function findBridgeRuns(samples: RoadSample[]): BridgeRun[] {
   return runs;
 }
 
-function makeStandardMaterial(color: string, opacity = 1, ribbon = false): THREE.MeshStandardMaterial {
+/**
+ * `offsetStrength` selects the polygon-offset bias applied toward the camera:
+ *  - 'none'    — no offset (thin/decorative geometry that doesn't fight the terrain/ribbon).
+ *  - 'ribbon'  — the full-width stage ribbons (graded/gravel/paved/painted), factor/units -2.
+ *  - 'stripe'  — the painted centerline dashes: stronger than 'ribbon' (-4/-4) so the dashes
+ *                reliably win the depth fight against BOTH the terrain and the asphalt ribbon
+ *                sitting just 0.06 world units below them (playtest fix: dashes were vanishing
+ *                at distance because they had no offset at all and lost that fight once far
+ *                enough from the camera for depth precision to matter).
+ */
+function makeStandardMaterial(
+  color: string,
+  opacity = 1,
+  offsetStrength: 'none' | 'ribbon' | 'stripe' = 'none',
+): THREE.MeshStandardMaterial {
+  const offset = offsetStrength !== 'none';
+  const magnitude = offsetStrength === 'stripe' ? -4 : offsetStrength === 'ribbon' ? -2 : 0;
   return new THREE.MeshStandardMaterial({
     color,
     flatShading: true,
@@ -317,11 +335,10 @@ function makeStandardMaterial(color: string, opacity = 1, ribbon = false): THREE
     // continuous deformation, this can flicker as faint ground bleed-through on the full-width
     // stage ribbons (graded/gravel/paved/painted). Bias the ribbon's depth toward the camera
     // (without changing any actual geometry heights) so it reliably draws on top. Survey dashes
-    // and the painted centerline are thin/decorative, not full-width road surface, so they don't
-    // need this and are excluded via the `ribbon` flag.
-    polygonOffset: ribbon,
-    polygonOffsetFactor: ribbon ? -2 : 0,
-    polygonOffsetUnits: ribbon ? -2 : 0,
+    // don't need this and stay excluded via 'none'.
+    polygonOffset: offset,
+    polygonOffsetFactor: magnitude,
+    polygonOffsetUnits: magnitude,
   });
 }
 
@@ -463,12 +480,12 @@ export class RoadRenderer {
       const rollerT = Math.max(from, to - ROLLER_TRAIL_DISTANCE);
       if (rollerT > from) {
         const compactedGeo = buildRibbonGeometry(samples, ROAD_WIDTH, STAGE_YLIFT.paved, from, rollerT);
-        const compactedMat = makeStandardMaterial(PAVED_COMPACTED_COLOR, 1, true);
+        const compactedMat = makeStandardMaterial(PAVED_COMPACTED_COLOR, 1, 'ribbon');
         this.addMesh(v, compactedGeo, compactedMat);
       }
       if (rollerT < to) {
         const freshGeo = buildRibbonGeometry(samples, ROAD_WIDTH, STAGE_YLIFT.paved, rollerT, to);
-        const freshMat = makeStandardMaterial(STAGE_COLOR.paved, 1, true);
+        const freshMat = makeStandardMaterial(STAGE_COLOR.paved, 1, 'ribbon');
         freshMat.roughness = 0.35; // fresh asphalt sheen start; advanced in update()
         const freshMesh = this.addMesh(v, freshGeo, freshMat);
         freshMesh.userData.freshAsphalt = true;
@@ -479,7 +496,7 @@ export class RoadRenderer {
     const yLift = STAGE_YLIFT[stage];
     const color = STAGE_COLOR[stage];
     const geo = buildRibbonGeometry(samples, ROAD_WIDTH, yLift, from, to);
-    const mat = makeStandardMaterial(color, 1, true);
+    const mat = makeStandardMaterial(color, 1, 'ribbon');
     const mesh = this.addMesh(v, geo, mat);
     if (stage === 'paved' || stage === 'painted') {
       mat.roughness = 0.35; // fresh asphalt sheen start; advanced in update()
@@ -488,7 +505,7 @@ export class RoadRenderer {
 
     if (stage === 'painted') {
       const dashGeo = buildDashedRibbonGeometry(samples, CENTERLINE_WIDTH, CENTERLINE_YLIFT, from, to, 2);
-      const dashMat = makeStandardMaterial(CENTERLINE_COLOR);
+      const dashMat = makeStandardMaterial(CENTERLINE_COLOR, 1, 'stripe');
       this.addMesh(v, dashGeo, dashMat);
     }
   }
