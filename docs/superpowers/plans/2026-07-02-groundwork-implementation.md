@@ -1533,3 +1533,36 @@ Then verify the Actions run goes green and the Pages URL serves the game. Load i
 all ─────────────────────────────────────────────────── → 17 polish/deploy
 ```
 Execute strictly in numeric order — later tasks assume all earlier interfaces exist.
+
+---
+
+# Addendum A — Construction 10x (approved by Sam 2026-07-02, full scope incl. bridge crane)
+
+Post-v1 upgrade of the construction theater. Zen constraints remain binding: no failure states, no player management, everything ambient. Sim/render split remains binding: choreography is render-side, driven by existing events; sim changes are limited to what's listed. Perf: ≥55 fps, draw calls ≤ 220 on a busy world.
+
+### Task 20: Animation fidelity
+
+**Files:** `src/render/constructionRenderer.ts` (major), `src/render/easing.ts` (helpers as needed)
+- Excavator: articulated boom/stick/bucket rig with a dig-swing-dump cycle (three pivots, keyframed procedurally; cycle ~4s) replacing the bobbing arm; cab yaw toward dig side.
+- All vehicles: wheels/tracks rotate proportional to actual travel speed; body pitch/roll aligns to `hf.slopeAt` under the vehicle (damped); acceleration/deceleration eased (no constant-velocity glide).
+- Dump truck: bed tips (rotate ~35° over 1.2s) when depositing; paver visibly extrudes the mat (a short fresh-asphalt quad trailing its rear); roller performs visible back-and-forth passes (±6u oscillation around the work front) with a spinning drum.
+- Tire/track marks: instanced fading decals in dirt during graded/gravel stages (pool ≤ 256, fade 20s).
+- Night work: one floodlight-tower prop near the work front when `night`, warm SpotLight (single light, budgeted) + emissive head.
+
+### Task 21: Process, logistics & site dressing
+
+**Files:** `src/render/constructionRenderer.ts`, `src/sim/construction/queue.ts` (survey phase only), `src/core/types.ts` (VehicleKind += 'surveyor', 'crane')
+- Sim: new initial survey work phase on build jobs (vehicle `surveyor`, 20 u/s, runs before graded work; no stage transition — edges are already born 'surveyed'; demolish and resume-from->surveyed skip it). Progress events carry `vehicle: 'surveyor'`.
+- Surveyor unit: small figure + tripod prop; plants survey stakes sequentially as it passes (stakes already exist as preview — now real ones appear during the phase, removed when grading passes).
+- Truck shuttle: during graded, truck follows excavator, receives spoil (bucket dumps into bed on each dig cycle), drives off-site along the built network (or toward map edge) when full, returns empty — purely cosmetic timing, sim progress unchanged. During paved, truck docks at the paver hopper and tips gradually.
+- Arrivals/departures: crew vehicles drive to the job's start along existing painted roads when possible (reuse lane paths), else overland in a straight damped path; drive away on completion. Replaces fade-in/out (fades remain only as fallback for offscreen spawn).
+- Site dressing: instanced traffic cones bracketing the active work front (±10u), small material stockpile prop (gravel mound + pallet) at the job start, all removed with a fade when the job completes.
+
+### Task 22: Bridge construction theater
+
+**Files:** `src/render/constructionRenderer.ts`, `src/render/roadRenderer.ts`
+- Pylons rise: scale-Y 0→1 with easeOutCubic as the work front passes their station during graded work (roadRenderer exposes per-edge bridge-run metadata for the choreography; today pylons appear with the stage rebuild).
+- Crane: new vehicle rig (lattice boom + hook) stationed at the bridge run during gravel-stage work across bridge samples; deck segments (16u) lower-and-settle sequentially from the hook as the work front crosses each; ribbon over bridge runs is masked until its segment settles (coordinate with roadRenderer's partial-progress split so there is never a visible gap behind the settled segment).
+- Rails appear with a quick settle after each span; existing bridge geometry/disposal rules unchanged.
+
+Each task: implementer → review gate → fix loop, as before. Visual verification with screenshots is mandatory; regression tests where sim is touched (survey phase: queue tests for phase ordering and resume/demolish skip).
