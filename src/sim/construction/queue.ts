@@ -1,10 +1,40 @@
 import { STAGES } from '../../core/types';
 import type { Stage, VehicleKind } from '../../core/types';
-import { ROAD_WIDTH } from '../../core/constants';
+import { ROAD_WIDTH, CELL } from '../../core/constants';
 import { RoadGraph } from '../roads/graph';
-import { sampleAt } from '../roads/path';
+import { sampleAt, sampleHeadingAt } from '../roads/path';
 import { Heightfield } from '../terrain/heightfield';
 import { EventBus } from '../../core/events';
+
+// --- Terrain clamp radii (Task 24: "grass/ground still rendering above the road", second
+// occurrence after T18) ----------------------------------------------------------------------
+// Perpendicular (across-the-road) radii: `CLAMP_FLAT_RADIUS` is the world-unit distance within
+// which `Heightfield.clampBelow` applies a true hard ceiling (no allowance at all) — covering the
+// visible ribbon corridor (ROAD_WIDTH/2) plus a full grid cell so ANY grid vertex whose bilinear
+// interpolation could bleed into a visible-corridor query point (up to a full cell's diagonal,
+// ~5.7u, at a road's start/end cap — see CLAMP_ALONG_RADIUS below) is unambiguously inside the
+// flat zone. `CLAMP_OUTER_RADIUS` is the rim where the allowance finishes rising back to +2.5
+// (embankments beyond the road blend smoothly, no cliff) — one more grid cell past the flat zone.
+//
+// Along-the-road radius: reaching a full grid cell (or its diagonal) perpendicular is safe,
+// because elevation barely changes across a single road cross-section — but an EARLIER version
+// of this fix sized the reach isotropically (same radius in every direction), which also reached
+// far enough ALONG a curved/hilly road's own arclength to pull in a *different* sample whose true
+// target elevation legitimately differs by several units, clamping terrain down that was
+// correctly following a closer, higher sample. `tests/queue.test.ts`'s "grading deforms terrain
+// toward the road profile" caught this regression on real (non-synthetic) hilly terrain. Samples
+// are spaced ~2u apart (see `SPACING` in `path.ts`); `CLAMP_ALONG_RADIUS` is kept well under that
+// so no single clampBelow call can ever reach past its own immediate neighbor sample.
+// `Heightfield.clampBelow`'s `heading` parameter makes the perpendicular/along reach genuinely
+// independent (an ellipse in the road's local frame) rather than one blended circle.
+//
+// Exported so `save.ts`'s restore path (which duplicates this finalization clamp for edges
+// loaded already at/past 'graded') can mirror the exact same rule rather than drifting out of
+// sync with its own copy of these numbers.
+export const CLAMP_FLAT_RADIUS = ROAD_WIDTH / 2 + CELL;
+export const CLAMP_OUTER_RADIUS = CLAMP_FLAT_RADIUS + CELL;
+export const CLAMP_ALONG_FLAT_RADIUS = 3;
+export const CLAMP_ALONG_RADIUS = CLAMP_ALONG_FLAT_RADIUS + 1;
 
 const STAGE_SPEED: Record<Exclude<Stage, 'surveyed'>, number> = {
   graded: 6,
@@ -270,6 +300,39 @@ export class BuildQueue {
         this.hf.flattenCircle(pos.x, pos.z, pos.y, GRADE_RADIUS);
         this.hf.flattenCircle(pos.x + perpX * offset, pos.z + perpZ * offset, pos.y, GRADE_RADIUS);
         this.hf.flattenCircle(pos.x - perpX * offset, pos.z - perpZ * offset, pos.y, GRADE_RADIUS);
+        // Mid-construction clamp (Task 24 finding): `flattenCircle`'s blend pulls nearby terrain
+        // toward the CURRENT vehicle position's own elevation (`pos.y`) every update as it moves
+        // forward along a climbing/dipping profile — on a cross-slope this can actually RAISE a
+        // vertex slightly behind-and-to-the-side of the vehicle back up on a later frame, because
+        // that frame's (higher/lower) `pos.y` target differs from the true graded profile at the
+        // vertex's own location. Clamping at the live `pos` with `pos.y` as the ceiling (an
+        // earlier version of this fix) chases the same problem — its ceiling rises and falls with
+        // the vehicle too, so it can't out-converge flattenCircle's re-raising.
+        //
+        // Fix: clamp using the trailing (already-passed) sample's OWN `y`, not the live vehicle
+        // position/elevation — exactly the same reasoning the graded-completion finalization pass
+        // below already uses per sample, just applied incrementally as the crew advances instead
+        // of once at the very end. Every sample the excavator has already passed gets re-clamped,
+        // every frame, against its own correct target height, so it converges to the same
+        // no-allowance-inside-the-corridor ceiling the finalization sweep guarantees, without
+        // waiting for the whole edge to finish.
+        for (const i of trailingSampleIndices(edge.samples, nearest)) {
+          const s = edge.samples[i];
+          if (s.bridge) continue;
+          const sHeading = sampleHeadingAt(edge.samples, i);
+          this.hf.clampBelow(s.x, s.z, s.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, sHeading, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
+        }
+        // Endpoint cap (Task 24 finding): the road's very first sample has no "before" neighbor,
+        // so it's the one spot where the anisotropic along-axis flat zone can't be helped along by
+        // an adjacent sample's own circle — a small (sub-0.1u) residual can otherwise sit at the
+        // tip until the graded-completion finalization sweep below reaches it. That's an
+        // imperceptible residual, but it's cheap (one extra sample) to just keep the tip
+        // re-clamped every update once the crew has moved past it, same as the finalization sweep
+        // does for every sample. Only meaningful once the front has actually passed sample 0.
+        if (nearest > 0 && !edge.samples[0].bridge) {
+          const cap = edge.samples[0];
+          this.hf.clampBelow(cap.x, cap.z, cap.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, sampleHeadingAt(edge.samples, 0), CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
+        }
       }
     }
 
@@ -297,9 +360,15 @@ export class BuildQueue {
         // roadbed on cross-slopes between passes. Now that grading for this edge is fully
         // complete, sweep every non-bridge sample once more with a hard `clampBelow` so no
         // terrain can poke through the cut, regardless of any blend gaps left by the moving cut.
-        for (const s of edge.samples) {
+        // Uses the same anisotropic radii as the per-update clamp above (Task 24) — a hard,
+        // allowance-free ceiling across the whole visible corridor plus margin perpendicular to
+        // the road, but kept narrow along the road's own arclength so it can't reach a
+        // neighboring sample with a meaningfully different target elevation on hilly terrain.
+        for (let i = 0; i < edge.samples.length; i++) {
+          const s = edge.samples[i];
           if (s.bridge) continue;
-          this.hf.clampBelow(s.x, s.z, s.y, ROAD_WIDTH / 2 + 1);
+          const sHeading = sampleHeadingAt(edge.samples, i);
+          this.hf.clampBelow(s.x, s.z, s.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, sHeading, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
         }
       }
       this.bus.emit('construction:stage', { edgeId: job.edgeId, stage });
@@ -336,6 +405,38 @@ export class BuildQueue {
       }
     }
   }
+}
+
+/**
+ * Indices of every sample within `CLAMP_ALONG_RADIUS` arclength of `samples[centerIdx]` (both
+ * directions) — the "already-graded neighborhood" re-clamped every update by the mid-construction
+ * pass above. Bounded by `CLAMP_ALONG_RADIUS` (the clamp's own along-the-road reach), NOT the
+ * (much larger) perpendicular `CLAMP_OUTER_RADIUS` — each of these samples' own `clampBelow` call
+ * already reaches every grid vertex it needs to across the road via the perpendicular radius; this
+ * just decides which nearby samples are worth re-running every frame so the already-graded trail
+ * stays converged while later `flattenCircle` calls at positions further along a (possibly
+ * climbing/dipping) profile are actively trying to pull it back up — see the Task 24 comment at
+ * the call site. Cheap: samples are ~2u apart and CLAMP_ALONG_RADIUS is only a couple units, so
+ * this is normally just the immediate 1-2 neighbors either side of `centerIdx`.
+ */
+function trailingSampleIndices<T extends { x: number; y: number; z: number; bridge: boolean }>(
+  samples: T[],
+  centerIdx: number,
+): number[] {
+  const out: number[] = [];
+  let acc = 0;
+  for (let i = centerIdx; i >= 0; i--) {
+    if (i < centerIdx) acc += Math.hypot(samples[i + 1].x - samples[i].x, samples[i + 1].y - samples[i].y, samples[i + 1].z - samples[i].z);
+    if (acc > CLAMP_ALONG_RADIUS) break;
+    out.push(i);
+  }
+  acc = 0;
+  for (let i = centerIdx + 1; i < samples.length; i++) {
+    acc += Math.hypot(samples[i].x - samples[i - 1].x, samples[i].y - samples[i - 1].y, samples[i].z - samples[i - 1].z);
+    if (acc > CLAMP_ALONG_RADIUS) break;
+    out.push(i);
+  }
+  return out;
 }
 
 /** Finds the index of the sample nearest arclength `t` along `samples`. */

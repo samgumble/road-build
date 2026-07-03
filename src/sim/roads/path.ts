@@ -49,6 +49,16 @@ export function validateChain(ctrl: P2[], hf: Heightfield): boolean {
   return hf.isLand(ctrl[0].x, ctrl[0].z) && hf.isLand(ctrl[ctrl.length - 1].x, ctrl[ctrl.length - 1].z);
 }
 
+/** Heading (radians) at `samples[i]`, via a forward/backward difference against its immediate
+ * neighbors (clamped at the array ends) — the same convention `sampleAt` uses internally. Shared
+ * by `BuildQueue` (Task 24's anisotropic terrain clamp, which needs each sample's own tangent
+ * direction to keep clampBelow's "along the road" reach narrow) and `save.ts`'s restore path. */
+export function sampleHeadingAt(samples: RoadSample[], i: number): number {
+  const a = samples[Math.max(0, i - 1)];
+  const b = samples[Math.min(samples.length - 1, i + 1)];
+  return Math.atan2(b.z - a.z, b.x - a.x);
+}
+
 export function sampleAt(samples: RoadSample[], t: number): { pos: V3; heading: number } {
   let acc = 0;
   for (let i = 1; i < samples.length; i++) {

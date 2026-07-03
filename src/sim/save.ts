@@ -4,7 +4,14 @@ import { ROAD_WIDTH } from '../core/constants';
 import { RoadGraph } from './roads/graph';
 import { Heightfield } from './terrain/heightfield';
 import { GrowthSim, type SpawnRecord } from './growth/growth';
-import { BuildQueue } from './construction/queue';
+import {
+  BuildQueue,
+  CLAMP_FLAT_RADIUS,
+  CLAMP_OUTER_RADIUS,
+  CLAMP_ALONG_FLAT_RADIUS,
+  CLAMP_ALONG_RADIUS,
+} from './construction/queue';
+import { sampleHeadingAt } from './roads/path';
 import { EventBus } from '../core/events';
 
 const SAVE_VERSION = 1 as const;
@@ -153,9 +160,10 @@ export function restoreWorld(save: SaveV1, deps: RestoreDeps): void {
     queue?.enqueueResume(edgeId);
 
     if (STAGES.indexOf(saved.stage) >= STAGES.indexOf('graded')) {
-      for (const s of edge.samples) {
+      for (let i = 0; i < edge.samples.length; i++) {
+        const s = edge.samples[i];
         if (s.bridge) continue;
-        const heading = sampleHeading(edge.samples, s);
+        const heading = sampleHeadingAt(edge.samples, i);
         const perpX = -Math.sin(heading);
         const perpZ = Math.cos(heading);
         hf.flattenCircle(s.x, s.z, s.y, gradeRadius);
@@ -165,11 +173,17 @@ export function restoreWorld(save: SaveV1, deps: RestoreDeps): void {
       // Playtest fix ("land still rendering above the cleared road"): flattenCircle shapes the
       // embankment via a blended smoothstep pull, but can still leave terrain above the roadbed
       // on cross-slopes. Follow with a hard clampBelow pass (mirrors BuildQueue's graded-complete
-      // finalization) so a reloaded save is guaranteed to have no terrain poking through the cut,
-      // not just an approximately-flattened embankment.
-      for (const s of edge.samples) {
+      // finalization, Task 24 revision: an anisotropic hard no-allowance flat zone — generous
+      // across the corridor via CLAMP_FLAT_RADIUS/CLAMP_OUTER_RADIUS, narrow along the road's own
+      // arclength via CLAMP_ALONG_FLAT_RADIUS/CLAMP_ALONG_RADIUS so it can't reach a neighboring
+      // sample with a meaningfully different target elevation on hilly terrain — so a reloaded
+      // save is guaranteed to have no terrain poking through the cut, not just an
+      // approximately-flattened embankment.
+      for (let i = 0; i < edge.samples.length; i++) {
+        const s = edge.samples[i];
         if (s.bridge) continue;
-        hf.clampBelow(s.x, s.z, s.y, ROAD_WIDTH / 2 + 1);
+        const heading = sampleHeadingAt(edge.samples, i);
+        hf.clampBelow(s.x, s.z, s.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, heading, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
       }
     }
   }
@@ -182,15 +196,4 @@ export function restoreWorld(save: SaveV1, deps: RestoreDeps): void {
   // once more now, with every edge at its restored stage, gives growth's next `update()` a correct
   // recompute.
   bus.emit('roads:changed', {});
-}
-
-/** Heading at sample `s`, matching the forward-difference convention used while grading live. */
-function sampleHeading(
-  samples: { x: number; y: number; z: number; bridge: boolean }[],
-  s: { x: number; y: number; z: number; bridge: boolean },
-): number {
-  const i = samples.indexOf(s);
-  const a = samples[Math.max(0, i - 1)];
-  const b = samples[Math.min(samples.length - 1, i + 1)];
-  return Math.atan2(b.z - a.z, b.x - a.x);
 }
