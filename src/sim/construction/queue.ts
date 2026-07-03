@@ -251,6 +251,18 @@ export class BuildQueue {
 
     if (!job.demolish && job.t >= edge.length) {
       edge.stage = stage;
+      if (stage === 'graded') {
+        // Finalization pass (playtest fix: "the land is still rendering above the cleared road
+        // in some areas"): the per-update 3-track `flattenCircle` blend above tracks the vehicle
+        // as it moves, but its smoothstep falloff can still leave terrain vertices above the
+        // roadbed on cross-slopes between passes. Now that grading for this edge is fully
+        // complete, sweep every non-bridge sample once more with a hard `clampBelow` so no
+        // terrain can poke through the cut, regardless of any blend gaps left by the moving cut.
+        for (const s of edge.samples) {
+          if (s.bridge) continue;
+          this.hf.clampBelow(s.x, s.z, s.y, ROAD_WIDTH / 2 + 1);
+        }
+      }
       this.bus.emit('construction:stage', { edgeId: job.edgeId, stage });
       if (stage === 'painted') {
         this.bus.emit('roads:changed', {});

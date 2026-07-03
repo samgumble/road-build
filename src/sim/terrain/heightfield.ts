@@ -70,6 +70,35 @@ export class Heightfield {
     }
     this.bus?.emit('terrain:deformed', { minI, minJ, maxI, maxJ });
   }
+
+  /**
+   * Hard-clamps terrain within `radius` of (x, z) so it never pokes above the roadbed (playtest
+   * fix: "the land is still rendering above the cleared road in some areas"). Unlike
+   * `flattenCircle` (a blended smoothstep pull toward `targetY`, which can still leave terrain
+   * vertices above the roadbed on cross-slopes even after multiple overlapping passes), this only
+   * ever pulls a vertex DOWN, and only when it's above the allowed ceiling — never raises terrain.
+   * The ceiling is `maxY` at the core (d=0), rising smoothly to `maxY + 2.5` at the rim (d=radius)
+   * so there's no hard vertical cliff at the clamp boundary; the allowance only starts growing
+   * past d/radius = 0.3, mirroring `flattenCircle`'s own feather structure.
+   */
+  clampBelow(x: number, z: number, maxY: number, radius: number): void {
+    const half = WORLD_SIZE / 2;
+    const minI = Math.max(0, Math.floor((x - radius + half) / CELL));
+    const maxI = Math.min(GRID_SIZE - 1, Math.ceil((x + radius + half) / CELL));
+    const minJ = Math.max(0, Math.floor((z - radius + half) / CELL));
+    const maxJ = Math.min(GRID_SIZE - 1, Math.ceil((z + radius + half) / CELL));
+    for (let j = minJ; j <= maxJ; j++) {
+      for (let i = minI; i <= maxI; i++) {
+        const wx = i * CELL - half, wz = j * CELL - half;
+        const d = Math.hypot(wx - x, wz - z) / radius;
+        if (d >= 1) continue;
+        const ceiling = maxY + smoothstep(0.3, 1.0, d) * 2.5;
+        const idx = j * GRID_SIZE + i;
+        if (this.heights[idx] > ceiling) this.heights[idx] = ceiling;
+      }
+    }
+    this.bus?.emit('terrain:deformed', { minI, minJ, maxI, maxJ });
+  }
 }
 
 export function smoothstep(a: number, b: number, x: number): number {

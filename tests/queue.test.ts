@@ -112,6 +112,22 @@ describe('BuildQueue', () => {
     // No job was ever enqueued/started for either restored-painted half specifically.
     expect(queue.queueLength).toBeLessThanOrEqual(1); // at most the legitimate new stub-road build job
   });
+  it('finalizes grading with a hard clamp so no terrain pokes above the roadbed on completion', () => {
+    const { queue, hf, graph, edgeId } = setup();
+    run(queue, 120); // full build through 'painted'
+    const samples = graph.edges.get(edgeId)!.samples;
+    // Check a handful of mid-edge, non-bridge samples.
+    const picks = [
+      samples[Math.floor(samples.length * 0.25)],
+      samples[Math.floor(samples.length * 0.5)],
+      samples[Math.floor(samples.length * 0.75)],
+    ];
+    for (const s of picks) {
+      if (s.bridge) continue;
+      expect(hf.heightAt(s.x, s.z)).toBeLessThanOrEqual(s.y + 0.05);
+    }
+  });
+
   it('demolishing a non-surveyed edge with only a pending (unstarted) job still walks it down properly', () => {
     const bus = new EventBus();
     const hf = new Heightfield('q-test-split-demolish', bus);

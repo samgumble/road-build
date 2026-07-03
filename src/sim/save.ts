@@ -162,6 +162,15 @@ export function restoreWorld(save: SaveV1, deps: RestoreDeps): void {
         hf.flattenCircle(s.x + perpX * offset, s.z + perpZ * offset, s.y, gradeRadius);
         hf.flattenCircle(s.x - perpX * offset, s.z - perpZ * offset, s.y, gradeRadius);
       }
+      // Playtest fix ("land still rendering above the cleared road"): flattenCircle shapes the
+      // embankment via a blended smoothstep pull, but can still leave terrain above the roadbed
+      // on cross-slopes. Follow with a hard clampBelow pass (mirrors BuildQueue's graded-complete
+      // finalization) so a reloaded save is guaranteed to have no terrain poking through the cut,
+      // not just an approximately-flattened embankment.
+      for (const s of edge.samples) {
+        if (s.bridge) continue;
+        hf.clampBelow(s.x, s.z, s.y, ROAD_WIDTH / 2 + 1);
+      }
     }
   }
 
