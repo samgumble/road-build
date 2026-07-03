@@ -5,6 +5,9 @@ import { RoadGraph } from '../sim/roads/graph';
 import { sampleAt } from '../sim/roads/path';
 import { Heightfield } from '../sim/terrain/heightfield';
 import { damp, easeOutCubic, clamp01 } from './easing';
+import { ROAD_WIDTH, WORLD_SIZE } from '../core/constants';
+
+const ROAD_WIDTH_HALF = ROAD_WIDTH / 2;
 
 const CAB_COLOR = '#e8641b';
 const BODY_COLOR = '#3c3f41';
@@ -18,6 +21,10 @@ const ROT_LAMBDA = 10;
 const SLOPE_LAMBDA = 6; // pitch/roll damping toward terrain-derived tilt
 
 const FADE_DURATION = 0.4; // seconds, easeOutCubic scale-in/out
+
+// --- Arrivals/departures (Task 21 deliverable 4) ------------------------------------------
+const SPAWN_DISTANCE = 60; // u away from the work front a vehicle spawns/departs to
+const DRIVE_HANDOFF_DISTANCE = 120; // u; below this, drive between consecutive jobs; above, fade
 
 const ROLLER_TRAIL_DISTANCE = 8;
 const ROLLER_OSCILLATION_RANGE = 6; // ± units around the trail point
@@ -76,6 +83,15 @@ const BED_TIP_DURATION = 1.2; // seconds, eased up and back down
 const BED_TIP_INTERVAL = 3; // seconds between tips while depositing gravel at the work front
 const GRAVEL_COLOR = '#8a7960';
 
+// --- Truck shuttle choreography (Task 21 deliverable 3) ---------------------------------------
+const SPOIL_DUMPS_TO_FILL = 4; // dig-cycle dumps before the bed reads "full" and the truck departs
+const SHUTTLE_AWAY_MIN = 8; // seconds
+const SHUTTLE_AWAY_MAX = 12; // seconds
+const SHUTTLE_ARRIVE_EPS = 1.5; // u; considered "arrived" within this distance of the target
+const HEADING_FREEZE_EPS = 0.05; // u; below this, toGoal is too short/noisy to derive a heading from
+const PAVED_DOCK_TIP_LAMBDA = 1 / 3; // very slow, gradual bed tip while docked at the paver hopper
+const PAVED_DOCK_TIP_ANGLE = THREE.MathUtils.degToRad(12); // shallow — feeding the hopper, not dumping a full load
+
 // --- Paver mat -------------------------------------------------------------------------------
 const MAT_LENGTH = 3.5;
 const MAT_FADE_TIME = 1.2; // seconds for the mat quad to fade as the real ribbon overtakes it
@@ -105,6 +121,23 @@ function wheelCylinder(radius: number, width: number): THREE.CylinderGeometry {
   const geo = new THREE.CylinderGeometry(radius, radius, width, 10);
   geo.rotateZ(Math.PI / 2);
   return geo;
+}
+
+const WORLD_HALF = WORLD_SIZE / 2;
+
+/** Direction (unit x/z) from `pos` toward the nearest of the four map edges — used both to spawn
+ * arriving vehicles offscreen (Task 21 deliverable 4) and to send a "full" shuttle truck off to
+ * dump out of view (deliverable 3). Picks whichever of +x/-x/+z/-z boundary is closest. */
+function nearestEdgeDir(x: number, z: number): { x: number; z: number } {
+  const distances: Array<[number, number, number]> = [
+    [WORLD_HALF - x, 1, 0],
+    [WORLD_HALF + x, -1, 0],
+    [WORLD_HALF - z, 0, 1],
+    [WORLD_HALF + z, 0, -1],
+  ];
+  distances.sort((a, b) => a[0] - b[0]);
+  const [, dx, dz] = distances[0];
+  return { x: dx, z: dz };
 }
 
 /** Whether the sample nearest arclength `t` along `samples` is a bridge-deck sample (mirrors
@@ -155,6 +188,7 @@ interface VehicleRig {
 
   // dump truck bed only
   bedPivot?: THREE.Group;
+  spoilMesh?: THREE.Mesh; // spoil-mound lump that grows 0->1 as dig-cycle dumps land in the bed
 
   // paver mat only
   matMesh?: THREE.Mesh;
@@ -278,6 +312,13 @@ function buildTruck(): VehicleRig {
   bed.rotation.z = 0.05;
   bedPivot.add(bed);
 
+  // Spoil mound: scales 0->1 in the bed as the excavator's dig cycle deposits loads (deliverable
+  // 3). Parented to bedPivot so it tips out with the bed during the gravel-deposit animation.
+  const spoilMesh = new THREE.Mesh(new THREE.ConeGeometry(0.85, 0.7, 8), gravelMat);
+  spoilMesh.position.set(1.3, 0.95, 0);
+  spoilMesh.scale.setScalar(0.001);
+  bedPivot.add(spoilMesh);
+
   const wheelGeo = wheelCylinder(0.45, 1.9);
   const wheels: WheelRef[] = [];
   for (const x of [-1.3, 0, 1.4]) {
@@ -289,7 +330,7 @@ function buildTruck(): VehicleRig {
 
   const beaconMat = addBeacon(cab, 0.9);
 
-  return { kind: 'truck', group, body, beaconMat, wheels, materials, bedPivot };
+  return { kind: 'truck', group, body, beaconMat, wheels, materials, bedPivot, spoilMesh };
 }
 
 function buildPaver(): VehicleRig {
@@ -426,6 +467,84 @@ function buildLiner(): VehicleRig {
   return { kind: 'liner', group, body, beaconMat, wheels, materials };
 }
 
+const SKIN_COLOR = '#c99a6f';
+const HI_VIS_COLOR = '#d9d940';
+
+/** Small tripod + figure rig for the survey phase — on foot, no wheels, walks the surveyed line
+ * ahead of the excavator. Uses the same beacon slot as vehicles (required by VehicleRig) but at a
+ * token size/intensity since a lone surveyor doesn't carry a beacon light in reality; kept for
+ * interface consistency and cheap "is this rig alive" pulses elsewhere in the file. */
+function buildSurveyor(): VehicleRig {
+  const group = new THREE.Group();
+  const body = new THREE.Group();
+  group.add(body);
+  const materials: THREE.MeshStandardMaterial[] = [];
+  const skinMat = flatMat(SKIN_COLOR);
+  const hiVisMat = flatMat(HI_VIS_COLOR);
+  const tripodMat = flatMat(WHEEL_COLOR);
+  materials.push(skinMat, hiVisMat, tripodMat);
+
+  // tripod (total station) planted just ahead of the figure
+  const tripod = new THREE.Group();
+  tripod.position.set(0.8, 0, 0.3);
+  body.add(tripod);
+  for (const ang of [0, (Math.PI * 2) / 3, (Math.PI * 4) / 3]) {
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.75, 5), tripodMat);
+    leg.position.set(Math.cos(ang) * 0.18, 0.375, Math.sin(ang) * 0.18);
+    leg.rotation.z = Math.cos(ang) * 0.35;
+    leg.rotation.x = Math.sin(ang) * 0.35;
+    tripod.add(leg);
+  }
+  const scope = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.2, 0.16), tripodMat);
+  scope.position.set(0, 0.82, 0);
+  tripod.add(scope);
+
+  // figure: legs, torso (hi-vis), head
+  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.6, 0.14), tripodMat);
+  legL.position.set(0, 0.3, 0.1);
+  body.add(legL);
+  const legR = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.6, 0.14), tripodMat);
+  legR.position.set(0, 0.3, -0.1);
+  body.add(legR);
+
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.55, 0.24), hiVisMat);
+  torso.position.set(0, 0.85, 0);
+  body.add(torso);
+
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.14, 8, 6), skinMat);
+  head.position.set(0, 1.28, 0);
+  body.add(head);
+
+  // arm reaching toward the tripod's scope
+  const arm = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.1, 0.1), skinMat);
+  arm.position.set(0.25, 0.95, 0.15);
+  arm.rotation.z = -0.2;
+  body.add(arm);
+
+  const beaconMat = addBeacon(body, 1.5);
+  beaconMat.emissiveIntensity = 0;
+
+  return { kind: 'surveyor', group, body, beaconMat, wheels: [], materials };
+}
+
+/**
+ * Minimal placeholder rig for 'crane' (Task 22's bridge-construction vehicle kind, added to
+ * VehicleKind now per Addendum A so this file's Record<VehicleKind, VehicleRig> type-checks).
+ * Never targeted by any `construction:progress` event yet — queue.ts doesn't emit it — so this
+ * stays permanently hidden/unused until Task 22 builds it out properly. Kept intentionally tiny.
+ */
+function buildCrane(): VehicleRig {
+  const group = new THREE.Group();
+  const body = new THREE.Group();
+  group.add(body);
+  const bodyMat = flatMat(BODY_COLOR);
+  const base = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.5, 1.2), bodyMat);
+  base.position.y = 0.25;
+  body.add(base);
+  const beaconMat = addBeacon(body, 1.0);
+  return { kind: 'crane', group, body, beaconMat, wheels: [], materials: [bodyMat] };
+}
+
 /** Per-vehicle animation/visibility state, independent of the rig's static geometry. */
 interface VehicleState {
   rig: VehicleRig;
@@ -473,6 +592,25 @@ interface VehicleState {
   // roller oscillation
   rollerOscOffset: number; // signed distance along the path from the trail point, -RANGE..+RANGE
   rollerOscDir: number; // +1 or -1
+
+  // --- Task 21 additions ---
+  // Arrivals/departures (deliverable 4): on a fresh sighting (or a same-kind handoff to a nearby
+  // job), the vehicle is placed at a point offscreen and let the existing position damp carry it
+  // in, reading as "driving to the site" rather than fading in at the work front. `justSpawned`
+  // guards against re-triggering the spawn placement on every progress event for the same session.
+  justSpawned: boolean;
+
+  // Truck shuttle choreography (deliverable 3, render-only theater — sim timing is untouched):
+  // the truck idles beside the excavator during graded work, filling its bed a bit each dig-cycle
+  // dump; once "full" it drives off to the nearest map edge, pauses offscreen, then returns empty.
+  // `shuttlePhase` is purely cosmetic and never affects when construction:progress fires.
+  shuttlePhase: 'idle' | 'departing' | 'away' | 'returning';
+  spoilLevel: number; // 0..1, grows one step per dig-cycle dump, drives spoilMesh scale
+  shuttleTimer: number; // seconds elapsed in the current phase
+  shuttleAwayDuration: number; // randomized 8-12s "away" hold, rolled fresh each departure
+  shuttleReturnPos: THREE.Vector3; // work-front position to return to (captured at departure time)
+  shuttleAwayPos: THREE.Vector3; // offscreen point the truck drives to when full
+  dumpCountThisLoad: number; // dig-cycle dumps received since the bed was last emptied
 }
 
 /**
@@ -667,6 +805,242 @@ class TireMarkPool {
   }
 }
 
+const stakeDummy = new THREE.Object3D();
+
+/**
+ * Fixed-capacity instanced pool of survey stakes (Task 21 deliverable 2): `plant()` places a stake
+ * at a given arclength `t` along an edge (rounded to the nearest STAKE_SPACING bucket so repeated
+ * calls as the surveyor walks past don't re-stamp the same spot), eased in via a quick scale-up.
+ * `removeNear(edgeId, t)` eases a planted stake back out (used when grading later passes over it —
+ * "removed progressively as grading passes"). One InstancedMesh, one draw call regardless of count.
+ */
+const STAKE_SPACING = 4; // u between planted stakes along the surveyed line
+const STAKE_EASE = 0.35; // seconds to scale a stake in/out
+const STAKE_POOL_SIZE = 96; // plenty for several concurrent/recent surveyed edges
+
+class StakePool {
+  private readonly capacity: number;
+  private readonly alive: Uint8Array;
+  private readonly scale: Float32Array; // current eased 0..1
+  private readonly targetScale: Float32Array;
+  private readonly posX: Float32Array;
+  private readonly posY: Float32Array;
+  private readonly posZ: Float32Array;
+  private readonly edgeId: Int32Array;
+  private readonly bucket: Int32Array; // rounded arclength bucket, for dedupe + removeNear matching
+  private cursor = 0;
+  readonly mesh: THREE.InstancedMesh;
+
+  constructor(capacity: number) {
+    this.capacity = capacity;
+    this.alive = new Uint8Array(capacity);
+    this.scale = new Float32Array(capacity);
+    this.targetScale = new Float32Array(capacity);
+    this.posX = new Float32Array(capacity);
+    this.posY = new Float32Array(capacity);
+    this.posZ = new Float32Array(capacity);
+    this.edgeId = new Int32Array(capacity).fill(-1);
+    this.bucket = new Int32Array(capacity).fill(-1);
+
+    const geo = new THREE.CylinderGeometry(0.1, 0.1, 0.9, 6);
+    geo.translate(0, 0.45, 0);
+    const mat = flatMat('#e8641b');
+    this.mesh = new THREE.InstancedMesh(geo, mat, capacity);
+    this.mesh.count = 0;
+    this.mesh.frustumCulled = false;
+    for (let i = 0; i < capacity; i++) {
+      stakeDummy.position.set(0, -9999, 0);
+      stakeDummy.scale.setScalar(0.001);
+      stakeDummy.updateMatrix();
+      this.mesh.setMatrixAt(i, stakeDummy.matrix);
+    }
+  }
+
+  /** Plants a stake at (x,y,z) for `edgeId` at arclength `t`, deduped to one per STAKE_SPACING
+   * bucket so a slow-moving surveyor doesn't spam the pool. No-op if that bucket already has a
+   * live (or fading-in) stake. */
+  plant(edgeId: number, t: number, x: number, y: number, z: number): void {
+    const bucket = Math.round(t / STAKE_SPACING);
+    for (let i = 0; i < this.capacity; i++) {
+      if (this.alive[i] && this.edgeId[i] === edgeId && this.bucket[i] === bucket) return; // already planted
+    }
+    const i = this.cursor;
+    this.cursor = (this.cursor + 1) % this.capacity;
+    this.alive[i] = 1;
+    this.scale[i] = 0;
+    this.targetScale[i] = 1;
+    this.posX[i] = x;
+    this.posY[i] = y;
+    this.posZ[i] = z;
+    this.edgeId[i] = edgeId;
+    this.bucket[i] = bucket;
+  }
+
+  /** Eases out (and eventually frees) every stake on `edgeId` at or behind arclength `t` — used
+   * when grading overtakes the surveyed line and the stakes there are no longer needed. */
+  removeBehind(edgeId: number, t: number): void {
+    const thresholdBucket = Math.floor(t / STAKE_SPACING);
+    for (let i = 0; i < this.capacity; i++) {
+      if (this.alive[i] && this.edgeId[i] === edgeId && this.bucket[i] <= thresholdBucket) {
+        this.targetScale[i] = 0;
+      }
+    }
+  }
+
+  /** Eases out every stake belonging to `edgeId` (job ended before grading swept them all). */
+  removeAll(edgeId: number): void {
+    for (let i = 0; i < this.capacity; i++) {
+      if (this.alive[i] && this.edgeId[i] === edgeId) this.targetScale[i] = 0;
+    }
+  }
+
+  update(dt: number): void {
+    let touched = false;
+    const rate = dt / STAKE_EASE;
+    for (let i = 0; i < this.capacity; i++) {
+      if (!this.alive[i]) continue;
+      const goal = this.targetScale[i];
+      if (this.scale[i] < goal) this.scale[i] = Math.min(goal, this.scale[i] + rate);
+      else if (this.scale[i] > goal) this.scale[i] = Math.max(goal, this.scale[i] - rate);
+      if (goal === 0 && this.scale[i] <= 0.001) {
+        this.alive[i] = 0;
+        this.edgeId[i] = -1;
+        this.bucket[i] = -1;
+        stakeDummy.position.set(0, -9999, 0);
+        stakeDummy.scale.setScalar(0.001);
+        stakeDummy.updateMatrix();
+        this.mesh.setMatrixAt(i, stakeDummy.matrix);
+        touched = true;
+        continue;
+      }
+      stakeDummy.position.set(this.posX[i], this.posY[i], this.posZ[i]);
+      stakeDummy.scale.set(1, Math.max(0.001, this.scale[i]), 1);
+      stakeDummy.updateMatrix();
+      this.mesh.setMatrixAt(i, stakeDummy.matrix);
+      touched = true;
+    }
+    if (touched) this.mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  dispose(): void {
+    this.mesh.geometry.dispose();
+    (this.mesh.material as THREE.Material).dispose();
+  }
+}
+
+const coneDummy = new THREE.Object3D();
+const CONE_COUNT = 6; // fixed instance count: 3 either side of the active work front (must stay even — ConePool splits it in half per side)
+const CONE_OFFSET = 10; // ± units from the work front, per spec
+const CONE_LAMBDA = 6; // position damping as the front advances
+
+/** Instanced traffic cones bracketing the active work front (site dressing, Task 21 deliverable
+ * 5): a fixed CONE_COUNT set of instances is repositioned each frame (damped) to sit in a small
+ * cluster ±CONE_OFFSET ahead/behind the current work-front position, easing to scale 0 when no job
+ * is active. One InstancedMesh — one draw call regardless of instance count. */
+class ConePool {
+  readonly mesh: THREE.InstancedMesh;
+  private readonly curX: Float32Array;
+  private readonly curY: Float32Array;
+  private readonly curZ: Float32Array;
+  private initialized = false;
+  private visibility = 0; // eased 0..1
+
+  constructor() {
+    const geo = new THREE.ConeGeometry(0.28, 0.6, 8);
+    geo.translate(0, 0.3, 0);
+    const mat = flatMat('#e8641b', '#5a2200');
+    this.mesh = new THREE.InstancedMesh(geo, mat, CONE_COUNT);
+    this.mesh.count = CONE_COUNT;
+    this.mesh.frustumCulled = false;
+    this.curX = new Float32Array(CONE_COUNT);
+    this.curY = new Float32Array(CONE_COUNT);
+    this.curZ = new Float32Array(CONE_COUNT);
+  }
+
+  /** `active` = a job is currently in progress somewhere; `pos`/`heading` = the current work
+   * front. Cones cluster in two rows of three either side of the road, offset along the direction
+   * of travel so they read as bracketing the work rather than sitting on the vehicle's path. */
+  update(dt: number, active: boolean, pos: THREE.Vector3, heading: number): void {
+    this.visibility = damp(this.visibility, active ? 1 : 0, 1 / FADE_DURATION, dt);
+    const scale = easeOutCubic(clamp01(this.visibility));
+    const cosH = Math.cos(heading);
+    const sinH = Math.sin(heading);
+    const perpX = -sinH;
+    const perpZ = cosH;
+    const half = CONE_COUNT / 2;
+
+    for (let i = 0; i < CONE_COUNT; i++) {
+      const side = i < half ? -1 : 1;
+      const along = (i % half) - (half - 1) / 2; // -1, 0, 1 for 3-per-side
+      const targetX = pos.x + perpX * side * (ROAD_WIDTH_HALF + 1.5) + cosH * along * CONE_OFFSET * 0.6;
+      const targetZ = pos.z + perpZ * side * (ROAD_WIDTH_HALF + 1.5) + sinH * along * CONE_OFFSET * 0.6;
+      const targetY = pos.y;
+      if (!this.initialized) {
+        this.curX[i] = targetX;
+        this.curY[i] = targetY;
+        this.curZ[i] = targetZ;
+      } else {
+        this.curX[i] = damp(this.curX[i], targetX, CONE_LAMBDA, dt);
+        this.curY[i] = damp(this.curY[i], targetY, CONE_LAMBDA, dt);
+        this.curZ[i] = damp(this.curZ[i], targetZ, CONE_LAMBDA, dt);
+      }
+
+      coneDummy.position.set(this.curX[i], this.curY[i], this.curZ[i]);
+      coneDummy.scale.setScalar(Math.max(0.001, scale));
+      coneDummy.updateMatrix();
+      this.mesh.setMatrixAt(i, coneDummy.matrix);
+    }
+    this.initialized = true;
+    this.mesh.instanceMatrix.needsUpdate = true;
+    this.mesh.visible = scale > 0.001;
+  }
+
+  dispose(): void {
+    this.mesh.geometry.dispose();
+    (this.mesh.material as THREE.Material).dispose();
+  }
+}
+
+/** A material stockpile prop (site dressing, Task 21 deliverable 5): a gravel mound + a small
+ * pallet stack, ≤6 primitives total. Lives at a job's start point for the job's duration and fades
+ * out on completion (opacity + scale, driven by `visibility` in the renderer's update loop). */
+interface StockpileRig {
+  group: THREE.Group;
+  materials: THREE.MeshStandardMaterial[];
+}
+
+function buildStockpile(): StockpileRig {
+  const group = new THREE.Group();
+  const materials: THREE.MeshStandardMaterial[] = [];
+  const gravelMat = flatMat(GRAVEL_COLOR);
+  const palletMat = flatMat('#a9812f');
+  const wrapMat = flatMat('#d8d0b0');
+  materials.push(gravelMat, palletMat, wrapMat);
+
+  const mound = new THREE.Mesh(new THREE.ConeGeometry(1.6, 1.3, 10), gravelMat);
+  mound.position.set(0, 0.65, 0);
+  group.add(mound);
+
+  const mound2 = new THREE.Mesh(new THREE.ConeGeometry(1.0, 0.8, 8), gravelMat);
+  mound2.position.set(1.6, 0.4, 0.6);
+  group.add(mound2);
+
+  // pallet stack: two crates on a base slab
+  const base = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.15, 1.1), palletMat);
+  base.position.set(-2.2, 0.075, -0.4);
+  group.add(base);
+
+  const crateA = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.6, 0.9), wrapMat);
+  crateA.position.set(-2.2, 0.45, -0.4);
+  group.add(crateA);
+
+  const crateB = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.5, 0.7), wrapMat);
+  crateB.position.set(-2.15, 0.95, -0.35);
+  group.add(crateB);
+
+  return { group, materials };
+}
+
 /** A single floodlight-tower prop: a pole + emissive head + one THREE.SpotLight (budgeted). */
 interface FloodlightRig {
   group: THREE.Group;
@@ -721,6 +1095,11 @@ export class ConstructionRenderer {
   private steamPool: ParticlePool;
   private gravelPool: ParticlePool;
   private tireMarks: TireMarkPool;
+  private stakes: StakePool;
+  private cones: ConePool;
+  private stockpile: StockpileRig;
+  private stockpileVisibility = 0; // eased 0..1
+  private stockpileEdgeId: number | null = null; // which job's start point the stockpile currently marks
   private dustTimer = 0;
   private steamTimer = 0;
 
@@ -745,6 +1124,8 @@ export class ConstructionRenderer {
       paver: buildPaver(),
       roller: buildRoller(),
       liner: buildLiner(),
+      surveyor: buildSurveyor(),
+      crane: buildCrane(),
     };
     for (const kind of Object.keys(this.rigs) as VehicleKind[]) {
       const rig = this.rigs[kind];
@@ -762,14 +1143,30 @@ export class ConstructionRenderer {
     this.steamPool = new ParticlePool(STEAM_POOL_SIZE, STEAM_SIZE, STEAM_COLOR, STEAM_LIFETIME);
     this.gravelPool = new ParticlePool(80, 1.0, GRAVEL_COLOR, 0.9);
     this.tireMarks = new TireMarkPool(TIRE_MARK_POOL_SIZE);
+    this.stakes = new StakePool(STAKE_POOL_SIZE);
+    this.cones = new ConePool();
+    this.stockpile = buildStockpile();
+    this.stockpile.group.visible = false;
+    this.stockpile.group.scale.setScalar(0.001);
     this.scene.add(this.dustPool.points);
     this.scene.add(this.steamPool.points);
     this.scene.add(this.gravelPool.points);
     this.scene.add(this.tireMarks.mesh);
+    this.scene.add(this.stakes.mesh);
+    this.scene.add(this.cones.mesh);
+    this.scene.add(this.stockpile.group);
 
     this.floodlight = buildFloodlight(this.scene);
 
     bus.on('construction:progress', (e) => this.onProgress(e));
+    // Safety net for stakes: grading normally sweeps every planted stake away as the work front
+    // passes (see onProgress's `stakes.removeBehind` call), but a demolish job walking an edge
+    // back down to 'removed' — or a bridge run where grading skips flattening on deck samples —
+    // could otherwise leave stray stakes behind forever. Any terminal stage transition for an
+    // edge clears whatever's left for it.
+    bus.on('construction:stage', (e) => {
+      if (e.stage === 'painted' || e.stage === 'removed') this.stakes.removeAll(e.edgeId);
+    });
   }
 
   private makeState(rig: VehicleRig): VehicleState {
@@ -804,6 +1201,14 @@ export class ConstructionRenderer {
       bedTipAngle: 0,
       rollerOscOffset: 0,
       rollerOscDir: 1,
+      justSpawned: false,
+      shuttlePhase: 'idle',
+      spoilLevel: 0,
+      shuttleTimer: 0,
+      shuttleAwayDuration: 10,
+      shuttleReturnPos: new THREE.Vector3(),
+      shuttleAwayPos: new THREE.Vector3(),
+      dumpCountThisLoad: 0,
     };
   }
 
@@ -828,11 +1233,25 @@ export class ConstructionRenderer {
    */
   private applyProgressTarget(state: VehicleState, edgeId: number, pos: THREE.Vector3, heading: number): void {
     if (!state.hasTarget) {
-      // snap on first sighting so it doesn't damp in from the origin
+      // Arrivals (deliverable 4): place the vehicle SPAWN_DISTANCE away toward the nearest map
+      // edge and let normal position damping carry it in, reading as "driving to the job" rather
+      // than fading in already-on-site. Degenerate spawn geometry (nearest-edge direction points
+      // back through the position itself, e.g. dead-center of an oddly-shaped world) can't really
+      // happen given nearestEdgeDir always returns a unit vector, but as a defensive fallback if
+      // the computed spawn point is somehow non-finite, snap directly (old fade-in-place behavior).
+      const dir = nearestEdgeDir(pos.x, pos.z);
+      const spawnX = pos.x + dir.x * SPAWN_DISTANCE;
+      const spawnZ = pos.z + dir.z * SPAWN_DISTANCE;
+      const spawnValid = Number.isFinite(spawnX) && Number.isFinite(spawnZ);
       state.targetPos.copy(pos);
       state.targetHeading = heading;
-      state.curPos.copy(pos);
-      state.curHeading = heading;
+      if (spawnValid) {
+        state.curPos.set(spawnX, pos.y, spawnZ);
+        state.curHeading = Math.atan2(pos.z - spawnZ, pos.x - spawnX);
+      } else {
+        state.curPos.copy(pos);
+        state.curHeading = heading;
+      }
       state.hasTarget = true;
       state.currentEdgeId = edgeId;
       return;
@@ -847,8 +1266,22 @@ export class ConstructionRenderer {
       return;
     }
 
-    // Different edge: buffer the target and request a fade-out; do NOT touch targetPos/Heading so
-    // the vehicle keeps damping toward its last on-screen position while it fades.
+    // Different edge (a same-kind job handoff): if the new job's start is close to where the
+    // vehicle currently is, drive it over directly (just retarget — the existing damped motion
+    // reads as driving from the old site to the new one). Otherwise it's too far to plausibly
+    // drive in view, so fall back to the fade-out/relocate/fade-in handoff as before.
+    const dist = state.curPos.distanceTo(pos);
+    if (dist < DRIVE_HANDOFF_DISTANCE) {
+      state.currentEdgeId = edgeId;
+      state.targetPos.copy(pos);
+      state.targetHeading = heading;
+      return;
+    }
+
+    // Different edge, far apart: buffer the target and request a fade-out; do NOT touch
+    // targetPos/Heading so the vehicle keeps damping toward its last on-screen position while it
+    // fades. Once fully faded (see stepVehicle), it's relocated near the new job's start and eases
+    // back in via the same spawn-and-drive-in path as a fresh sighting.
     state.handoffPending = true;
     state.pendingPos.copy(pos);
     state.pendingHeading = heading;
@@ -877,6 +1310,26 @@ export class ConstructionRenderer {
     // events fire at 60/s and would otherwise blow through the particle pool in a fraction of a
     // second. This handler only tracks liveness + (for 'paved') the trailing roller's target.
 
+    // Site dressing (deliverable 5): a fixed stockpile prop marks the job's start point for the
+    // job's whole duration (any stage, any vehicle) — captured once per edge and held until a
+    // different edge's job takes over or the job goes idle (handled in update()'s fade logic).
+    if (edge && this.stockpileEdgeId !== e.edgeId) {
+      this.stockpileEdgeId = e.edgeId;
+      const start = edge.samples[0];
+      this.stockpile.group.position.set(start.x, start.y, start.z);
+      this.stockpile.group.rotation.y = -e.heading;
+    }
+
+    // Survey stakes (deliverable 2): the surveyor plants a real stake every STAKE_SPACING as it
+    // passes; grading later sweeps them away as the work front overtakes the surveyed line.
+    if (e.vehicle === 'surveyor' && edge) {
+      const y = this.hf.heightAt(e.pos.x, e.pos.z);
+      this.stakes.plant(e.edgeId, e.t, e.pos.x, y, e.pos.z);
+    }
+    if (e.stage === 'graded' && !e.demolish) {
+      this.stakes.removeBehind(e.edgeId, e.t);
+    }
+
     if (e.stage === 'paved' && edge) {
       // Roller now performs visible back-and-forth passes around the trail point rather than
       // pure trailing — the base trail point (work front minus ROLLER_TRAIL_DISTANCE) is still
@@ -889,6 +1342,50 @@ export class ConstructionRenderer {
       this.roller.stage = 'paved';
       this.roller.demolish = e.demolish;
       this.roller.onBridge = nearestSampleBridge(edge.samples, rollerT);
+    }
+
+    // Truck shuttle theater (deliverable 3): during 'graded' and 'paved' stages queue.ts never
+    // reports a `vehicle: 'truck'` progress event (only 'gravel' does), so the truck's presence
+    // then is purely synthesized here from the excavator's/paver's own progress — exactly the
+    // same synthesis pattern used for the roller above. Sim timing (job.t/stage transitions) is
+    // completely untouched; this only ever feeds the truck's *cosmetic* target position.
+    if (e.stage === 'graded' && !e.demolish && edge) {
+      const truckState = this.stateFor('truck');
+      // idle a short distance behind the excavator, off to the dump side, facing back toward it
+      const perpX = -Math.sin(e.heading);
+      const perpZ = Math.cos(e.heading);
+      const behind = 6;
+      const side = 3.5;
+      const tx = e.pos.x - Math.cos(e.heading) * behind + perpX * side;
+      const tz = e.pos.z - Math.sin(e.heading) * behind + perpZ * side;
+      const ty = this.hf.heightAt(tx, tz);
+      const truckHeading = e.heading + Math.PI * 0.5;
+      // The truck stays "alive" (not idle-timed-out) for the whole graded job regardless of
+      // shuttle phase — only its idle-anchor *position* is gated on shuttlePhase === 'idle';
+      // while departing/away/returning, updateTruckShuttle drives targetPos/targetHeading instead.
+      this.lastSeenAt.set('truck', this.clock);
+      if (truckState.shuttlePhase === 'idle') {
+        this.applyProgressTarget(truckState, e.edgeId, new THREE.Vector3(tx, ty, tz), truckHeading);
+      } else {
+        truckState.currentEdgeId = e.edgeId;
+      }
+      truckState.stage = 'graded';
+      truckState.demolish = false;
+      truckState.onBridge = nearestSampleBridge(edge.samples, e.t);
+      truckState.shuttleReturnPos.set(tx, ty, tz);
+    } else if (e.stage === 'paved' && !e.demolish && edge) {
+      const truckState = this.stateFor('truck');
+      // dock nose-to-hopper just behind the paver (paver travel direction is +heading, hopper is
+      // at its front, so the truck backs up to it from behind).
+      const dockDist = 3.2;
+      const tx = e.pos.x - Math.cos(e.heading) * dockDist;
+      const tz = e.pos.z - Math.sin(e.heading) * dockDist;
+      const ty = this.hf.heightAt(tx, tz);
+      this.applyProgressTarget(truckState, e.edgeId, new THREE.Vector3(tx, ty, tz), e.heading);
+      this.lastSeenAt.set('truck', this.clock);
+      truckState.stage = 'paved';
+      truckState.demolish = false;
+      truckState.onBridge = nearestSampleBridge(edge.samples, e.t);
     }
   }
 
@@ -940,7 +1437,11 @@ export class ConstructionRenderer {
 
     state.prevPos.copy(state.curPos);
 
-    const effectiveActive = state.handoffPending ? false : active;
+    // The shuttling truck fades out for its 'away' hold (dumps off-map "just fades at distance",
+    // per spec) even though it's still linked to an active graded job (lastSeenAt keeps updating,
+    // see onProgress) — handoffPending already overrides `active` the same way for the same
+    // reason (visually hidden without being considered "job stopped").
+    const effectiveActive = state.handoffPending || state.shuttlePhase === 'away' ? false : active;
 
     state.curPos.x = damp(state.curPos.x, state.targetPos.x, POS_LAMBDA, dt);
     state.curPos.y = damp(state.curPos.y, state.targetPos.y, POS_LAMBDA, dt);
@@ -958,10 +1459,21 @@ export class ConstructionRenderer {
     state.scale = easeOutCubic(state.fadeElapsed);
 
     if (state.handoffPending && state.fadeElapsed <= 0.001) {
-      // Fully faded out — move the vehicle to the buffered target position/heading (no damping,
-      // so no glide across the gap) and let it fade back in on the new edge from here.
-      state.curPos.copy(state.pendingPos);
-      state.curHeading = state.pendingHeading;
+      // Fully faded out — this handoff was far enough (>= DRIVE_HANDOFF_DISTANCE) that driving
+      // over wasn't plausible, so relocate offscreen near the new job (same spawn geometry as a
+      // fresh arrival) and let it drive+fade back in from there rather than snapping directly onto
+      // the work front.
+      const dir = nearestEdgeDir(state.pendingPos.x, state.pendingPos.z);
+      const spawnX = state.pendingPos.x + dir.x * SPAWN_DISTANCE;
+      const spawnZ = state.pendingPos.z + dir.z * SPAWN_DISTANCE;
+      const spawnValid = Number.isFinite(spawnX) && Number.isFinite(spawnZ);
+      if (spawnValid) {
+        state.curPos.set(spawnX, state.pendingPos.y, spawnZ);
+        state.curHeading = Math.atan2(state.pendingPos.z - spawnZ, state.pendingPos.x - spawnX);
+      } else {
+        state.curPos.copy(state.pendingPos);
+        state.curHeading = state.pendingHeading;
+      }
       state.targetPos.copy(state.pendingPos);
       state.targetHeading = state.pendingHeading;
       state.currentEdgeId = state.pendingEdgeId;
@@ -1048,6 +1560,8 @@ export class ConstructionRenderer {
     const truckState = this.states.get('truck');
     const truckActive = this.clock - (this.lastSeenAt.get('truck') ?? -Infinity) <= this.IDLE_TIMEOUT;
     this.updateTruck(truckState, truckActive, dt);
+    this.updateTruckShuttle(dt, excavatorActive);
+    this.updateTruckPavedDock(dt, truckActive);
 
     const paverState = this.states.get('paver');
     const paverActive = this.clock - (this.lastSeenAt.get('paver') ?? -Infinity) <= this.IDLE_TIMEOUT;
@@ -1057,11 +1571,49 @@ export class ConstructionRenderer {
 
     this.updateTireMarks(dt);
     this.updateFloodlight(dt, night);
+    this.updateSiteDressing(dt);
 
     this.dustPool.update(dt);
     this.steamPool.update(dt);
     this.gravelPool.update(dt);
     this.tireMarks.update(dt);
+    this.stakes.update(dt);
+    this.cones.update(dt, this.dressingActive, this.dressingPos, this.dressingHeading);
+  }
+
+  // scratch fields for updateSiteDressing -> cones.update handoff (avoids a per-frame allocation)
+  private dressingActive = false;
+  private dressingPos = new THREE.Vector3();
+  private dressingHeading = 0;
+
+  /**
+   * Site dressing (deliverable 5): finds whichever vehicle is currently the "primary" active one
+   * (same anchor-picking approach as updateFloodlight) to serve as the work front for bracketing
+   * cones, and fades the job-start stockpile in/out with whether ANY job is currently active
+   * (cones/stockpile both belong to "a job is in progress somewhere", not any one vehicle kind).
+   */
+  private updateSiteDressing(dt: number): void {
+    let anchor: VehicleState | null = null;
+    for (const [kind, state] of this.states) {
+      const lastSeen = this.lastSeenAt.get(kind) ?? -Infinity;
+      if (this.clock - lastSeen <= this.IDLE_TIMEOUT && state.hasTarget) {
+        anchor = state;
+        break;
+      }
+    }
+
+    this.dressingActive = anchor !== null;
+    if (anchor) {
+      this.dressingPos.copy(anchor.curPos);
+      this.dressingHeading = anchor.curHeading;
+    }
+
+    const jobActive = anchor !== null;
+    this.stockpileVisibility = damp(this.stockpileVisibility, jobActive ? 1 : 0, 1 / FADE_DURATION, dt);
+    const scale = easeOutCubic(clamp01(this.stockpileVisibility));
+    this.stockpile.group.visible = scale > 0.001;
+    this.stockpile.group.scale.setScalar(Math.max(0.001, scale));
+    if (!jobActive) this.stockpileEdgeId = null; // free the anchor once fully faded/no job running
   }
 
   /**
@@ -1125,6 +1677,10 @@ export class ConstructionRenderer {
           const dumpX = state.curPos.x + Math.cos(state.curHeading + Math.PI / 2 * Math.sign(CAB_YAW_AMOUNT)) * 3;
           const dumpZ = state.curPos.z + Math.sin(state.curHeading + Math.PI / 2 * Math.sign(CAB_YAW_AMOUNT)) * 3;
           this.emitDust(dumpX, state.curPos.y + 1.5, dumpZ);
+          // Truck shuttle theater (deliverable 3): each dig-cycle dump lands a load of spoil in
+          // the idling truck's bed, purely cosmetic — the excavator keeps digging on its own
+          // sim-driven schedule whether or not the truck happens to be present at all.
+          if (state.stage === 'graded' && !state.demolish) this.truckReceiveDump();
         }
       } else {
         // swing back: cab yaws back to center, arm returns toward the carry pose
@@ -1182,7 +1738,12 @@ export class ConstructionRenderer {
         state.bedTipElapsed = 0;
         state.bedTipAngle = 0;
       }
-      rig.bedPivot!.rotation.z = damp(rig.bedPivot!.rotation.z, 0, RELOCATE_LAMBDA, dt);
+      // 'paved' owns bedPivot.rotation.z exclusively via updateTruckPavedDock (called right after
+      // this method in update()) — leave it untouched here rather than relying on call order to
+      // "win" the last write; every other non-'gravel' stage still eases the bed flat as before.
+      if (!state || state.stage !== 'paved') {
+        rig.bedPivot!.rotation.z = damp(rig.bedPivot!.rotation.z, 0, RELOCATE_LAMBDA, dt);
+      }
       return;
     }
 
@@ -1222,6 +1783,119 @@ export class ConstructionRenderer {
           -Math.sin(state.curHeading) * 0.4,
         );
       }
+    }
+  }
+
+  /** Called from `updateExcavator`'s dig-cycle dump moment while the excavator is grading and the
+   * truck is idling beside it: grows the truck bed's spoil mound one step, and once it's received
+   * SPOIL_DUMPS_TO_FILL loads, kicks off the "full — drive off to dump" phase. Purely cosmetic. */
+  private truckReceiveDump(): void {
+    const truck = this.states.get('truck');
+    if (!truck || truck.shuttlePhase !== 'idle') return;
+    truck.dumpCountThisLoad += 1;
+    truck.spoilLevel = clamp01(truck.dumpCountThisLoad / SPOIL_DUMPS_TO_FILL);
+    if (truck.dumpCountThisLoad >= SPOIL_DUMPS_TO_FILL) {
+      truck.shuttlePhase = 'departing';
+      truck.shuttleTimer = 0;
+      truck.shuttleAwayDuration = SHUTTLE_AWAY_MIN + Math.random() * (SHUTTLE_AWAY_MAX - SHUTTLE_AWAY_MIN);
+      const dir = nearestEdgeDir(truck.curPos.x, truck.curPos.z);
+      truck.shuttleAwayPos.set(
+        truck.curPos.x + dir.x * SPAWN_DISTANCE,
+        truck.curPos.y,
+        truck.curPos.z + dir.z * SPAWN_DISTANCE,
+      );
+    }
+  }
+
+  /**
+   * Drives the truck's departing -> away -> returning -> idle cycle once its bed reads "full"
+   * (see truckReceiveDump above). Entirely render-side theater: while the truck is off-cycle, its
+   * `targetPos`/`targetHeading` are driven directly here (overriding the onProgress-synthesized
+   * idle-anchor position) and `stepVehicle`'s usual POS_LAMBDA/ROT_LAMBDA damping carries it along,
+   * since there's no underlying sim event stream to follow during this excursion. The excavator
+   * itself is completely unaffected — it keeps digging on the sim's own schedule whether or not
+   * the truck happens to be present, per the spec's "sim timing unchanged".
+   */
+  private updateTruckShuttle(dt: number, excavatorActive: boolean): void {
+    const truck = this.states.get('truck');
+    if (!truck || !truck.hasTarget) return;
+
+    if (truck.shuttlePhase === 'idle') return;
+
+    if (!excavatorActive) {
+      // The graded job itself ended (edge finished/excavator idle-timed-out) while the truck was
+      // mid-shuttle — don't strand it forever mid-cycle; drop back to 'idle' so the normal
+      // onProgress/handoff/idle-timeout fade logic takes back over cleanly next time this vehicle
+      // gets a real progress event (e.g. a future job elsewhere).
+      truck.shuttlePhase = 'idle';
+      truck.dumpCountThisLoad = 0;
+      truck.spoilLevel = 0;
+      return;
+    }
+
+    const rig = this.rigs.truck;
+
+    if (truck.shuttlePhase === 'departing') {
+      truck.targetPos.copy(truck.shuttleAwayPos);
+      // Heading tracks the goal down to a much tighter distance than the arrival threshold below
+      // (HEADING_FREEZE_EPS < SHUTTLE_ARRIVE_EPS*4) so it never goes stale for the last stretch of
+      // travel before the phase flips — a prior version froze heading and flipped phase at the
+      // same threshold, which could pop the rig's facing right at the transition.
+      const toGoal = new THREE.Vector3().subVectors(truck.shuttleAwayPos, truck.curPos);
+      if (toGoal.length() > HEADING_FREEZE_EPS) {
+        truck.targetHeading = Math.atan2(toGoal.z, toGoal.x);
+      }
+      if (truck.curPos.distanceTo(truck.shuttleAwayPos) <= SHUTTLE_ARRIVE_EPS * 4) {
+        // "dumps offscreen — just fades at distance": once close to the map edge, fade the rig
+        // out via the same scale mechanism as an idle-timeout, without touching lastSeenAt (which
+        // would otherwise make onProgress's idle-anchor logic think the job stopped).
+        truck.shuttlePhase = 'away';
+        truck.shuttleTimer = 0;
+      }
+    } else if (truck.shuttlePhase === 'away') {
+      truck.shuttleTimer += dt;
+      if (truck.shuttleTimer >= truck.shuttleAwayDuration) {
+        truck.shuttlePhase = 'returning';
+        truck.dumpCountThisLoad = 0;
+        truck.spoilLevel = 0;
+        // Empty the visible spoil mound immediately — it dumped off-map during the 'away' hold.
+        rig.spoilMesh!.scale.setScalar(0.001);
+      }
+    } else if (truck.shuttlePhase === 'returning') {
+      truck.targetPos.copy(truck.shuttleReturnPos);
+      const toGoal = new THREE.Vector3().subVectors(truck.shuttleReturnPos, truck.curPos);
+      if (toGoal.length() > HEADING_FREEZE_EPS) {
+        truck.targetHeading = Math.atan2(toGoal.z, toGoal.x);
+      }
+      if (truck.curPos.distanceTo(truck.shuttleReturnPos) <= SHUTTLE_ARRIVE_EPS) {
+        truck.shuttlePhase = 'idle';
+      }
+    }
+
+    // Spoil mound scale tracks spoilLevel (grows per dump, resets on departure/return) — eased via
+    // a simple damp toward the target scale so a dump doesn't pop the lump in instantly.
+    const targetSpoilScale = truck.shuttlePhase === 'idle' || truck.shuttlePhase === 'departing' ? truck.spoilLevel : 0;
+    rig.spoilMesh!.scale.setScalar(Math.max(0.001, damp(rig.spoilMesh!.scale.y, targetSpoilScale, 6, dt)));
+  }
+
+  /**
+   * Truck docked at the paver hopper during 'paved' work (deliverable 3): a slow, shallow,
+   * continuously-oscillating bed tip standing in for "gradually feeding material into the
+   * hopper" — distinct from the sharper gravel-deposit tip cycle in `updateTruck`, which only
+   * fires during 'gravel'. The truck's dock *position* itself is synthesized in onProgress; this
+   * only drives the bed pivot while it's stage 'paved' and actively parked there.
+   */
+  private updateTruckPavedDock(dt: number, truckActive: boolean): void {
+    const truck = this.states.get('truck');
+    const rig = this.rigs.truck;
+    const docked = !!truck && truckActive && truck.stage === 'paved' && !truck.demolish;
+    const targetAngle = docked ? PAVED_DOCK_TIP_ANGLE * (0.5 + 0.5 * Math.sin(this.clock * PAVED_DOCK_TIP_LAMBDA * Math.PI * 2)) : 0;
+    // Ownership split with updateTruck: updateTruck now explicitly skips writing bedPivot during
+    // 'paved' (see its early-return branch), so this is the sole writer for that stage — no
+    // dependency on call order between the two methods. Still guard on stage !== 'gravel' so this
+    // method never fights updateTruck's own tip cycle if ever called while gravel-depositing.
+    if (!truck || truck.stage !== 'gravel') {
+      rig.bedPivot!.rotation.z = damp(rig.bedPivot!.rotation.z, targetAngle, RELOCATE_LAMBDA, dt);
     }
   }
 
@@ -1358,10 +2032,20 @@ export class ConstructionRenderer {
     this.scene.remove(this.steamPool.points);
     this.scene.remove(this.gravelPool.points);
     this.scene.remove(this.tireMarks.mesh);
+    this.scene.remove(this.stakes.mesh);
+    this.scene.remove(this.cones.mesh);
     this.dustPool.dispose();
     this.steamPool.dispose();
     this.gravelPool.dispose();
     this.tireMarks.dispose();
+    this.stakes.dispose();
+    this.cones.dispose();
+
+    this.scene.remove(this.stockpile.group);
+    this.stockpile.group.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) obj.geometry.dispose();
+    });
+    for (const m of this.stockpile.materials) m.dispose();
 
     this.scene.remove(this.floodlight.group);
     this.floodlight.group.traverse((obj) => {
