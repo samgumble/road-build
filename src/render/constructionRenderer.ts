@@ -4,8 +4,9 @@ import { EventBus } from '../core/events';
 import { RoadGraph } from '../sim/roads/graph';
 import { sampleAt } from '../sim/roads/path';
 import { Heightfield } from '../sim/terrain/heightfield';
-import { damp, easeOutCubic, clamp01 } from './easing';
+import { damp, easeOutCubic, easeOutBack, clamp01 } from './easing';
 import { ROAD_WIDTH, WORLD_SIZE } from '../core/constants';
+import { RoadRenderer, getBridgeRunInfo, BRIDGE_PYLON_SPACING, STAGE_COLOR } from './roadRenderer';
 
 const ROAD_WIDTH_HALF = ROAD_WIDTH / 2;
 
@@ -109,6 +110,13 @@ const TIRE_MARK_COLOR = '#2a2420';
 const FLOODLIGHT_EASE = 1.2; // seconds to ease in/out with night + job-active state
 const FLOODLIGHT_COLOR = '#ffcf8a';
 
+// --- Bridge construction theater (Task 22) -----------------------------------------------------
+const BRIDGE_SPAN_LENGTH = BRIDGE_PYLON_SPACING; // 16u, matches roadRenderer's pylon spacing/deck masking
+const SEGMENT_DROP_HEIGHT = 8; // u above the deck the segment starts its descent from
+const SEGMENT_DESCEND_DURATION = 1.5; // seconds, easeOutCubic
+const SEGMENT_SETTLE_BOUNCE_DURATION = 0.35; // seconds, easeOutBack tiny settle bounce after descent
+const CRANE_SLEW_LAMBDA = 4; // damping for the cab's yaw tracking the current span
+
 function flatMat(color: string, emissive?: string): THREE.MeshStandardMaterial {
   return new THREE.MeshStandardMaterial({
     color,
@@ -195,6 +203,13 @@ interface VehicleRig {
   // paver mat only
   matMesh?: THREE.Mesh;
   matMat?: THREE.MeshStandardMaterial;
+
+  // crane articulation only (Task 22)
+  craneCab?: THREE.Group; // slews (yaws) to track the current span being placed
+  craneBoom?: THREE.Group; // lattice boom, pitches slightly but mostly just carries the cable/hook
+  craneCable?: THREE.Mesh; // thin cylinder, scale-Y = current cable length (hook drop)
+  craneHook?: THREE.Group; // hangs at the cable's end (see buildCraneSegment for why the actual
+                            // descending deck segment mesh is NOT parented here)
 }
 
 function addBeacon(parent: THREE.Object3D, y: number): THREE.MeshStandardMaterial {
@@ -529,22 +544,134 @@ function buildSurveyor(): VehicleRig {
   return { kind: 'surveyor', group, body, beaconMat, wheels: [], materials };
 }
 
+const CRANE_COLOR = '#c9c230';
+const CRANE_LATTICE_COLOR = '#3c3f41';
+
 /**
- * Minimal placeholder rig for 'crane' (Task 22's bridge-construction vehicle kind, added to
- * VehicleKind now per Addendum A so this file's Record<VehicleKind, VehicleRig> type-checks).
- * Never targeted by any `construction:progress` event yet — queue.ts doesn't emit it — so this
- * stays permanently hidden/unused until Task 22 builds it out properly. Kept intentionally tiny.
+ * Lattice-boom crane rig (Task 22 deliverable 3), replacing the T21 placeholder now that it has a
+ * real job: stationed at a bridge run's near end during 'gravel'-stage work crossing that run,
+ * lowering deck segments into place. 11 primitives total (base, cab, counterweight, boom spine, 3
+ * lattice struts, 2 A-frame legs, cable, hook) — comfortably under the ≤14 budget.
+ *
+ * Static geometry only: everything that actually animates (cab slew, cable length, hook position)
+ * is applied per-frame in `updateCrane` via the named sub-parts below, exactly like the
+ * excavator's boom/stick/bucket pivots.
  */
 function buildCrane(): VehicleRig {
   const group = new THREE.Group();
   const body = new THREE.Group();
   group.add(body);
-  const bodyMat = flatMat(BODY_COLOR);
-  const base = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.5, 1.2), bodyMat);
+  const materials: THREE.MeshStandardMaterial[] = [];
+  const bodyMat = flatMat(CRANE_COLOR);
+  const latticeMat = flatMat(CRANE_LATTICE_COLOR);
+  const cableMat = flatMat('#1c1d1e');
+  materials.push(bodyMat, latticeMat, cableMat);
+
+  // base (fixed, doesn't slew)
+  const base = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.5, 2.2), bodyMat);
   base.position.y = 0.25;
   body.add(base);
-  const beaconMat = addBeacon(body, 1.0);
-  return { kind: 'crane', group, body, beaconMat, wheels: [], materials: [bodyMat] };
+
+  // slewing cab/turret — everything above this yaws to track the current span
+  const cab = new THREE.Group();
+  cab.position.y = 0.5;
+  body.add(cab);
+
+  const cabBody = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.8, 1.3), bodyMat);
+  cabBody.position.set(0, 0.4, 0);
+  cab.add(cabBody);
+
+  const counterweight = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.7, 1.1), latticeMat);
+  counterweight.position.set(-1.1, 0.5, 0);
+  cab.add(counterweight);
+
+  // A-frame legs bracing the boom's base, angled up and forward
+  const legGeo = new THREE.BoxGeometry(0.18, 1.6, 0.18);
+  for (const side of [-1, 1]) {
+    const leg = new THREE.Mesh(legGeo, latticeMat);
+    leg.position.set(0.3, 1.2, side * 0.5);
+    leg.rotation.z = THREE.MathUtils.degToRad(-20);
+    cab.add(leg);
+  }
+
+  // Lattice boom: a main spine plus diagonal struts (the "lattice" reading), rising at a fixed
+  // angle from just above the cab. Pivoted at its base so the whole assembly could in principle
+  // pitch, though Task 22 only ever slews (yaws) it — the pitch stays fixed.
+  const boom = new THREE.Group();
+  boom.position.set(0.5, 1.7, 0);
+  boom.rotation.z = THREE.MathUtils.degToRad(35); // rises up and forward
+  cab.add(boom);
+
+  const BOOM_LENGTH = 7.5;
+  const spine = new THREE.Mesh(new THREE.BoxGeometry(BOOM_LENGTH, 0.22, 0.22), latticeMat);
+  spine.position.set(BOOM_LENGTH / 2, 0, 0);
+  boom.add(spine);
+
+  const strutGeo = new THREE.BoxGeometry(0.08, 0.5, 0.08);
+  for (let i = 0; i < 3; i++) {
+    const u = (i + 1) / 4;
+    const strut = new THREE.Mesh(strutGeo, latticeMat);
+    strut.position.set(BOOM_LENGTH * u, 0, 0);
+    strut.rotation.z = THREE.MathUtils.degToRad(45);
+    boom.add(strut);
+  }
+
+  // Cable + hook hang from the boom tip. `craneCable` is a unit-length cylinder whose local origin
+  // sits at its TOP (translated so it only ever grows downward) so scaling Y directly gives "cable
+  // length" without needing to also reposition it every frame.
+  const boomTip = new THREE.Group();
+  boomTip.position.set(BOOM_LENGTH, 0, 0);
+  boom.add(boomTip);
+
+  const cableGeo = new THREE.CylinderGeometry(0.05, 0.05, 1, 6);
+  cableGeo.translate(0, -0.5, 0);
+  const craneCable = new THREE.Mesh(cableGeo, cableMat);
+  boomTip.add(craneCable);
+
+  const craneHook = new THREE.Group();
+  boomTip.add(craneHook);
+
+  const hookMesh = new THREE.Mesh(new THREE.SphereGeometry(0.22, 8, 6), latticeMat);
+  craneHook.add(hookMesh);
+
+  const beaconMat = addBeacon(cab, 2.2);
+
+  return {
+    kind: 'crane',
+    group,
+    body,
+    beaconMat,
+    wheels: [],
+    materials,
+    craneCab: cab,
+    craneBoom: boom,
+    craneCable,
+    craneHook,
+  };
+}
+
+/**
+ * The deck segment currently being lowered into place (deliverable 3/4): a plain slab standing in
+ * for a prefab bridge-deck section. Unlike the rest of the crane rig, this is NOT parented under
+ * the crane's hook — the boom's fixed reach means the hook itself never actually travels out to a
+ * span that may be many units down the run, so a hook-parented segment would visually hover right
+ * next to the crane instead of over the water where it's actually landing. Built as a standalone
+ * scene-level mesh instead, positioned directly at the span's real world location each frame by
+ * `applyCraneArticulation` — the crane's cable/hook still animate (paying out as if lowering it)
+ * for the "the crane is doing this" read, but the segment itself always appears where the deck
+ * segment is actually going.
+ */
+function buildCraneSegment(): { mesh: THREE.Mesh; mat: THREE.MeshStandardMaterial } {
+  const mat = new THREE.MeshStandardMaterial({
+    color: STAGE_COLOR.gravel,
+    flatShading: true,
+    roughness: 0.9,
+    transparent: true,
+    opacity: 0,
+  });
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 0.4, 1), mat);
+  mesh.visible = false;
+  return { mesh, mat };
 }
 
 /** Per-vehicle animation/visibility state, independent of the rig's static geometry. */
@@ -1082,6 +1209,30 @@ function buildFloodlight(scene: THREE.Scene): FloodlightRig {
 }
 
 /**
+ * Per-edge bridge-crane crossing state (Task 22 deliverable 3/4): tracks a single active gravel-
+ * stage crossing of one bridge run at a time. `settledUpTo` is the edge-absolute arclength every
+ * span up to (and including) has fully landed+bounced — this is exactly the value reported to
+ * `roadRenderer.setBridgeMask` so the deck ribbon can never render ahead of it (deliverable 4).
+ * `activeSpanIdx`/`phase`/`elapsed` drive the crane's own descend-and-settle animation for
+ * whichever single span is currently in flight; at most one span animates at a time since the work
+ * front only ever crosses spans in order.
+ */
+interface BridgeCrossing {
+  edgeId: number;
+  runFromDist: number;
+  runToDist: number;
+  settledUpTo: number; // edge-absolute arclength
+  activeSpanIdx: number | null;
+  phase: 'descending' | 'bouncing';
+  elapsed: number;
+  segmentFrom: number; // arclength bounds of the span currently animating
+  segmentTo: number;
+  cabYaw: number; // current damped slew yaw (radians, crane-local)
+  demolish: boolean; // true if this crossing is being walked backward (reverse teardown)
+  lastProgressAt: number; // this.clock as of the last progress event that touched this crossing
+}
+
+/**
  * Renders the active construction crew's vehicle for each in-progress job, plus the trailing
  * roller during `paved` and dust/steam particle effects. One `VehicleRig` per `VehicleKind` is
  * built once at startup and hidden; only the vehicle(s) relevant to the currently-streaming
@@ -1114,11 +1265,20 @@ export class ConstructionRenderer {
   private lastRollerSeenAt = -Infinity;
   private readonly IDLE_TIMEOUT = 0.2; // seconds without a progress event => job considered done
 
+  // Bridge construction theater (Task 22): at most one active crossing per edge (a bridge run
+  // being actively crossed by 'gravel'-stage progress right now); cleared once the crossing's
+  // owning job goes idle/moves past the run so the crane can fade out and be reused elsewhere.
+  private bridgeCrossings: Map<number, BridgeCrossing> = new Map();
+  private craneSeenAt = -Infinity;
+  private craneSegment: THREE.Mesh;
+  private craneSegmentMat: THREE.MeshStandardMaterial;
+
   constructor(
     private scene: THREE.Scene,
     bus: EventBus,
     private graph: RoadGraph,
     private hf: Heightfield,
+    private roadRenderer: RoadRenderer,
   ) {
     this.rigs = {
       excavator: buildExcavator(),
@@ -1159,6 +1319,11 @@ export class ConstructionRenderer {
     this.scene.add(this.stockpile.group);
 
     this.floodlight = buildFloodlight(this.scene);
+
+    const craneSegmentParts = buildCraneSegment();
+    this.craneSegment = craneSegmentParts.mesh;
+    this.craneSegmentMat = craneSegmentParts.mat;
+    this.scene.add(this.craneSegment);
 
     bus.on('construction:progress', (e) => this.onProgress(e));
     // Safety net for stakes: grading normally sweeps every planted stake away as the work front
@@ -1392,6 +1557,103 @@ export class ConstructionRenderer {
       truckState.demolish = false;
       truckState.onBridge = nearestSampleBridge(edge.samples, e.t);
     }
+
+    // Bridge construction theater (deliverable 3/4): 'gravel'-stage progress crossing a bridge run
+    // stations the crane and lowers deck segments span-by-span; the deck ribbon stays masked (see
+    // roadRenderer.setBridgeMask) until each span settles. Demolition's reverse teardown is a
+    // simple fade (no crane) per the binding spec, handled by `updateBridgeCrossings`'s recede path.
+    if (e.stage === 'gravel' && edge) {
+      this.onGravelBridgeProgress(e.edgeId, edge, e.t, e.demolish);
+    }
+  }
+
+  /**
+   * Advances (or starts/ends) this edge's `BridgeCrossing` in response to a 'gravel'-stage
+   * progress event. Only meaningful while `t` is actually within one of the edge's bridge runs —
+   * everywhere else on the edge, gravel work proceeds exactly as before Task 22 (no crane, no
+   * masking) and any existing crossing for this edge is torn down so its mask/state don't linger.
+   */
+  private onGravelBridgeProgress(edgeId: number, edge: { samples: Parameters<typeof getBridgeRunInfo>[0] }, t: number, demolish: boolean): void {
+    const runs = getBridgeRunInfo(edge.samples);
+    const run = runs.find((r) => t >= r.fromDist - 0.01 && t <= r.toDist + 0.01);
+
+    if (!run) {
+      // Work front isn't currently inside any bridge run on this edge — nothing to animate. Leave
+      // any existing (now-finished) crossing's mask exactly where it settled; `updateBridgeCrossings`
+      // clears it once the crossing goes idle for IDLE_TIMEOUT, same liveness pattern as every
+      // other vehicle kind in this file.
+      return;
+    }
+
+    let crossing = this.bridgeCrossings.get(edgeId);
+    if (!crossing || crossing.runFromDist !== run.fromDist) {
+      // Fresh crossing of this run (first time we've seen 'gravel' progress land inside it, or a
+      // different run on a multi-bridge edge): start masking from the run's own beginning (or, for
+      // a demolish walking backward INTO this run from the far end, from the run's own end — see
+      // below) rather than wherever `t` happens to be, so there's never a gap for spans skipped
+      // between "job started" and "the first progress event we happened to observe."
+      crossing = {
+        edgeId,
+        runFromDist: run.fromDist,
+        runToDist: run.toDist,
+        settledUpTo: demolish ? run.toDist : run.fromDist,
+        activeSpanIdx: null,
+        phase: 'descending',
+        elapsed: 0,
+        segmentFrom: run.fromDist,
+        segmentTo: run.fromDist,
+        cabYaw: 0,
+        demolish,
+        lastProgressAt: this.clock,
+      };
+      this.bridgeCrossings.set(edgeId, crossing);
+      this.roadRenderer.setBridgeMask(edgeId, crossing.settledUpTo);
+    }
+    crossing.demolish = demolish;
+    crossing.lastProgressAt = this.clock;
+    // The crane rig itself only ever appears for the forward (build) direction — reverse teardown
+    // is a simple fade per the binding spec, no crane required — so liveness for 'crane' the
+    // VehicleKind is refreshed here only in the non-demolish case.
+    if (!demolish) this.craneSeenAt = this.clock;
+
+    if (demolish) {
+      // Reverse teardown (deliverable 6): simple recede, no crane — settledUpTo (here read as "not
+      // yet torn down past this point") tracks the receding work front directly, one-to-one, with
+      // no descend/bounce animation. `updateBridgeCrossings` drives the actual fade-down visuals.
+      crossing.settledUpTo = Math.max(run.fromDist, Math.min(run.toDist, t));
+      this.roadRenderer.setBridgeMask(edgeId, crossing.settledUpTo);
+      return;
+    }
+
+    const spanIdx = Math.max(0, Math.floor((t - run.fromDist) / BRIDGE_SPAN_LENGTH));
+    const spanFrom = run.fromDist + spanIdx * BRIDGE_SPAN_LENGTH;
+    const spanTo = Math.min(run.toDist, spanFrom + BRIDGE_SPAN_LENGTH);
+
+    if (crossing.activeSpanIdx === null || crossing.activeSpanIdx !== spanIdx) {
+      // Work front has advanced into a new span: kick off that span's descent. If a previous span
+      // was still mid-animation (shouldn't normally happen at 8u/s vs. a 1.5s+bounce descent, but
+      // the work front's speed is a sim constant we don't control), snap it straight to settled
+      // first so we never leave two segments animating at once.
+      if (crossing.activeSpanIdx !== null) {
+        this.settleBridgeSpan(crossing);
+      }
+      crossing.activeSpanIdx = spanIdx;
+      crossing.segmentFrom = spanFrom;
+      crossing.segmentTo = spanTo;
+      crossing.phase = 'descending';
+      crossing.elapsed = 0;
+    }
+  }
+
+  /** Immediately finalizes whichever span is currently animating on `crossing` (used both by the
+   * normal descend->bounce completion in `updateBridgeCrossings` and as a safety valve if the work
+   * front races ahead of the crane's own animation timing). */
+  private settleBridgeSpan(crossing: BridgeCrossing): void {
+    if (crossing.activeSpanIdx === null) return;
+    crossing.settledUpTo = Math.max(crossing.settledUpTo, crossing.segmentTo);
+    this.roadRenderer.setBridgeMask(crossing.edgeId, crossing.settledUpTo);
+    this.roadRenderer.markSpanSettled(crossing.edgeId, crossing.runFromDist, crossing.activeSpanIdx);
+    crossing.activeSpanIdx = null;
   }
 
   private emitDust(x: number, y: number, z: number): void {
@@ -1557,10 +1819,16 @@ export class ConstructionRenderer {
   update(dt: number, night: boolean): void {
     this.clock += dt;
 
+    // Bridge crane theater (Task 22) is stepped before the generic per-kind loop below so its
+    // `applyProgressTarget`/liveness bookkeeping (synthesized here, same pattern as the truck
+    // shuttle/roller — queue.ts never emits a real `vehicle: 'crane'` progress event) is in place
+    // before `stepVehicle('crane', ...)` runs this same frame.
+    this.updateBridgeCrossings(dt);
+
     // determine which vehicle kinds are "active" this frame: they received a progress event
     // within IDLE_TIMEOUT seconds (guards against a single stray frame gap causing a pop).
     for (const [kind, state] of this.states) {
-      const lastSeen = this.lastSeenAt.get(kind) ?? -Infinity;
+      const lastSeen = kind === 'crane' ? this.craneSeenAt : (this.lastSeenAt.get(kind) ?? -Infinity);
       const active = this.clock - lastSeen <= this.IDLE_TIMEOUT;
       this.stepVehicle(state, dt, active);
     }
@@ -1977,6 +2245,140 @@ export class ConstructionRenderer {
   }
 
   /**
+   * Bridge crane theater (Task 22 deliverables 3/4): for every edge currently mid-crossing of a
+   * bridge run during 'gravel'-stage work, stations the crane rig at the run's near end, slews its
+   * cab to track whichever span is currently descending, and advances that span's descend
+   * (easeOutCubic, SEGMENT_DESCEND_DURATION) then settle-bounce (easeOutBack,
+   * SEGMENT_SETTLE_BOUNCE_DURATION) animation. On completion, hands off to `settleBridgeSpan` (marks
+   * the span settled in `roadRenderer`, which un-masks that stretch of the real deck ribbon/rails).
+   * Demolition crossings never show the crane at all (deliverable 6: reverse is a simple recede,
+   * already fully handled by `onGravelBridgeProgress`'s mask update) — this method only animates
+   * the crane/segment for non-demolish crossings, though it still runs the shared idle-timeout
+   * cleanup for both directions.
+   */
+  private updateBridgeCrossings(dt: number): void {
+    let anyForwardActive = false;
+
+    for (const [edgeId, crossing] of this.bridgeCrossings) {
+      const idle = this.clock - crossing.lastProgressAt > this.IDLE_TIMEOUT;
+      if (idle) {
+        // Job moved off this bridge run (finished crossing it, or the whole job went idle/ended).
+        // If every span settled, this was a clean completion — nothing left to mask, drop the
+        // crossing entirely. Otherwise (job ended mid-crossing, e.g. edge externally removed)
+        // leave roadRenderer's mask exactly where it last was rather than guessing; either way the
+        // crane itself stops being fed a target and fades out via the normal liveness timeout.
+        this.bridgeCrossings.delete(edgeId);
+        if (!crossing.demolish && crossing.settledUpTo >= crossing.runToDist - 0.01) {
+          this.roadRenderer.setBridgeMask(edgeId, null);
+        }
+        continue;
+      }
+      if (crossing.demolish) continue; // reverse teardown: no crane, nothing further to animate here
+
+      anyForwardActive = true;
+      const edge = this.graph.edges.get(edgeId);
+      if (!edge) continue;
+
+      // Station the crane at the run's near end, facing along the run.
+      const { pos: stationPos, heading: stationHeading } = sampleAt(edge.samples, crossing.runFromDist);
+      const craneState = this.stateFor('crane');
+      this.applyProgressTarget(craneState, edgeId, new THREE.Vector3(stationPos.x, stationPos.y, stationPos.z), stationHeading);
+      craneState.stage = 'gravel';
+      craneState.demolish = false;
+      craneState.onBridge = false; // the crane itself sits on the approach, not the deck
+
+      // Advance the current span's descend -> settle-bounce animation.
+      if (crossing.activeSpanIdx !== null) {
+        crossing.elapsed += dt;
+        if (crossing.phase === 'descending' && crossing.elapsed >= SEGMENT_DESCEND_DURATION) {
+          crossing.phase = 'bouncing';
+          crossing.elapsed = 0;
+        } else if (crossing.phase === 'bouncing' && crossing.elapsed >= SEGMENT_SETTLE_BOUNCE_DURATION) {
+          this.settleBridgeSpan(crossing);
+        }
+      }
+
+      this.applyCraneArticulation(craneState.rig, edge, crossing, dt);
+    }
+
+    if (!anyForwardActive) {
+      // No forward (build) crossing active anywhere: make sure the crane segment mesh is hidden
+      // rather than left showing a stale descended segment from the last crossing it animated.
+      const rig = this.rigs.crane;
+      this.craneSegmentMat.opacity = damp(this.craneSegmentMat.opacity, 0, 1 / FADE_DURATION, dt);
+      if (this.craneSegmentMat.opacity <= 0.01) this.craneSegment.visible = false;
+      if (rig.craneCable) rig.craneCable.scale.y = damp(rig.craneCable.scale.y, 0.001, 8, dt);
+    }
+  }
+
+  /**
+   * Positions/scales the crane's cab slew + cable (both cosmetic, near the crane's own fixed
+   * station) and the standalone world-space deck-segment mesh (see `buildCraneSegment`) for the
+   * span `crossing` is currently animating.
+   *
+   * The boom has a fixed physical reach, but bridge spans can sit many multiples of that reach
+   * away from the crane's stationary base — so rather than pretend the hook itself travels all the
+   * way out to the span (which would require either an implausibly long boom or literally
+   * relocating the crane every span), the cab still slews to visually "aim" at the current span
+   * and the cable still pays in/out near the crane as a "the crane is doing this" cue, but the
+   * actual descending segment is a separate mesh placed directly at the span's real world position
+   * — this is the part players actually watch land, so it must never be anywhere else.
+   */
+  private applyCraneArticulation(rig: VehicleRig, edge: { samples: Parameters<typeof sampleAt>[0] }, crossing: BridgeCrossing, dt: number): void {
+    if (!rig.craneCab || !rig.craneCable || !rig.craneHook) return;
+    if (crossing.activeSpanIdx === null) {
+      this.craneSegmentMat.opacity = damp(this.craneSegmentMat.opacity, 0, 1 / FADE_DURATION, dt);
+      if (this.craneSegmentMat.opacity <= 0.01) this.craneSegment.visible = false;
+      return;
+    }
+
+    const spanMid = (crossing.segmentFrom + crossing.segmentTo) / 2;
+    const { pos: spanPos, heading: spanHeading } = sampleAt(edge.samples, spanMid);
+    const stationPos = rig.group.position;
+    // Slew (cab yaw) tracks the bearing from the crane's station to the span's midpoint, in the
+    // rig's own local frame (subtract the rig's own world yaw, which `stepVehicle` already applied
+    // to `rig.group.rotation.y`).
+    const worldBearing = Math.atan2(spanPos.z - stationPos.z, spanPos.x - stationPos.x);
+    const targetYaw = worldBearing + rig.group.rotation.y; // rig.group.rotation.y = -heading
+    let deltaYaw = targetYaw - crossing.cabYaw;
+    deltaYaw = Math.atan2(Math.sin(deltaYaw), Math.cos(deltaYaw));
+    crossing.cabYaw += deltaYaw * (1 - Math.exp(-CRANE_SLEW_LAMBDA * dt));
+    rig.craneCab.rotation.y = crossing.cabYaw;
+
+    // Descend -> settle-bounce: `u` is the segment's height above the deck (SEGMENT_DROP_HEIGHT ->
+    // 0), eased down during 'descending' and holding at (a tiny bounce around) 0 during 'bouncing'.
+    let dropHeight: number;
+    if (crossing.phase === 'descending') {
+      const u = clamp01(crossing.elapsed / SEGMENT_DESCEND_DURATION);
+      dropHeight = SEGMENT_DROP_HEIGHT * (1 - easeOutCubic(u));
+    } else {
+      const u = clamp01(crossing.elapsed / SEGMENT_SETTLE_BOUNCE_DURATION);
+      // easeOutBack overshoots past 1 then settles back to 1; invert so the segment dips slightly
+      // below its resting height and springs back, reading as a small settle bounce on landing.
+      const bounce = 1 - easeOutBack(u);
+      dropHeight = Math.max(0, -bounce * 0.3);
+    }
+
+    // Cable/hook: a simple cosmetic pay-out near the crane's own boom tip, tracking the same
+    // descend progress (0 = fully hoisted, 1 = fully paid out) without trying to reach the span.
+    const descendU = crossing.phase === 'descending'
+      ? clamp01(crossing.elapsed / SEGMENT_DESCEND_DURATION)
+      : 1;
+    const cableLength = 1 + descendU * 3;
+    rig.craneCable.scale.y = cableLength;
+    rig.craneHook.position.y = -cableLength;
+
+    // The actual deck segment: placed in world space at the span's real position/heading, easing
+    // down from SEGMENT_DROP_HEIGHT above the deck to the deck surface itself.
+    this.craneSegment.visible = true;
+    this.craneSegment.position.set(spanPos.x, spanPos.y + dropHeight, spanPos.z);
+    this.craneSegment.rotation.y = -spanHeading;
+    this.craneSegmentMat.opacity = damp(this.craneSegmentMat.opacity, 0.95, 1 / 0.3, dt);
+    const segLen = crossing.segmentTo - crossing.segmentFrom;
+    this.craneSegment.scale.set(ROAD_WIDTH * 0.9, 1, Math.max(1, segLen));
+  }
+
+  /**
    * Tire/track marks: fading instanced decals stamped under moving vehicles while the terrain is
    * still dirt (graded/gravel stages) — paved/painted stages have a hard surface, no marks. Each
    * active vehicle stamps at most once every TIRE_MARK_INTERVAL seconds so the ≤256 pool covers a
@@ -2075,5 +2477,9 @@ export class ConstructionRenderer {
     });
     this.floodlight.headMat.dispose();
     this.floodlight.poleMat.dispose();
+
+    this.scene.remove(this.craneSegment);
+    this.craneSegment.geometry.dispose();
+    this.craneSegmentMat.dispose();
   }
 }

@@ -118,7 +118,7 @@ function main(): void {
   const graph = new RoadGraph(bus, makeSampler(hf));
   const roadRenderer = new RoadRenderer(scene, graph, bus, hf);
   const buildQueue = new BuildQueue(graph, hf, bus);
-  const constructionRenderer = new ConstructionRenderer(scene, bus, graph, hf);
+  const constructionRenderer = new ConstructionRenderer(scene, bus, graph, hf, roadRenderer);
 
   const traffic = new TrafficSim(graph, bus, createRng('traffic-' + hf.seed));
   traffic.targetPopulation = 6; // Task 13 scales this with houses: 6 + houses, capped at 80

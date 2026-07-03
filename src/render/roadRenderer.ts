@@ -5,6 +5,7 @@ import { ROAD_WIDTH } from '../core/constants';
 import { EventBus } from '../core/events';
 import { RoadGraph, RoadEdge } from '../sim/roads/graph';
 import type { Heightfield } from '../sim/terrain/heightfield';
+import { easeOutCubic, clamp01 } from './easing';
 
 const REBUILD_THROTTLE = 0.15; // seconds, per edge, during progress events
 const SHEEN_DURATION = 25; // seconds for fresh-asphalt roughness lerp
@@ -46,7 +47,10 @@ const BRIDGE_COLOR = '#7a7a72';
 const BRIDGE_RAIL_WIDTH = 0.4;
 const BRIDGE_RAIL_HEIGHT = 0.8;
 const BRIDGE_PYLON_RADIUS = 0.9;
-const BRIDGE_PYLON_SPACING = 16;
+// Exported (Task 22): constructionRenderer.ts's crane choreography lowers deck segments in the
+// same 16u increments pylons are spaced at, so the two files share this one constant rather than
+// each defining their own "span length" that could silently drift out of sync.
+export const BRIDGE_PYLON_SPACING = 16;
 
 /** Previous stage in the construction order; 'surveyed' has no previous stage. */
 function prevStage(stage: Stage): Stage | null {
@@ -289,6 +293,20 @@ interface BridgeRun {
   toDist: number;
 }
 
+/**
+ * A single contiguous bridge run's arclength span plus the arclength stations (measured from the
+ * edge's own sample[0], NOT from the run's own start) of every pylon along it — the same stations
+ * `buildBridgeParts` plants cylinders at. Exported (Task 22) so `constructionRenderer.ts` can
+ * choreograph the crane/pylon-rise/deck-masking sequence without duplicating this geometry math or
+ * needing a reference to the `RoadRenderer` instance itself; this is a pure function of an edge's
+ * `samples`, so either renderer can call it directly off `RoadGraph.edges.get(id)!.samples`.
+ */
+export interface BridgeRunInfo {
+  fromDist: number;
+  toDist: number;
+  pylonStations: number[];
+}
+
 /** Finds maximal consecutive runs of bridge==true samples, expressed as arclength ranges. */
 function findBridgeRuns(samples: RoadSample[]): BridgeRun[] {
   const pts = cumulativeDistances(samples);
@@ -304,6 +322,72 @@ function findBridgeRuns(samples: RoadSample[]): BridgeRun[] {
   }
   if (runStart !== -1) runs.push({ fromDist: pts[runStart].dist, toDist: pts[samples.length - 1].dist });
   return runs;
+}
+
+/**
+ * Splits [from, to] into sub-ranges, clipping any portion that overlaps a bridge run to
+ * `min(subRangeEnd, maskTo)` — i.e. a bridge run never draws its deck ribbon past `maskTo`,
+ * regardless of how far the caller's own `to` extends. Ground outside every bridge run is
+ * returned unclipped. Ranges that clip to zero length are dropped. This is the mechanism behind
+ * Task 22 deliverable 4: `constructionRenderer.ts` reports `maskTo` as the crane settles each deck
+ * segment, and this guarantees the ribbon can never render ahead of (or leave a gap behind) that
+ * settled point, no matter which stage/pending-progress split `buildStageSegment` is mid-way
+ * through.
+ */
+function clipRangesForBridgeMask(
+  samples: RoadSample[],
+  from: number,
+  to: number,
+  maskTo: number,
+): Array<{ from: number; to: number }> {
+  const runs = findBridgeRuns(samples);
+  if (!runs.length) return [{ from, to }];
+
+  const out: Array<{ from: number; to: number }> = [];
+  let cursor = from;
+  // Process runs in order; between/around them the range passes through unmodified.
+  for (const run of runs) {
+    const runFrom = Math.max(run.fromDist, from);
+    const runTo = Math.min(run.toDist, to);
+    if (runTo <= runFrom) continue; // this run doesn't overlap [from, to] at all
+
+    if (cursor < runFrom) out.push({ from: cursor, to: runFrom });
+    const clippedRunTo = Math.min(runTo, maskTo);
+    if (clippedRunTo > runFrom) out.push({ from: runFrom, to: clippedRunTo });
+    cursor = runTo;
+  }
+  if (cursor < to) out.push({ from: cursor, to });
+  return out;
+}
+
+/** Pylon stations for a single run, spaced BRIDGE_PYLON_SPACING apart starting at the run's own
+ * start — identical stepping logic to `buildBridgeParts`'s pylon loop (kept in sync deliberately;
+ * `buildBridgeParts` now calls this instead of re-deriving its own copy). */
+function pylonStationsFor(run: BridgeRun): number[] {
+  const stations: number[] = [];
+  const runLen = run.toDist - run.fromDist;
+  const count = Math.max(1, Math.floor(runLen / BRIDGE_PYLON_SPACING) + 1);
+  for (let k = 0; k <= count; k++) {
+    const d = run.fromDist + Math.min(runLen, k * BRIDGE_PYLON_SPACING);
+    if (d > run.toDist) break;
+    stations.push(d);
+    if (d >= run.toDist) break;
+  }
+  return stations;
+}
+
+/**
+ * Per-edge bridge-run metadata (Task 22 deliverable 1): every contiguous bridge-flagged sample run
+ * on this edge, expressed as an arclength span plus its pylon stations. Read-only/stateless — pure
+ * geometry derived from `samples.bridge`, with no side effects and no change to what
+ * `buildBridgeParts` itself renders.
+ */
+export function getBridgeRunInfo(samples: RoadSample[]): BridgeRunInfo[] {
+  return findBridgeRuns(samples).map((run) => ({
+    fromDist: run.fromDist,
+    toDist: run.toDist,
+    pylonStations: pylonStationsFor(run),
+  }));
 }
 
 /**
@@ -347,17 +431,57 @@ interface PendingProgress {
   t: number;
 }
 
+// --- Bridge construction theater (Task 22) ---------------------------------------------------
+const PYLON_RISE_DURATION = 1.2; // seconds, easeOutCubic scale-Y 0->1 as the graded work front passes
+const RAIL_SETTLE_DURATION = 0.4; // seconds, quick scale/position ease right after a span's deck settles
+const BRIDGE_SPAN_LENGTH = BRIDGE_PYLON_SPACING; // deck "segments" for masking/rails match the 16u pylon spacing
+
+/** Per-station pylon rise progress, keyed by a rounded arclength bucket (see `stationKey`) so it
+ * survives the throttled `rebuild()` cycle instead of resetting to 0 every 0.15s. `startedAt` is
+ * `null` until the graded work front first reaches the station; `elapsed` then counts up toward
+ * `PYLON_RISE_DURATION` independent of how many rebuilds happen while it's rising. A demolition
+ * (work front receding) sinks the pylon back down via the same `elapsed`, driven in reverse. */
+interface PylonRiseState {
+  elapsed: number; // 0..PYLON_RISE_DURATION, drives easeOutCubic scale-Y
+  rising: boolean; // direction: true = animating toward risen, false = sinking back to 0
+}
+
+/** Per-span (16u bucket within a bridge run) rail settle progress — mirrors `PylonRiseState` but
+ * keyed per-span rather than per-pylon-station, since rails settle with each deck segment landing,
+ * not with the (differently-timed) graded work front. */
+interface RailSettleState {
+  elapsed: number; // 0..RAIL_SETTLE_DURATION
+  settled: boolean; // true once this span's deck has been reported settled by constructionRenderer
+}
+
+function stationKey(edgeId: number, station: number): string {
+  return `${edgeId}:${Math.round(station * 4)}`; // quarter-unit buckets, plenty precise for a fixed pylon spacing
+}
+
+function spanKey(edgeId: number, runFromDist: number, spanIndex: number): string {
+  return `${edgeId}:${Math.round(runFromDist * 4)}:${spanIndex}`;
+}
+
 interface EdgeVisual {
   group: THREE.Group;
   meshes: THREE.Mesh[];
   lastRebuildAt: number;
   pending: PendingProgress | null;
   freshAsphaltAt: number | null; // performance.now()/1000-style seconds when 'paved' stage began, or null
+  gradedT: number; // latest reported graded-stage arclength (drives pylon rise); 0 if never graded
+  gradedDemolish: boolean; // latest graded progress event's demolish flag (sinks pylons in reverse)
+  bridgeMaskTo: number | null; // arclength (edge-absolute) the deck/rails may draw up to within bridge
+                               // runs; null = no masking (unaffected — e.g. edge has no active gravel job)
 }
 
 export class RoadRenderer {
   private visuals = new Map<number, EdgeVisual>();
   private clockSeconds = 0;
+
+  // Bridge construction theater (Task 22): persisted per-station/per-span animation state that
+  // survives the throttled `rebuild()` cycle (see PylonRiseState/RailSettleState doc comments).
+  private pylonRise = new Map<string, PylonRiseState>();
+  private railSettle = new Map<string, RailSettleState>();
 
   constructor(
     private scene: THREE.Scene,
@@ -368,7 +492,7 @@ export class RoadRenderer {
     bus.on('roads:edgeAdded', ({ edgeId }) => this.onEdgeAdded(edgeId));
     bus.on('roads:edgeRemoved', ({ edgeId }) => this.disposeEdge(edgeId));
     bus.on('construction:stage', ({ edgeId, stage }) => this.onStage(edgeId, stage));
-    bus.on('construction:progress', ({ edgeId, stage, t }) => this.onProgress(edgeId, stage, t));
+    bus.on('construction:progress', ({ edgeId, stage, t, demolish }) => this.onProgress(edgeId, stage, t, demolish));
   }
 
   private onEdgeAdded(edgeId: number): void {
@@ -393,11 +517,17 @@ export class RoadRenderer {
     this.rebuild(edge);
   }
 
-  private onProgress(edgeId: number, stage: Stage, t: number): void {
+  private onProgress(edgeId: number, stage: Stage, t: number, demolish: boolean): void {
     const edge = this.graph.edges.get(edgeId);
     if (!edge) return;
     const v = this.ensureVisual(edge);
     v.pending = { stage, t };
+    if (stage === 'graded') {
+      // Pylon rise (deliverable 2) is driven by the graded-stage work front specifically, tracked
+      // independent of `pending` so it isn't cleared/reset by a later stage's progress events.
+      v.gradedT = t;
+      v.gradedDemolish = demolish;
+    }
   }
 
   private ensureVisual(edge: RoadEdge): EdgeVisual {
@@ -406,10 +536,56 @@ export class RoadRenderer {
       const group = new THREE.Group();
       group.userData.edgeId = edge.id;
       this.scene.add(group);
-      v = { group, meshes: [], lastRebuildAt: -Infinity, pending: null, freshAsphaltAt: edge.stage === 'paved' || edge.stage === 'painted' ? this.clockSeconds : null };
+      v = {
+        group,
+        meshes: [],
+        lastRebuildAt: -Infinity,
+        pending: null,
+        freshAsphaltAt: edge.stage === 'paved' || edge.stage === 'painted' ? this.clockSeconds : null,
+        gradedT: edge.stage === 'surveyed' ? 0 : edge.length, // already past graded => pylons fully risen
+        gradedDemolish: false,
+        bridgeMaskTo: null,
+      };
       this.visuals.set(edge.id, v);
     }
     return v;
+  }
+
+  /**
+   * Bridge deck/rail masking hook (Task 22 deliverable 4): `constructionRenderer.ts` calls this as
+   * its crane choreography settles each 16u deck segment during the gravel stage, reporting how far
+   * (edge-absolute arclength) the deck may now be drawn within this edge's bridge run(s).
+   * `settledTo === null` clears masking entirely (deck/rails draw exactly like the existing
+   * partial-progress split, unaffected — e.g. once the job leaves 'gravel' and moves on to
+   * 'paved'/'painted', the whole run is by definition already settled and behaves exactly as
+   * before Task 22). Marks the edge dirty for the next throttled rebuild rather than forcing an
+   * immediate one, per the binding spec's "coordinate with the rebuild-throttle."
+   */
+  setBridgeMask(edgeId: number, settledTo: number | null): void {
+    const edge = this.graph.edges.get(edgeId);
+    if (!edge) return;
+    const v = this.ensureVisual(edge);
+    if (v.bridgeMaskTo === settledTo) return;
+    v.bridgeMaskTo = settledTo;
+    // Force a rebuild eagerly the same way onStage does for a real stage transition — masking
+    // changes need to track the crane's per-frame settle progress closely enough to read as a
+    // continuous descent, not just whatever the unrelated pending-progress throttle happens to do.
+    if (this.clockSeconds - v.lastRebuildAt >= REBUILD_THROTTLE) {
+      this.rebuild(edge);
+    }
+  }
+
+  /** Marks span `spanIndex` of the bridge run starting at `runFromDist` on `edgeId` as settled
+   * (deliverable 5's "rails appear with a quick settle right after their segment lands"). Called by
+   * `constructionRenderer.ts` at the exact moment a deck segment finishes its descent+bounce. */
+  markSpanSettled(edgeId: number, runFromDist: number, spanIndex: number): void {
+    const key = spanKey(edgeId, runFromDist, spanIndex);
+    let s = this.railSettle.get(key);
+    if (!s) {
+      s = { elapsed: 0, settled: false };
+      this.railSettle.set(key, s);
+    }
+    s.settled = true;
   }
 
   private clearMeshes(v: EdgeVisual): void {
@@ -451,7 +627,19 @@ export class RoadRenderer {
       this.buildStageSegment(v, samples, edge.stage, 0, length);
     }
 
-    this.buildBridgeParts(v, samples);
+    // Deliverable 4/5 gating: rails/pylons must never appear before this edge's construction has
+    // actually reached a stage where a deck could plausibly exist. `edge.stage` is the graph's own
+    // persisted "fully completed through" marker; `v.pending`'s stage (if any) is the *currently
+    // in-progress* stage, which for a live 'gravel' job on a bridge run is exactly when the crane
+    // choreography (bridgeMaskTo) is the authority instead. A `'surveyed'`/`'graded'` edge with no
+    // pending progress at gravel-or-later has no deck at all yet, so nothing should render (a fresh
+    // `commitChain` immediately calling `rebuild()` was previously showing full-height rails/pylons
+    // on a brand-new, not-yet-built bridge — this flag fixes that).
+    const pendingStage = v.pending?.stage;
+    const deckStageReached =
+      STAGES.indexOf(edge.stage) >= STAGES.indexOf('gravel') ||
+      (pendingStage !== undefined && STAGES.indexOf(pendingStage) >= STAGES.indexOf('gravel'));
+    this.buildBridgeParts(v, samples, edge.id, deckStageReached);
   }
 
   /**
@@ -462,6 +650,11 @@ export class RoadRenderer {
    * darker than the freshly-laid strip still ahead of the roller. A fully-`paved` edge with no
    * pending progress (the `else` branch in `rebuild()`) always renders uniformly, since there's no
    * roller actively working it anymore.
+   *
+   * Bridge deck masking (Task 22 deliverable 4): for stage 'gravel' or later (the stages that
+   * represent an actual deck surface, as opposed to 'graded' dirt/formwork), any sub-range that
+   * falls inside a bridge run is additionally clipped to `v.bridgeMaskTo` when masking is active —
+   * see `clipRangeForBridgeMask`. This never touches non-bridge ground.
    */
   private buildStageSegment(v: EdgeVisual, samples: RoadSample[], stage: Stage, from: number, to: number, advancing = false): void {
     if (to <= from) return;
@@ -471,6 +664,20 @@ export class RoadRenderer {
       this.addMesh(v, geo, mat);
       return;
     }
+
+    const deckStage = stage === 'gravel' || stage === 'paved' || stage === 'painted';
+    const ranges = deckStage && v.bridgeMaskTo !== null
+      ? clipRangesForBridgeMask(samples, from, to, v.bridgeMaskTo)
+      : [{ from, to }];
+
+    for (const range of ranges) {
+      this.buildStageRange(v, samples, stage, range.from, range.to, advancing);
+    }
+  }
+
+  /** The unclipped per-range body of `buildStageSegment` (see there for the masking wrapper). */
+  private buildStageRange(v: EdgeVisual, samples: RoadSample[], stage: Stage, from: number, to: number, advancing: boolean): void {
+    if (to <= from) return;
 
     if (stage === 'paved' && advancing) {
       // Roller trails the paver by ROLLER_TRAIL_DISTANCE (see constructionRenderer.ts): everything
@@ -510,46 +717,168 @@ export class RoadRenderer {
     }
   }
 
-  private buildBridgeParts(v: EdgeVisual, samples: RoadSample[]): void {
+  /**
+   * Pure read of currently-persisted pylon-rise/rail-settle state (both in `this.pylonRise`/
+   * `this.railSettle`, keyed per-station/per-span so they survive being rebuilt from scratch every
+   * throttled `rebuild()` call — see those maps' doc comments); does not itself advance either
+   * timer. Time advancement is `advanceBridgeEases`'s sole job, called once per frame from
+   * `update()` regardless of whether a geometry rebuild happens to land that same frame.
+   *
+   * `deckStageReached` (see `rebuild()`) is true once this edge's construction has actually reached
+   * 'gravel' or later, either as its persisted `edge.stage` or its currently in-progress pending
+   * stage. It gates the "no crane choreography has ever touched this span" default: a span with no
+   * `railSettle` entry defaults to hidden unless `deckStageReached` — otherwise a brand-new
+   * `'surveyed'`/`'graded'` edge (whose bridge run has no masking info yet simply because no gravel
+   * job has started) would show fully-built rails floating over a deck that doesn't exist yet.
+   */
+  private buildBridgeParts(v: EdgeVisual, samples: RoadSample[], edgeId: number, deckStageReached: boolean): void {
     const runs = findBridgeRuns(samples);
     if (!runs.length) return;
 
     const pts = cumulativeDistances(samples);
 
     for (const run of runs) {
-      // side rails: real 0.4 (wide) x 0.8 (tall) box cross-sections following the deck curve,
-      // offset to sit just inside the deck edges, resting on top of the paved deck surface.
-      const railOffset = ROAD_WIDTH / 2 - 0.2;
-      for (const side of [-1, 1]) {
-        const railGeo = buildRailBoxGeometry(
-          samples,
-          side * railOffset,
-          BRIDGE_RAIL_WIDTH,
-          BRIDGE_RAIL_HEIGHT,
-          STAGE_YLIFT.paved,
-          run.fromDist,
-          run.toDist,
-        );
-        const railMat = makeStandardMaterial(BRIDGE_COLOR);
-        this.addMesh(v, railGeo, railMat);
+      const runLen = run.toDist - run.fromDist;
+      const spanCount = Math.max(1, Math.ceil(runLen / BRIDGE_SPAN_LENGTH));
+
+      // Rails (deliverable 5): built per-span (rather than one box for the whole run) so each
+      // span's rail can settle in independently, right after that span's deck segment lands.
+      // A span with no settle info yet defaults to "already settled" ONLY once `deckStageReached`
+      // — this covers a fully 'paved'/'painted' edge rebuilt with no pending progress (see
+      // `rebuild()`'s `else` branch), which has no crane sequence driving settle state at all and
+      // must render every span at full scale unconditionally. Before gravel work has ever reached
+      // this run, every span defaults to hidden instead.
+      for (let spanIdx = 0; spanIdx < spanCount; spanIdx++) {
+        const spanFrom = run.fromDist + spanIdx * BRIDGE_SPAN_LENGTH;
+        const spanTo = Math.min(run.toDist, spanFrom + BRIDGE_SPAN_LENGTH);
+        if (spanTo <= spanFrom) continue;
+
+        const key = spanKey(edgeId, run.fromDist, spanIdx);
+        let settleState = this.railSettle.get(key);
+        const stillMasking = v.bridgeMaskTo !== null;
+        if (!settleState) {
+          // No crane choreography has ever reported this span. If masking is actively in effect,
+          // fall back to the mask boundary (spans already behind it default settled, matching the
+          // deck ribbon that's already showing there); otherwise fall back to `deckStageReached` —
+          // fully settled for an edge whose deck genuinely already exists (paved/painted, no live
+          // crane), hidden for one that hasn't even started gravel work yet.
+          const settled = stillMasking ? spanFrom < (v.bridgeMaskTo ?? 0) : deckStageReached;
+          settleState = { elapsed: settled ? RAIL_SETTLE_DURATION : 0, settled };
+          this.railSettle.set(key, settleState);
+        }
+        const settleU = easeOutCubic(clamp01(settleState.elapsed / RAIL_SETTLE_DURATION));
+        if (settleU <= 0.001) continue; // not settled yet — no rail drawn (deliverable 4/5 coordination)
+
+        const railOffset = ROAD_WIDTH / 2 - 0.2;
+        for (const side of [-1, 1]) {
+          const railGeo = buildRailBoxGeometry(
+            samples,
+            side * railOffset,
+            BRIDGE_RAIL_WIDTH,
+            BRIDGE_RAIL_HEIGHT,
+            STAGE_YLIFT.paved,
+            spanFrom,
+            spanTo,
+          );
+          const railMat = makeStandardMaterial(BRIDGE_COLOR);
+          const mesh = this.addMesh(v, railGeo, railMat);
+          // Quick settle: scale up from the deck (Y=STAGE_YLIFT.paved) rather than from the true
+          // origin, so the rail appears to rise out of the deck surface itself.
+          mesh.position.y = STAGE_YLIFT.paved;
+          mesh.scale.y = Math.max(0.001, settleU);
+          mesh.position.y -= STAGE_YLIFT.paved * mesh.scale.y; // keep the deck-level face anchored
+        }
       }
 
-      // pylons every BRIDGE_PYLON_SPACING along the run
-      const runLen = run.toDist - run.fromDist;
-      const count = Math.max(1, Math.floor(runLen / BRIDGE_PYLON_SPACING) + 1);
-      for (let k = 0; k <= count; k++) {
-        const d = run.fromDist + Math.min(runLen, k * BRIDGE_PYLON_SPACING);
-        if (d > run.toDist) break;
+      // pylons every BRIDGE_PYLON_SPACING along the run (deliverable 2: scale-Y rise as the
+      // graded-stage work front passes each station).
+      const stations = pylonStationsFor(run);
+      for (const d of stations) {
         const p = samplePointAt(pts, d);
         const groundY = this.hf.heightAt(p.x, p.z);
         const deckY = p.y;
         const pylonHeight = Math.max(0.1, deckY - groundY);
+
+        const key = stationKey(edgeId, d);
+        let riseState = this.pylonRise.get(key);
+        if (!riseState) {
+          // First time this station has ever been rendered: if the graded work front has already
+          // passed it (gradedT >= d) treat it as already fully risen (covers edges restored/loaded
+          // mid-or-post-build, where there was never a live progress event to trigger the rise);
+          // otherwise start at 0 and let `update()` grow it once the front reaches this station.
+          const alreadyPassed = v.gradedT >= d;
+          riseState = { elapsed: alreadyPassed ? PYLON_RISE_DURATION : 0, rising: alreadyPassed };
+          this.pylonRise.set(key, riseState);
+        }
+        const riseU = easeOutCubic(clamp01(riseState.elapsed / PYLON_RISE_DURATION));
+        if (riseU <= 0.001) continue; // hasn't started rising yet — nothing to draw
+
         const cyl = new THREE.CylinderGeometry(BRIDGE_PYLON_RADIUS, BRIDGE_PYLON_RADIUS, pylonHeight, 8);
-        cyl.translate(0, pylonHeight / 2, 0);
-        cyl.translate(p.x, groundY, p.z);
+        cyl.translate(0, pylonHeight / 2, 0); // pivot at the base so scale-Y grows upward from the ground
         const mat = makeStandardMaterial(BRIDGE_COLOR);
-        this.addMesh(v, cyl, mat);
-        if (d >= run.toDist) break;
+        const mesh = this.addMesh(v, cyl, mat);
+        mesh.position.set(p.x, groundY, p.z);
+        mesh.scale.y = Math.max(0.001, riseU);
+      }
+    }
+  }
+
+  /**
+   * Advances every persisted pylon-rise/rail-settle ease timer whose animation is in flight, for
+   * every currently-tracked edge — called once per frame from `update()` so the eases progress in
+   * real time regardless of whether/when the next throttled geometry rebuild happens to land. A
+   * timer reaching its target duration exactly at the moment a mesh visually needs to update its
+   * scale relies on the next `rebuild()` (triggered either by the normal progress throttle, by
+   * `setBridgeMask`, or — as a fallback — this method's own trigger below) to actually apply it.
+   */
+  private advanceBridgeEases(dt: number): void {
+    for (const [edgeId, v] of this.visuals) {
+      const edge = this.graph.edges.get(edgeId);
+      if (!edge) continue;
+      let touched = false;
+
+      // Pylon rise: grow toward risen for every station at/behind the current graded work front
+      // (or sink back toward 0 during a demolish's receding front), independent of any bridgeMask.
+      const runs = getBridgeRunInfo(edge.samples);
+      for (const run of runs) {
+        for (const station of run.pylonStations) {
+          const key = stationKey(edgeId, station);
+          let s = this.pylonRise.get(key);
+          const shouldRise = v.gradedDemolish ? v.gradedT > station : v.gradedT >= station;
+          if (!s) {
+            if (!shouldRise) continue;
+            s = { elapsed: 0, rising: true };
+            this.pylonRise.set(key, s);
+          }
+          const targetElapsed = shouldRise ? PYLON_RISE_DURATION : 0;
+          if (s.elapsed === targetElapsed) continue;
+          s.rising = shouldRise;
+          s.elapsed = shouldRise
+            ? Math.min(PYLON_RISE_DURATION, s.elapsed + dt)
+            : Math.max(0, s.elapsed - dt);
+          touched = true;
+        }
+      }
+
+      // Rail settle: once a span is marked settled (`markSpanSettled`, called by
+      // constructionRenderer.ts as the crane's descent+bounce for that segment completes), ease its
+      // rail scale up over RAIL_SETTLE_DURATION. Spans never un-settle (no reverse case here —
+      // demolition's reverse teardown is a simple fade per the binding spec, handled entirely by
+      // constructionRenderer's crane-less reverse path + this same rail geometry just disappearing
+      // via the normal partial-progress split once the mask recedes past it).
+      for (const run of runs) {
+        const spanCount = Math.max(1, Math.ceil((run.toDist - run.fromDist) / BRIDGE_SPAN_LENGTH));
+        for (let spanIdx = 0; spanIdx < spanCount; spanIdx++) {
+          const key = spanKey(edgeId, run.fromDist, spanIdx);
+          const s = this.railSettle.get(key);
+          if (!s || !s.settled || s.elapsed >= RAIL_SETTLE_DURATION) continue;
+          s.elapsed = Math.min(RAIL_SETTLE_DURATION, s.elapsed + dt);
+          touched = true;
+        }
+      }
+
+      if (touched && this.clockSeconds - v.lastRebuildAt >= REBUILD_THROTTLE) {
+        this.rebuild(edge);
       }
     }
   }
@@ -560,6 +889,14 @@ export class RoadRenderer {
     this.clearMeshes(v);
     this.scene.remove(v.group);
     this.visuals.delete(edgeId);
+
+    // Bridge theater state (Task 22) is keyed by a prefix containing this edgeId — drop every
+    // entry for it so a demolished/removed edge doesn't leak entries forever (an edge's id is
+    // never reused, so nothing else could ever collide with these keys anyway, but this keeps the
+    // maps bounded by "edges that currently exist" rather than "every edge that ever existed").
+    const prefix = `${edgeId}:`;
+    for (const key of this.pylonRise.keys()) if (key.startsWith(prefix)) this.pylonRise.delete(key);
+    for (const key of this.railSettle.keys()) if (key.startsWith(prefix)) this.railSettle.delete(key);
   }
 
   update(dt: number): void {
@@ -584,6 +921,10 @@ export class RoadRenderer {
         if (u >= 1) v.freshAsphaltAt = null;
       }
     }
+
+    // Bridge construction theater (Task 22): pylon-rise/rail-settle eases tick every frame,
+    // independent of the (unrelated) pending-progress rebuild throttle above.
+    this.advanceBridgeEases(dt);
   }
 }
 
