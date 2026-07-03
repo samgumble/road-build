@@ -19,6 +19,15 @@ import { GRID_SIZE, CELL, WORLD_SIZE, ROAD_WIDTH } from '../src/core/constants';
  * build a road straight through it, both axis-aligned (worst case for the ramp direction) and
  * diagonal (the realistic case, since most roads aren't grid-aligned; the diagonal + gentle-slope
  * combination turned out to be the clearest real-world trigger — see task-24-report.md).
+ *
+ * These same hillside scenarios also cover the DOWNHILL direction named in the original spec but
+ * never previously asserted: "no new artifacts (cliffs, ribbon-edge gaps over trenches)" — terrain
+ * sitting far enough BELOW the ribbon edge that the (skirt-less) ribbon geometry would visibly
+ * float over a gap. `scanDownhillEdges` checks, at each ribbon edge and 2u further outside it, that
+ * the drop from the road surface to terrain doesn't exceed what the ribbon can visually bridge.
+ * The report argued `flattenCircle`'s embankment blending prevents this; measured numbers across
+ * all scenarios (worst edge gap 0.755u, worst outside-drop 2.0u) confirm it holds with margin —
+ * see task-24-report.md's "Downhill-edge coverage" section for the full numbers.
  */
 
 const SURVEY_SPEED = 20; // must match BuildQueue's own constant — every fresh build starts with a
@@ -87,6 +96,53 @@ function scanRibbonFootprint(
   return violations;
 }
 
+interface EdgeDropSample {
+  t: number;
+  sign: -1 | 1;
+  edgeGap: number; // roadY - terrainY at the ribbon edge (positive = terrain sits below road)
+  outsideDrop: number; // terrainY(ribbon edge) - terrainY(2u further out) — the "cliff" step
+}
+
+/**
+ * Downhill counterpart to `scanRibbonFootprint`: rather than checking for terrain poking ABOVE
+ * the road (the T24 bug), this checks the opposite failure mode named in the original spec but
+ * never covered by a test — terrain sitting so far BELOW the ribbon edge that the (skirt-less)
+ * ribbon geometry would visibly float over a gap or show a sheer cliff at its edge. Scans the same
+ * lattice arclength spacing as `scanRibbonFootprint`, but only at the two ribbon edges
+ * (+-ROAD_WIDTH/2) and a point 2u further outside each one, since that's where a downhill cliff
+ * would actually render.
+ */
+function scanDownhillEdges(
+  hf: Heightfield,
+  samples: { x: number; y: number; z: number; bridge: boolean }[],
+  edgeLength: number,
+  yLift: number,
+  minT = 0,
+): EdgeDropSample[] {
+  const halfWidth = ROAD_WIDTH / 2;
+  const out: EdgeDropSample[] = [];
+  for (let t = minT; t <= edgeLength; t += 2) {
+    const { pos, heading } = sampleAt(samples, t);
+    const perpX = -Math.sin(heading);
+    const perpZ = Math.cos(heading);
+    for (const sign of [-1, 1] as const) {
+      const edgeX = pos.x + perpX * halfWidth * sign;
+      const edgeZ = pos.z + perpZ * halfWidth * sign;
+      const edgeTerrainY = hf.heightAt(edgeX, edgeZ);
+      const roadY = pos.y + yLift;
+      const edgeGap = roadY - edgeTerrainY;
+
+      const outX = pos.x + perpX * (halfWidth + 2) * sign;
+      const outZ = pos.z + perpZ * (halfWidth + 2) * sign;
+      const outTerrainY = hf.heightAt(outX, outZ);
+      const outsideDrop = edgeTerrainY - outTerrainY;
+
+      out.push({ t, sign, edgeGap, outsideDrop });
+    }
+  }
+  return out;
+}
+
 function setupAxisAligned(slope: number, edgeLengthU: number) {
   const bus = new EventBus();
   const hf = new Heightfield('ramp-test', bus);
@@ -127,6 +183,16 @@ describe('road/terrain clamp — steep cross-slope regression (Task 24)', () => 
     const workFrontT = 3 * GRADE_SPEED;
     const behindFront = violations.filter((v) => v.t < workFrontT - CELL * 2); // stay well behind the front
     expect(behindFront.length).toBe(0);
+
+    // Downhill check, behind the front only (same rationale as above: right at the front the
+    // excavator hasn't graded yet, so a transient gap there isn't the bug under test). Measured
+    // worst case behind the front: edge gap 0.04u, outside-drop 1.2u.
+    const drops = scanDownhillEdges(hf, edge.samples, edge.length, 0.06 - 0.02, 0)
+      .filter((d) => d.t < workFrontT - CELL * 2);
+    for (const d of drops) {
+      expect(d.edgeGap).toBeLessThanOrEqual(1.0);
+      expect(d.outsideDrop).toBeLessThanOrEqual(2.5);
+    }
   });
 
   it('REPRODUCE(axis-aligned): no terrain pokes above the road once fully built', () => {
@@ -136,6 +202,16 @@ describe('road/terrain clamp — steep cross-slope regression (Task 24)', () => 
     expect(edge.stage).toBe('painted');
     const violations = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
     expect(violations.length).toBe(0);
+
+    // Downhill direction (spec also required "no new artifacts (cliffs, ribbon-edge gaps over
+    // trenches)" — never previously checked). Measured worst case on this scenario: edge gap
+    // 0.04u, outside-drop 1.2u — comfortably inside tolerance; asserted tight (not the full
+    // 1.5/3.5 ceiling from the spec) to lock in the real observed margin.
+    const drops = scanDownhillEdges(hf, edge.samples, edge.length, 0.06 - 0.02);
+    for (const d of drops) {
+      expect(d.edgeGap).toBeLessThanOrEqual(1.0);
+      expect(d.outsideDrop).toBeLessThanOrEqual(2.5);
+    }
   });
 
   it('REPRODUCE(axis-aligned): steeper slope (1.0) still holds after full build', () => {
@@ -144,6 +220,15 @@ describe('road/terrain clamp — steep cross-slope regression (Task 24)', () => 
     const edge = graph.edges.get(edgeId)!;
     const violations = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
     expect(violations.length).toBe(0);
+
+    // Steeper ramp (1.0) is the worst case for the downhill "outside-drop" cliff metric too
+    // (measured 2.0u here vs 1.2u at slope 0.6) — still well inside the ~3.5u ceiling the spec
+    // allows for "no sheer cliff."
+    const drops = scanDownhillEdges(hf, edge.samples, edge.length, 0.06 - 0.02);
+    for (const d of drops) {
+      expect(d.edgeGap).toBeLessThanOrEqual(1.0);
+      expect(d.outsideDrop).toBeLessThanOrEqual(2.5);
+    }
   });
 
   it('REPRODUCE(diagonal, gentle slope, no bridge): no terrain pokes above the road once fully built', () => {
@@ -159,6 +244,15 @@ describe('road/terrain clamp — steep cross-slope regression (Task 24)', () => 
     expect(edge.samples.every((s) => !s.bridge)).toBe(true); // confirm this path stayed graded, not bridged
     const violations = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
     expect(violations.length).toBe(0);
+
+    // Downhill check: the diagonal case is the worst measured edge-gap of all scenarios (0.755u,
+    // off-axis grid vertices near the ribbon edge sit a bit further below the road profile than
+    // the axis-aligned case) — still well under the 1.5u the ribbon can visually bridge.
+    const drops = scanDownhillEdges(hf, edge.samples, edge.length, 0.06 - 0.02);
+    for (const d of drops) {
+      expect(d.edgeGap).toBeLessThanOrEqual(1.0);
+      expect(d.outsideDrop).toBeLessThanOrEqual(2.5);
+    }
   });
 
   it('REPRODUCE(diagonal, gentle slope): no terrain pokes above the road mid-construction', () => {
@@ -169,6 +263,15 @@ describe('road/terrain clamp — steep cross-slope regression (Task 24)', () => 
     const workFrontT = 3 * GRADE_SPEED;
     const behindFront = violations.filter((v) => v.t < workFrontT - CELL * 2);
     expect(behindFront.length).toBe(0);
+
+    // Downhill check, behind the front only. Measured worst case: edge gap 0.676u, outside-drop
+    // 0.534u — under the same tolerances as the other scenarios.
+    const drops = scanDownhillEdges(hf, edge.samples, edge.length, 0.06 - 0.02, 0)
+      .filter((d) => d.t < workFrontT - CELL * 2);
+    for (const d of drops) {
+      expect(d.edgeGap).toBeLessThanOrEqual(1.0);
+      expect(d.outsideDrop).toBeLessThanOrEqual(2.5);
+    }
   });
 
   it('demolish (reverse grading) leaves no lingering above-road terrain either', () => {
