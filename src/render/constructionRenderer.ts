@@ -25,6 +25,8 @@ const FADE_DURATION = 0.4; // seconds, easeOutCubic scale-in/out
 // --- Arrivals/departures (Task 21 deliverable 4) ------------------------------------------
 const SPAWN_DISTANCE = 60; // u away from the work front a vehicle spawns/departs to
 const DRIVE_HANDOFF_DISTANCE = 120; // u; below this, drive between consecutive jobs; above, fade
+const APPROACH_TERRAIN_EPS = 4; // u (horizontal, to target); within this, blend Y onto the target
+                                // instead of terrain — avoids a last-moment snap onto the road grade
 
 const ROLLER_TRAIL_DISTANCE = 8;
 const ROLLER_OSCILLATION_RANGE = 6; // ± units around the trail point
@@ -1246,7 +1248,10 @@ export class ConstructionRenderer {
       state.targetPos.copy(pos);
       state.targetHeading = heading;
       if (spawnValid) {
-        state.curPos.set(spawnX, pos.y, spawnZ);
+        // Sample terrain height at the spawn XZ rather than reusing the destination's Y — the
+        // spawn point is SPAWN_DISTANCE away and can sit at a very different elevation.
+        const spawnY = this.hf.heightAt(spawnX, spawnZ);
+        state.curPos.set(spawnX, spawnY, spawnZ);
         state.curHeading = Math.atan2(pos.z - spawnZ, pos.x - spawnX);
       } else {
         state.curPos.copy(pos);
@@ -1444,8 +1449,22 @@ export class ConstructionRenderer {
     const effectiveActive = state.handoffPending || state.shuttlePhase === 'away' ? false : active;
 
     state.curPos.x = damp(state.curPos.x, state.targetPos.x, POS_LAMBDA, dt);
-    state.curPos.y = damp(state.curPos.y, state.targetPos.y, POS_LAMBDA, dt);
     state.curPos.z = damp(state.curPos.z, state.targetPos.z, POS_LAMBDA, dt);
+
+    // Y damping: while working at the road (or on a bridge), targetPos.y is already the correct
+    // road/deck sample, so damp straight toward it as before. But during a long drive-in approach
+    // (fresh arrival / far-relocate spawn, see applyProgressTarget) the target is still the distant
+    // work-front position — damping straight toward its Y across 60u of varied terrain can float
+    // the rig over valleys or bury it in hills. So while still far from the target horizontally,
+    // follow the terrain under the vehicle's *current* XZ instead; only blend onto the target's own
+    // Y once close enough that "the road's grade" and "the terrain" are effectively the same thing.
+    const dxTarget = state.targetPos.x - state.curPos.x;
+    const dzTarget = state.targetPos.z - state.curPos.z;
+    const horizDistToTarget = Math.sqrt(dxTarget * dxTarget + dzTarget * dzTarget);
+    const yGoal = (!state.onBridge && horizDistToTarget > APPROACH_TERRAIN_EPS)
+      ? this.hf.heightAt(state.curPos.x, state.curPos.z)
+      : state.targetPos.y;
+    state.curPos.y = damp(state.curPos.y, yGoal, POS_LAMBDA, dt);
 
     // shortest-path angle damping
     let delta = state.targetHeading - state.curHeading;
@@ -1468,7 +1487,10 @@ export class ConstructionRenderer {
       const spawnZ = state.pendingPos.z + dir.z * SPAWN_DISTANCE;
       const spawnValid = Number.isFinite(spawnX) && Number.isFinite(spawnZ);
       if (spawnValid) {
-        state.curPos.set(spawnX, state.pendingPos.y, spawnZ);
+        // Sample terrain height at the spawn XZ rather than reusing the pending destination's Y —
+        // see the identical fix at the fresh-arrival spawn site above.
+        const spawnY = this.hf.heightAt(spawnX, spawnZ);
+        state.curPos.set(spawnX, spawnY, spawnZ);
         state.curHeading = Math.atan2(state.pendingPos.z - spawnZ, state.pendingPos.x - spawnX);
       } else {
         state.curPos.copy(state.pendingPos);
