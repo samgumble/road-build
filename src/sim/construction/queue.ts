@@ -86,15 +86,23 @@ interface ActiveJob extends Job {
   surveying: boolean;
 }
 
+/** Task 25: number of concurrent crew slots. FIFO assignment fills every free slot each time
+ * `maybeStartNext` runs, so up to this many edges build/demolish simultaneously. */
+export const MAX_CREWS = 3;
+
 /**
- * Owns the single construction "crew": a FIFO queue of build jobs (auto-enqueued whenever a new
- * edge appears) plus demolish jobs that jump the queue. Advances one active job at a time,
- * stepping a vehicle along the edge's sampled path at a per-stage speed, deforming terrain during
- * grading, and emitting `construction:progress` / `construction:stage` events for the renderer.
+ * Owns the construction crews: up to `MAX_CREWS` concurrent job slots, backed by a single FIFO
+ * queue of build jobs (auto-enqueued whenever a new edge appears) plus demolish jobs that jump the
+ * queue. Each crew advances its own active job independently, stepping a vehicle along the edge's
+ * sampled path at a per-stage speed, deforming terrain during grading, and emitting
+ * `construction:progress` / `construction:stage` events (tagged with the 0-based `crew` index)
+ * for the renderer/HUD/audio. Per-job semantics (survey phase, stage speeds, grading, resume,
+ * demolish conversion) are exactly as they were under the single-crew model — only the number of
+ * jobs that can be "active" at once has changed.
  */
 export class BuildQueue {
   private queue: Job[] = [];
-  private active: ActiveJob | null = null;
+  private crews: (ActiveJob | null)[] = new Array(MAX_CREWS).fill(null);
 
   constructor(
     private graph: RoadGraph,
@@ -118,25 +126,28 @@ export class BuildQueue {
   }
 
   get busy(): boolean {
-    return this.active !== null;
+    return this.crews.some((c) => c !== null);
   }
 
   get queueLength(): number {
-    return this.queue.length + (this.active ? 1 : 0);
+    return this.queue.length + this.crews.filter((c) => c !== null).length;
   }
 
   /**
    * Drops any pending or active job for `edgeId` without touching the graph (Task 15 restore):
    * `commitChain` auto-enqueues a fresh build job via `roads:edgeAdded`, but save/load forces the
    * edge's stage directly, so that auto-enqueued job must be discarded rather than left to
-   * "rebuild" an edge that's already at its restored stage.
+   * "rebuild" an edge that's already at its restored stage. Frees whichever crew (if any) is
+   * currently active on `edgeId` so another queued job can take that slot immediately.
    */
   clearPending(edgeId: number): void {
     this.queue = this.queue.filter((j) => j.edgeId !== edgeId);
-    if (this.active && this.active.edgeId === edgeId) {
-      this.active = null;
-      this.maybeStartNext();
+    for (let i = 0; i < this.crews.length; i++) {
+      if (this.crews[i]?.edgeId === edgeId) {
+        this.crews[i] = null;
+      }
     }
+    this.maybeStartNext();
   }
 
   private enqueueBuild(edgeId: number): void {
@@ -164,11 +175,14 @@ export class BuildQueue {
   }
 
   enqueueDemolish(edgeId: number): void {
-    // If this edge is the active job, convert it in place (whatever stage it's currently at,
-    // partially built or not) rather than letting the pending build job continue.
-    if (this.active && this.active.edgeId === edgeId) {
-      if (!this.active.demolish) {
-        this.active.demolish = true;
+    // If this edge is the active job on ANY crew, convert it in place (whatever stage it's
+    // currently at, partially built or not) rather than letting the pending build job continue —
+    // unchanged from the single-crew behavior, just scanning every crew slot instead of one.
+    const activeCrewIdx = this.crews.findIndex((c) => c?.edgeId === edgeId);
+    if (activeCrewIdx !== -1) {
+      const active = this.crews[activeCrewIdx]!;
+      if (!active.demolish) {
+        active.demolish = true;
         // t currently measures forward progress into `stageIndex`; walking in reverse from here
         // is fine as-is — the reverse loop in update() treats t as "remaining distance in this
         // stage's pass" once demolish is true, so we keep t as the current forward progress and
@@ -196,7 +210,9 @@ export class BuildQueue {
     if (pendingIdx !== -1 && edge?.stage === 'surveyed') {
       this.queue.splice(pendingIdx, 1);
       this.graph.removeEdge(edgeId);
-      this.bus.emit('construction:stage', { edgeId, stage: 'removed' });
+      // No crew ever worked this edge (it was only pending, dropped instantly) — -1 is the "no
+      // crew" sentinel for this synchronous shortcut, distinct from any real 0-based crew index.
+      this.bus.emit('construction:stage', { edgeId, stage: 'removed', crew: -1 });
       return;
     }
     if (pendingIdx !== -1) {
@@ -215,9 +231,17 @@ export class BuildQueue {
     this.maybeStartNext();
   }
 
+  /**
+   * Fills every free crew slot from the front of the FIFO queue (Task 25: up to MAX_CREWS jobs run
+   * concurrently, not just one). Each iteration finds the next free slot and the next runnable
+   * queue entry; a queue entry whose edge has since disappeared (externally removed) or whose
+   * demolish target has nothing built yet is dropped without consuming a slot, exactly as the
+   * single-crew version dropped it before retrying the loop.
+   */
   private maybeStartNext(): void {
-    if (this.active) return;
-    while (!this.active && this.queue.length) {
+    for (;;) {
+      const freeIdx = this.crews.findIndex((c) => c === null);
+      if (freeIdx === -1 || this.queue.length === 0) return;
       const job = this.queue.shift()!;
       const edge = this.graph.edges.get(job.edgeId);
       if (!edge) continue; // externally removed before we got to it
@@ -228,24 +252,36 @@ export class BuildQueue {
           // enqueueDemolish drops pending builds instead of queuing a demolish job for them).
           continue;
         }
-        this.active = { edgeId: job.edgeId, demolish: true, stageIndex, t: edge.length, surveying: false };
+        this.crews[freeIdx] = { edgeId: job.edgeId, demolish: true, stageIndex, t: edge.length, surveying: false };
       } else {
         const stageIndex = job.resumeAt ?? STAGES.indexOf('graded');
         // Only a genuinely fresh build (no `resumeAt`) gets a survey pass — a resumed job by
         // definition starts at/after 'graded', i.e. the edge is already past 'surveyed'.
         const surveying = job.resumeAt === undefined;
-        this.active = { edgeId: job.edgeId, demolish: false, stageIndex, t: 0, surveying };
+        this.crews[freeIdx] = { edgeId: job.edgeId, demolish: false, stageIndex, t: 0, surveying };
       }
     }
   }
 
+  /**
+   * Advances every active crew's job by one step (Task 25: each crew slot is independent — a crew
+   * finishing/freeing up mid-loop can immediately be refilled by `maybeStartNext` without waiting
+   * for the other crews). Iterates crew slots in order so `crew` attribution on emitted events is
+   * stable and low crew indices are filled first as slots free up, matching the FIFO/"fills the
+   * first free slot" assignment `maybeStartNext` already performs.
+   */
   update(dt: number): void {
-    if (!this.active) return;
-    const job = this.active;
+    for (let crew = 0; crew < this.crews.length; crew++) {
+      const job = this.crews[crew];
+      if (job) this.updateCrew(crew, job, dt);
+    }
+  }
+
+  private updateCrew(crew: number, job: ActiveJob, dt: number): void {
     const edge = this.graph.edges.get(job.edgeId);
     if (!edge) {
       // Edge disappeared out from under us (externally removed) — drop and move on.
-      this.active = null;
+      this.crews[crew] = null;
       this.maybeStartNext();
       return;
     }
@@ -262,6 +298,7 @@ export class BuildQueue {
         heading,
         vehicle: 'surveyor',
         demolish: false,
+        crew,
       });
       if (job.t >= edge.length) {
         // Survey pass complete — no stage transition (the edge is already 'surveyed'); hand off
@@ -349,6 +386,7 @@ export class BuildQueue {
       heading,
       vehicle,
       demolish: job.demolish,
+      crew,
     });
 
     if (!job.demolish && job.t >= edge.length) {
@@ -371,10 +409,10 @@ export class BuildQueue {
           this.hf.clampBelow(s.x, s.z, s.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, sHeading, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
         }
       }
-      this.bus.emit('construction:stage', { edgeId: job.edgeId, stage });
+      this.bus.emit('construction:stage', { edgeId: job.edgeId, stage, crew });
       if (stage === 'painted') {
         this.bus.emit('roads:changed', {});
-        this.active = null;
+        this.crews[crew] = null;
         this.maybeStartNext();
       } else {
         job.stageIndex += 1;
@@ -392,13 +430,13 @@ export class BuildQueue {
       const prevIndex = job.stageIndex - 1;
       if (prevIndex < STAGES.indexOf('graded')) {
         this.graph.removeEdge(job.edgeId);
-        this.bus.emit('construction:stage', { edgeId: job.edgeId, stage: 'removed' });
-        this.active = null;
+        this.bus.emit('construction:stage', { edgeId: job.edgeId, stage: 'removed', crew });
+        this.crews[crew] = null;
         this.maybeStartNext();
       } else {
         const prevStage = STAGES[prevIndex] as Stage;
         edge.stage = prevStage;
-        this.bus.emit('construction:stage', { edgeId: job.edgeId, stage: prevStage });
+        this.bus.emit('construction:stage', { edgeId: job.edgeId, stage: prevStage, crew });
         if (wasPainted) this.bus.emit('roads:changed', {});
         job.stageIndex = prevIndex;
         job.t = edge.length;

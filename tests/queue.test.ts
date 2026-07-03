@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { BuildQueue } from '../src/sim/construction/queue';
+import { BuildQueue, MAX_CREWS } from '../src/sim/construction/queue';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { Heightfield } from '../src/sim/terrain/heightfield';
 import { makeSampler } from '../src/sim/roads/path';
@@ -11,6 +11,31 @@ function findAnchor(hf: Heightfield, span: number): { x: number; z: number } {
   outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
     if (hf.isLand(x, z) && hf.isLand(x + span, z)) { anchor = { x, z }; break outer; }
   return anchor;
+}
+
+/** Finds `count` anchors for span-length edges, each on a distinct z-row at least `span + 16`
+ * apart from every previously-picked row so the edges never overlap/snap into each other (graph
+ * commits snap control points to an 8u grid — see SNAP in core/constants.ts). Used by the
+ * multi-crew tests below to commit several genuinely independent edges at once and let the queue
+ * fan them out across crews. Scans the FULL x/z grid per row (rather than reusing findAnchor's
+ * early-exit) so a row whose first reachable land happens to coincide with an earlier row's still
+ * finds a distinct point instead of silently returning the same anchor twice. */
+function findParallelAnchors(hf: Heightfield, span: number, count: number): { x: number; z: number }[] {
+  const anchors: { x: number; z: number }[] = [];
+  const usedZ: number[] = [];
+  for (let row = 0; row < count; row++) {
+    let anchor: { x: number; z: number } | null = null;
+    outer: for (let z = -160; z <= 160; z += 8) {
+      if (usedZ.some((uz) => Math.abs(uz - z) < span + 16)) continue;
+      for (let x = -160; x <= 160; x += 8) {
+        if (hf.isLand(x, z) && hf.isLand(x + span, z)) { anchor = { x, z }; break outer; }
+      }
+    }
+    if (!anchor) throw new Error(`could not find anchor for row ${row}`);
+    usedZ.push(anchor.z);
+    anchors.push(anchor);
+  }
+  return anchors;
 }
 
 function setup() {
@@ -243,6 +268,150 @@ describe('BuildQueue', () => {
       run(queue, 120);
       expect(sawSurveyor).toBe(false);
       expect(graph.edges.has(edgeId)).toBe(false);
+    });
+  });
+
+  // --- Task 25: multi-crew construction ---------------------------------------------------
+  describe('multi-crew (MAX_CREWS)', () => {
+    it('two queued edges advance CONCURRENTLY in the same update window', () => {
+      const bus = new EventBus();
+      const hf = new Heightfield('q-test-concurrent', bus);
+      const graph = new RoadGraph(bus, makeSampler(hf));
+      const queue = new BuildQueue(graph, hf, bus);
+      const [a1, a2] = findParallelAnchors(hf, 32, 2);
+      const [edgeA] = graph.commitChain([a1, { x: a1.x + 32, z: a1.z }]);
+      const [edgeB] = graph.commitChain([a2, { x: a2.x + 32, z: a2.z }]);
+
+      // Both jobs must have started immediately (2 free crews, 2 queued jobs) — neither is stuck
+      // waiting behind the other in a single-crew FIFO.
+      expect(queue.queueLength).toBe(2);
+
+      const progressedA: number[] = [];
+      const progressedB: number[] = [];
+      bus.on('construction:progress', (e) => {
+        if (e.edgeId === edgeA) progressedA.push(e.t);
+        if (e.edgeId === edgeB) progressedB.push(e.t);
+      });
+
+      // A single small step: if both crews are truly concurrent, both edges must show forward
+      // progress from this ONE update call — a single-crew queue would only advance edgeA (or
+      // whichever was FIFO-first) and edgeB would see nothing at all.
+      queue.update(1 / 60);
+      expect(progressedA.length).toBeGreaterThan(0);
+      expect(progressedB.length).toBeGreaterThan(0);
+    });
+
+    it('4+ queued jobs drain as crews free up (never more than MAX_CREWS active at once)', () => {
+      const bus = new EventBus();
+      const hf = new Heightfield('q-test-drain', bus);
+      const graph = new RoadGraph(bus, makeSampler(hf));
+      const queue = new BuildQueue(graph, hf, bus);
+      const anchors = findParallelAnchors(hf, 32, 5);
+      const edgeIds = anchors.map((a) => graph.commitChain([a, { x: a.x + 32, z: a.z }])[0]);
+
+      expect(edgeIds.length).toBe(5);
+      // Never more concurrently active+queued crews than MAX_CREWS busy at any single instant —
+      // sample right after commit (queue should have started exactly MAX_CREWS, the rest waiting).
+      const activeCount = edgeIds.filter((id) => graph.edges.get(id)!.stage !== 'surveyed').length;
+      expect(activeCount).toBeLessThanOrEqual(MAX_CREWS);
+
+      // Run long enough for all 5 to fully drain through the queue via crew rotation.
+      run(queue, 5 * 120);
+      for (const id of edgeIds) {
+        expect(graph.edges.get(id)!.stage).toBe('painted');
+      }
+      expect(queue.busy).toBe(false);
+      expect(queue.queueLength).toBe(0);
+    });
+
+    it('events carry correct crew attribution — concurrent jobs report distinct crew indices', () => {
+      const bus = new EventBus();
+      const hf = new Heightfield('q-test-crew-attr', bus);
+      const graph = new RoadGraph(bus, makeSampler(hf));
+      const queue = new BuildQueue(graph, hf, bus);
+      const anchors = findParallelAnchors(hf, 32, 3);
+      const edgeIds = anchors.map((a) => graph.commitChain([a, { x: a.x + 32, z: a.z }])[0]);
+
+      const crewByEdge = new Map<number, Set<number>>();
+      bus.on('construction:progress', (e) => {
+        if (!edgeIds.includes(e.edgeId)) return;
+        let set = crewByEdge.get(e.edgeId);
+        if (!set) { set = new Set(); crewByEdge.set(e.edgeId, set); }
+        set.add(e.crew);
+      });
+
+      run(queue, 1); // enough for all 3 crews to report several progress events each
+
+      // Each edge's progress events must always report the SAME crew index throughout (a job
+      // never silently migrates crews), and the three edges' crews must be pairwise distinct
+      // since all 3 started concurrently on 3 separate free slots.
+      const crewsUsed = edgeIds.map((id) => {
+        const set = crewByEdge.get(id)!;
+        expect(set.size).toBe(1); // stable attribution per job
+        return [...set][0];
+      });
+      expect(new Set(crewsUsed).size).toBe(3); // pairwise distinct
+      expect(crewsUsed.every((c) => c >= 0 && c < MAX_CREWS)).toBe(true);
+    });
+
+    it('restore with 3 non-painted edges resumes on 3 crews concurrently', () => {
+      const bus = new EventBus();
+      const hf = new Heightfield('q-test-restore-multi', bus);
+      const graph = new RoadGraph(bus, makeSampler(hf));
+      const queue = new BuildQueue(graph, hf, bus);
+      const anchors = findParallelAnchors(hf, 32, 3);
+      const edgeIds = anchors.map((a) => graph.commitChain([a, { x: a.x + 32, z: a.z }])[0]);
+
+      // Simulate a restore (Task 15 style): drop the auto-enqueued fresh jobs, force each edge to
+      // a different non-painted stage directly (as restoreWorld does), then resume all three.
+      const stages: Stage[] = ['graded', 'gravel', 'paved'];
+      for (let i = 0; i < edgeIds.length; i++) {
+        queue.clearPending(edgeIds[i]);
+        graph.edges.get(edgeIds[i])!.stage = stages[i];
+      }
+      for (const id of edgeIds) queue.enqueueResume(id);
+
+      // All three should be picked up onto their own crew immediately (3 free crews, 3 resumable
+      // jobs) rather than queued behind each other.
+      expect(queue.queueLength).toBe(3);
+
+      const progressed = new Set<number>();
+      bus.on('construction:progress', (e) => { if (edgeIds.includes(e.edgeId)) progressed.add(e.edgeId); });
+      queue.update(1 / 60);
+      expect(progressed.size).toBe(3); // all three advanced in the very first update — concurrent
+
+      run(queue, 3 * 120);
+      for (const id of edgeIds) {
+        expect(graph.edges.get(id)!.stage).toBe('painted');
+      }
+    });
+
+    it('demolish-jumps-queue still holds with busy crews (converts in place on whichever crew is active)', () => {
+      const bus = new EventBus();
+      const hf = new Heightfield('q-test-demolish-busy', bus);
+      const graph = new RoadGraph(bus, makeSampler(hf));
+      const queue = new BuildQueue(graph, hf, bus);
+      const anchors = findParallelAnchors(hf, 32, MAX_CREWS + 1);
+      const edgeIds = anchors.map((a) => graph.commitChain([a, { x: a.x + 32, z: a.z }])[0]);
+
+      // First MAX_CREWS edges are active (one per crew); the last one is still queued (no free
+      // crew slot left) — asserted immediately, before any crew can free up and pick it up.
+      const queuedEdge = edgeIds[edgeIds.length - 1];
+      const activeEdge = edgeIds[0];
+      expect(graph.edges.get(queuedEdge)!.stage).toBe('surveyed');
+      expect(queue.queueLength).toBe(MAX_CREWS + 1);
+
+      // Demolishing the edge that was only ever queued (never started, still 'surveyed') takes
+      // the instant-remove shortcut regardless of how busy the other crews are — jumping ahead of
+      // its own still-pending build job without waiting for a crew to free up.
+      queue.enqueueDemolish(queuedEdge);
+      expect(graph.edges.has(queuedEdge)).toBe(false);
+
+      // Demolishing an edge that's actively being built on some crew converts that crew's job in
+      // place to a demolish job — it must NOT get shoved behind any other queued/active work.
+      queue.enqueueDemolish(activeEdge);
+      run(queue, 200); // long enough to walk it all the way back down
+      expect(graph.edges.has(activeEdge)).toBe(false);
     });
   });
 });

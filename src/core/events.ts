@@ -4,8 +4,8 @@ export interface GameEvents {
   'roads:changed': Record<string, never>;                     // any topology/stage change relevant to lanes+growth
   'roads:edgeAdded': { edgeId: number };
   'roads:edgeRemoved': { edgeId: number };
-  'construction:stage': { edgeId: number; stage: Stage | 'removed' };
-  'construction:progress': { edgeId: number; stage: Stage; t: number; pos: V3; heading: number; vehicle: VehicleKind; demolish: boolean };
+  'construction:stage': { edgeId: number; stage: Stage | 'removed'; crew: number };
+  'construction:progress': { edgeId: number; stage: Stage; t: number; pos: V3; heading: number; vehicle: VehicleKind; demolish: boolean; crew: number };
   'terrain:deformed': { minI: number; minJ: number; maxI: number; maxJ: number };
   'growth:spawn': { kind: 'tree' | 'field' | 'house' | 'building'; x: number; z: number; rot: number };
   'atmosphere:phase': { night: boolean };

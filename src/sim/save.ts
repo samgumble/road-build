@@ -151,8 +151,9 @@ export function restoreWorld(save: SaveV1, deps: RestoreDeps): void {
     // dashes. Emit the event ourselves so the renderer (and anything else listening, e.g. the HUD's
     // ticker) picks up the restored stage immediately. Safe pre-user-gesture: AmbientAudio's
     // `construction:stage` handler no-ops without an AudioContext, and the HUD isn't constructed
-    // yet at this point in main.ts's boot sequence.
-    bus.emit('construction:stage', { edgeId, stage: saved.stage });
+    // yet at this point in main.ts's boot sequence. `crew: -1` — this is a synthetic sync event, not
+    // a real crew's work (the actual resuming crew, if any, is assigned below by `enqueueResume`).
+    bus.emit('construction:stage', { edgeId, stage: saved.stage, crew: -1 });
 
     // Finding 1: forcing `edge.stage` above freezes construction forever unless the crew is
     // told to pick back up where the save left off — resume a build job starting at the stage

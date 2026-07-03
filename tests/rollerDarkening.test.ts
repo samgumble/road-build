@@ -56,10 +56,10 @@ describe('roller compaction darkening', () => {
 
     // Before any 'paved' progress (still mid-'graded' stage progress), there must be no
     // compacted-color mesh anywhere on this edge.
-    bus.emit('construction:stage', { edgeId, stage: 'graded' });
+    bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
     bus.emit('construction:progress', {
       edgeId, stage: 'graded', t: 10,
-      pos: { x: 10, y: 1, z: 0 }, heading: 0, vehicle: 'truck', demolish: false,
+      pos: { x: 10, y: 1, z: 0 }, heading: 0, vehicle: 'truck', demolish: false, crew: 0,
     });
     renderer.update(0.2); // flush the 0.15s rebuild throttle
     expect(meshColors()).not.toContain(compactedHex);
@@ -67,10 +67,10 @@ describe('roller compaction darkening', () => {
     // Enter 'paved' stage, then push partial progress to t=30 on a 64u edge. The roller
     // trails the paver by ROLLER_TRAIL_DISTANCE, so the compacted/fresh split should sit at
     // t=30-ROLLER_TRAIL_DISTANCE=22.
-    bus.emit('construction:stage', { edgeId, stage: 'paved' });
+    bus.emit('construction:stage', { edgeId, stage: 'paved', crew: 0 });
     bus.emit('construction:progress', {
       edgeId, stage: 'paved', t: 30,
-      pos: { x: 30, y: 1, z: 0 }, heading: 0, vehicle: 'roller', demolish: false,
+      pos: { x: 30, y: 1, z: 0 }, heading: 0, vehicle: 'roller', demolish: false, crew: 0,
     });
     renderer.update(0.2); // advance clock past REBUILD_THROTTLE (0.15s) to flush pending progress
 
