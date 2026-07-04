@@ -4,6 +4,7 @@ import { RoadRenderer, STAGE_COLOR } from '../src/render/roadRenderer';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { Heightfield } from '../src/sim/terrain/heightfield';
 import { GrowthSim } from '../src/sim/growth/growth';
+import { QuarrySim } from '../src/sim/quarry';
 import { EventBus } from '../src/core/events';
 import { serialize, deserialize, restoreWorld } from '../src/sim/save';
 import { createRng } from '../src/core/rng';
@@ -53,7 +54,8 @@ function buildWorld(seed: string, sampler: (ctrl: P2[]) => RoadSample[] = stubSa
   const scene = new THREE.Scene();
   const renderer = new RoadRenderer(scene, graph, bus, hf);
   const growth = new GrowthSim(graph, hf, bus, createRng(seed));
-  return { bus, hf, graph, scene, renderer, growth };
+  const quarry = new QuarrySim(hf, graph, bus, 'quarry-' + seed);
+  return { bus, hf, graph, scene, renderer, growth, quarry };
 }
 
 describe('restoreWorld render sync', () => {
@@ -65,12 +67,12 @@ describe('restoreWorld render sync', () => {
     const w1 = buildWorld('restore-render-test');
     const [edgeId] = w1.graph.commitChain([{ x: 0, z: 0 }, { x: 32, z: 0 }]);
     w1.graph.edges.get(edgeId)!.stage = 'painted';
-    const json = serialize({ seed: 'restore-render-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth });
+    const json = serialize({ seed: 'restore-render-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth, quarry: w1.quarry });
     const save = deserialize(json)!;
 
     // Fresh world + fresh scene + fresh RoadRenderer, then restore into it.
     const w2 = buildWorld('restore-render-test');
-    restoreWorld(save, { bus: w2.bus, hf: w2.hf, graph: w2.graph, growth: w2.growth });
+    restoreWorld(save, { bus: w2.bus, hf: w2.hf, graph: w2.graph, growth: w2.growth, quarry: w2.quarry });
 
     const restoredEdgeId = [...w2.graph.edges.keys()][0];
     const group = w2.scene.children.find((c) => c.userData.edgeId === restoredEdgeId) as THREE.Group;
@@ -93,14 +95,14 @@ describe('restoreWorld render sync', () => {
     const w1 = buildWorld('restore-bridge-test', bridgeStubSampler);
     const [edgeId] = w1.graph.commitChain([{ x: 0, z: 0 }, { x: 64, z: 0 }]);
     w1.graph.edges.get(edgeId)!.stage = 'painted';
-    const json = serialize({ seed: 'restore-bridge-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth });
+    const json = serialize({ seed: 'restore-bridge-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth, quarry: w1.quarry });
     const save = deserialize(json)!;
 
     // Fresh world + fresh scene + fresh RoadRenderer, then restore into it. This is the path where
     // `ensureVisual` first runs from `roads:edgeAdded` inside `commitChain`, with `edge.stage` still
     // 'surveyed' — the bug this test guards against.
     const w2 = buildWorld('restore-bridge-test', bridgeStubSampler);
-    restoreWorld(save, { bus: w2.bus, hf: w2.hf, graph: w2.graph, growth: w2.growth });
+    restoreWorld(save, { bus: w2.bus, hf: w2.hf, graph: w2.graph, growth: w2.growth, quarry: w2.quarry });
 
     const restoredEdgeId = [...w2.graph.edges.keys()][0];
     const group = w2.scene.children.find((c) => c.userData.edgeId === restoredEdgeId) as THREE.Group;

@@ -9,6 +9,7 @@ import { damp, easeOutCubic, easeOutBack, clamp01 } from './easing';
 import { ROAD_WIDTH, WORLD_SIZE } from '../core/constants';
 import { RoadRenderer, getBridgeRunInfo, BRIDGE_PYLON_SPACING, STAGE_COLOR } from './roadRenderer';
 import { MAX_CREWS } from '../sim/construction/queue';
+import { QuarrySim, type QuarryPlacement } from '../sim/quarry';
 
 /** Vehicle kinds that get their own rig SET per crew (Task 25). 'crane' is deliberately excluded —
  * it remains a single shared rig globally (bridges are rare; if two crews hit bridge runs at the
@@ -190,8 +191,9 @@ function wheelCylinder(radius: number, width: number): THREE.CylinderGeometry {
 const WORLD_HALF = WORLD_SIZE / 2;
 
 /** Direction (unit x/z) from `pos` toward the nearest of the four map edges — used both to spawn
- * arriving vehicles offscreen (Task 21 deliverable 4) and to send a "full" shuttle truck off to
- * dump out of view (deliverable 3). Picks whichever of +x/-x/+z/-z boundary is closest. */
+ * arriving vehicles offscreen (Task 21 deliverable 4) and, pre-Task-34 (no quarry placed yet), to
+ * send a "full" shuttle truck off to dump out of view (deliverable 3). Picks whichever of
+ * +x/-x/+z/-z boundary is closest. */
 function nearestEdgeDir(x: number, z: number): { x: number; z: number } {
   const distances: Array<[number, number, number]> = [
     [WORLD_HALF - x, 1, 0],
@@ -202,6 +204,33 @@ function nearestEdgeDir(x: number, z: number): { x: number; z: number } {
   distances.sort((a, b) => a[0] - b[0]);
   const [, dx, dz] = distances[0];
   return { x: dx, z: dz };
+}
+
+/**
+ * Task 34: the shuttle's "away" destination from `pos` — heads toward the quarry once one exists,
+ * otherwise falls back to the pre-Task-34 "toward the nearest map edge" behavior unchanged. When a
+ * quarry exists but sits farther than SPAWN_DISTANCE away, the truck heads along the straight-line
+ * direction toward it and (per spec) still only travels SPAWN_DISTANCE before fading mid-route —
+ * the theater budget is unchanged, it just now reads as "driving toward the quarry" rather than
+ * "driving toward the map edge". When the quarry is closer than SPAWN_DISTANCE, the destination is
+ * the quarry's actual position (no overshoot past the landmark).
+ */
+function shuttleAwayTarget(
+  x: number,
+  z: number,
+  quarry: { x: number; z: number } | null,
+): { x: number; y: number | null; z: number } {
+  if (!quarry) {
+    const dir = nearestEdgeDir(x, z);
+    return { x: x + dir.x * SPAWN_DISTANCE, y: null, z: z + dir.z * SPAWN_DISTANCE };
+  }
+  const dx = quarry.x - x, dz = quarry.z - z;
+  const dist = Math.hypot(dx, dz);
+  if (dist <= SPAWN_DISTANCE || dist < 1e-6) {
+    return { x: quarry.x, y: null, z: quarry.z };
+  }
+  const ux = dx / dist, uz = dz / dist;
+  return { x: x + ux * SPAWN_DISTANCE, y: null, z: z + uz * SPAWN_DISTANCE };
 }
 
 /** Whether the sample nearest arclength `t` along `samples` is a bridge-deck sample (mirrors
@@ -1559,6 +1588,106 @@ interface CrewSlot {
   lastBreakSeenAt: number;
 }
 
+// --- Quarry landmark (Task 34) -----------------------------------------------------------------
+// One quarry per island, placed on the first road commit (see src/sim/quarry.ts). Rendered here
+// (rather than a separate dedicated renderer) since it's a single static prop group with no
+// per-frame articulation of its own — the only "animation" it needs (fade/pop-in) is the same
+// scale-ease every other one-off prop in this file already uses, so a whole new renderer class
+// would just duplicate that machinery for one instance.
+const QUARRY_PIT_RADIUS = 9;
+const QUARRY_PIT_DEPTH = 1.6;
+const QUARRY_PAD_FLATTEN_RADIUS = 13; // terrain flatten pad, once at placement
+const QUARRY_ROCK_COLOR = '#8f7a5c';
+const QUARRY_ROCK_DARK_COLOR = '#6b5a44';
+const QUARRY_STEEL_COLOR = '#7d8a8f';
+const QUARRY_SILO_COLOR = '#c7c2b0';
+const QUARRY_POP_DURATION = 1.4; // seconds, easeOutBack pop-in once terrain is flattened
+
+/** Builds the quarry's static prop group: a sunken gravel pit (rim + floor), a conveyor (incline +
+ * two support legs), and a silo (body + cone cap + base ring) — 8 primitives total, comfortably
+ * under the ≤14 budget. One instance for the whole island (Task 34 deliverable 2). */
+function buildQuarryProp(): THREE.Group {
+  const group = new THREE.Group();
+
+  const rockMat = flatMat(QUARRY_ROCK_COLOR);
+  const rockDarkMat = flatMat(QUARRY_ROCK_DARK_COLOR);
+  const steelMat = flatMat(QUARRY_STEEL_COLOR);
+  const siloMat = flatMat(QUARRY_SILO_COLOR);
+
+  // Pit rim: a flattened ring standing slightly proud of the sunken floor, reading as the lip of
+  // the excavation. (1)
+  const rim = new THREE.Mesh(
+    new THREE.RingGeometry(QUARRY_PIT_RADIUS * 0.72, QUARRY_PIT_RADIUS, 16),
+    rockMat,
+  );
+  rim.rotation.x = -Math.PI / 2;
+  rim.position.y = 0.05;
+  group.add(rim);
+
+  // Pit floor: sunken disc, darker rock. (1)
+  const floor = new THREE.Mesh(
+    new THREE.CircleGeometry(QUARRY_PIT_RADIUS * 0.75, 16),
+    rockDarkMat,
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = -QUARRY_PIT_DEPTH;
+  group.add(floor);
+
+  // Pit wall: a short open cone connecting rim to floor so the sunken look reads from any angle. (1)
+  const wall = new THREE.Mesh(
+    new THREE.CylinderGeometry(QUARRY_PIT_RADIUS * 0.72, QUARRY_PIT_RADIUS * 0.75, QUARRY_PIT_DEPTH, 16, 1, true),
+    rockDarkMat,
+  );
+  wall.position.y = -QUARRY_PIT_DEPTH / 2;
+  group.add(wall);
+
+  // Conveyor: an inclined belt box rising from the pit's edge toward the silo, on two support
+  // legs. (3)
+  const conveyor = new THREE.Group();
+  conveyor.position.set(QUARRY_PIT_RADIUS * 0.55, 0, -QUARRY_PIT_RADIUS * 0.2);
+  conveyor.rotation.y = Math.PI * 0.15;
+  group.add(conveyor);
+
+  const CONVEYOR_LENGTH = 9;
+  const belt = new THREE.Mesh(new THREE.BoxGeometry(CONVEYOR_LENGTH, 0.5, 1.3), steelMat);
+  belt.position.set(CONVEYOR_LENGTH / 2, 2.2, 0);
+  belt.rotation.z = THREE.MathUtils.degToRad(18);
+  conveyor.add(belt);
+
+  const legGeo = new THREE.BoxGeometry(0.35, 1, 0.35);
+  const legFront = new THREE.Mesh(legGeo, steelMat);
+  legFront.position.set(1.2, 1.05, 0);
+  legFront.rotation.z = THREE.MathUtils.degToRad(18);
+  conveyor.add(legFront);
+  const legBack = new THREE.Mesh(new THREE.BoxGeometry(0.35, 3.2, 0.35), steelMat);
+  legBack.position.set(CONVEYOR_LENGTH - 1.2, 3.4, 0);
+  legBack.rotation.z = THREE.MathUtils.degToRad(18);
+  conveyor.add(legBack);
+
+  // Silo: cylindrical body, conical cap, small base ring — fed by the conveyor's upper end. (3)
+  const silo = new THREE.Group();
+  silo.position.set(
+    conveyor.position.x + Math.cos(conveyor.rotation.y) * (CONVEYOR_LENGTH + 1),
+    0,
+    conveyor.position.z + Math.sin(conveyor.rotation.y) * (CONVEYOR_LENGTH + 1),
+  );
+  group.add(silo);
+
+  const siloBody = new THREE.Mesh(new THREE.CylinderGeometry(1.8, 1.8, 6, 12), siloMat);
+  siloBody.position.y = 3 + 4.6; // sits on top of the conveyor's high end, above the pit rim
+  silo.add(siloBody);
+
+  const siloCap = new THREE.Mesh(new THREE.ConeGeometry(1.8, 1.4, 12), rockMat);
+  siloCap.position.y = 3 + 4.6 + 3 + 0.7;
+  silo.add(siloCap);
+
+  const siloBase = new THREE.Mesh(new THREE.CylinderGeometry(1.95, 1.95, 0.3, 12), steelMat);
+  siloBase.position.y = 3 + 4.6 - 3 - 0.15;
+  silo.add(siloBase);
+
+  return group;
+}
+
 /**
  * Renders every active construction crew's vehicle for each in-progress job (Task 25: up to
  * `MAX_CREWS` concurrent crews, each with its own full rig set/dressing/floodlight — see
@@ -1598,16 +1727,34 @@ export class ConstructionRenderer {
   private craneSegment: THREE.Mesh;
   private craneSegmentMat: THREE.MeshStandardMaterial;
 
+  // --- Quarry landmark (Task 34) -------------------------------------------------------------
+  private quarryGroup: THREE.Group;
+  private quarryPlacement: QuarryPlacement | null = null; // null until placed; shuttles fall back
+                                                            // to the pre-Task-34 "toward map edge" behavior
+  private quarryPopElapsed = 0; // seconds since placement, drives the pop-in ease
+  private quarryPopping = false;
+
   constructor(
     private scene: THREE.Scene,
     bus: EventBus,
     private graph: RoadGraph,
     private hf: Heightfield,
     private roadRenderer: RoadRenderer,
+    quarry?: QuarrySim,
   ) {
     for (let crew = 0; crew < MAX_CREWS; crew++) {
       this.crews.push(this.makeCrewSlot());
     }
+
+    this.quarryGroup = buildQuarryProp();
+    this.quarryGroup.visible = false;
+    this.quarryGroup.scale.setScalar(0.001);
+    this.scene.add(this.quarryGroup);
+    // An already-placed quarry (restored save, or a QuarrySim constructed and placed before this
+    // renderer — shouldn't normally happen given main.ts's construction order, but stay defensive)
+    // shows immediately at full scale, no pop-in.
+    if (quarry?.placement) this.placeQuarryProp(quarry.placement, false);
+    bus.on('quarry:placed', (e) => this.placeQuarryProp(e, true));
 
     this.craneRig = buildCrane();
     this.craneRig.group.visible = false;
@@ -1642,6 +1789,33 @@ export class ConstructionRenderer {
     bus.on('construction:stage', (e) => {
       if (e.stage === 'painted' || e.stage === 'removed') this.stakes.removeAll(e.edgeId);
     });
+  }
+
+  /** Places the quarry prop group at its sim-decided position/rotation, flattens a terrain pad
+   * once (Task 34 deliverable 2: "terrain-flattened pad, flattenCircle once at placement"), and
+   * either pops it in (`animate: true`, a live first-road placement) or shows it immediately at
+   * full scale (`animate: false`, restoring an already-known placement from a save). */
+  private placeQuarryProp(placement: QuarryPlacement, animate: boolean): void {
+    this.quarryPlacement = placement;
+    const y = this.hf.heightAt(placement.x, placement.z);
+    this.hf.flattenCircle(placement.x, placement.z, y, QUARRY_PAD_FLATTEN_RADIUS);
+    this.quarryGroup.position.set(placement.x, y, placement.z);
+    this.quarryGroup.rotation.y = placement.rot;
+    this.quarryGroup.visible = true;
+    if (animate) {
+      this.quarryPopping = true;
+      this.quarryPopElapsed = 0;
+      this.quarryGroup.scale.setScalar(0.001);
+    } else {
+      this.quarryPopping = false;
+      this.quarryGroup.scale.setScalar(1);
+    }
+  }
+
+  /** The quarry's world position, or `null` if none has been placed yet (no road ever committed).
+   * Read by the truck shuttle theater so trips can head toward it instead of the map edge. */
+  get quarryPosition(): { x: number; z: number } | null {
+    return this.quarryPlacement ? { x: this.quarryPlacement.x, z: this.quarryPlacement.z } : null;
   }
 
   /** Builds one crew's full rig set + site dressing + floodlight, adds everything to the scene
@@ -2269,6 +2443,13 @@ export class ConstructionRenderer {
   update(dt: number, night: boolean): void {
     this.clock += dt;
 
+    if (this.quarryPopping) {
+      this.quarryPopElapsed += dt;
+      const t = clamp01(this.quarryPopElapsed / QUARRY_POP_DURATION);
+      this.quarryGroup.scale.setScalar(Math.max(0.001, easeOutBack(t)));
+      if (t >= 1) this.quarryPopping = false;
+    }
+
     // Bridge crane theater (Task 22) is stepped before the generic per-kind loop below so its
     // `applyProgressTarget`/liveness bookkeeping (synthesized here, same pattern as the truck
     // shuttle/roller — queue.ts never emits a real `vehicle: 'crane'` progress event) is in place
@@ -2576,12 +2757,10 @@ export class ConstructionRenderer {
       truck.shuttlePhase = 'departing';
       truck.shuttleTimer = 0;
       truck.shuttleAwayDuration = SHUTTLE_AWAY_MIN + Math.random() * (SHUTTLE_AWAY_MAX - SHUTTLE_AWAY_MIN);
-      const dir = nearestEdgeDir(truck.curPos.x, truck.curPos.z);
-      truck.shuttleAwayPos.set(
-        truck.curPos.x + dir.x * SPAWN_DISTANCE,
-        truck.curPos.y,
-        truck.curPos.z + dir.z * SPAWN_DISTANCE,
-      );
+      // Task 34: head toward the quarry once one exists; falls back to "toward the nearest map
+      // edge" unchanged when it doesn't (no road committed yet).
+      const target = shuttleAwayTarget(truck.curPos.x, truck.curPos.z, this.quarryPosition);
+      truck.shuttleAwayPos.set(target.x, truck.curPos.y, target.z);
     }
   }
 

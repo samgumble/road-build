@@ -15,6 +15,7 @@ import { TrafficSim } from './sim/traffic/traffic';
 import { CarRenderer } from './render/carRenderer';
 import { GrowthSim } from './sim/growth/growth';
 import { generateWilderness, WildernessSim } from './sim/growth/wilderness';
+import { QuarrySim } from './sim/quarry';
 import { SceneryRenderer } from './render/sceneryRenderer';
 import { Atmosphere } from './render/atmosphere';
 import { Hud, randomSeed } from './ui/hud';
@@ -128,7 +129,13 @@ function main(): void {
   const graph = new RoadGraph(bus, makeSampler(hf));
   const roadRenderer = new RoadRenderer(scene, graph, bus, hf);
   const buildQueue = new BuildQueue(graph, hf, bus);
-  const constructionRenderer = new ConstructionRenderer(scene, bus, graph, hf, roadRenderer);
+  // Task 34: quarry landmark — placed deterministically on the FIRST road commit ever. Constructed
+  // before any `restoreWorld` call below (same reasoning as WildernessSim just below) so a restored
+  // save's replayed first edge either seeds an already-known placement via `restoreWorld`'s
+  // `quarry.restore()` call, or (a save predating this feature) computes one fresh from the
+  // restored graph.
+  const quarry = new QuarrySim(hf, graph, bus, 'quarry-' + hf.seed);
+  const constructionRenderer = new ConstructionRenderer(scene, bus, graph, hf, roadRenderer, quarry);
 
   const traffic = new TrafficSim(graph, bus, createRng('traffic-' + hf.seed));
   traffic.targetPopulation = 6; // Task 13 scales this with houses: 6 + houses, capped at 80
@@ -229,7 +236,7 @@ function main(): void {
     if (raw) {
       const save = deserialize(raw);
       if (save && save.seed === seed) {
-        restoreWorld(save, { bus, hf, graph, growth, queue: buildQueue });
+        restoreWorld(save, { bus, hf, graph, growth, queue: buildQueue, quarry });
         sceneryRenderer.rebuild(growth.spawned);
         atmosphere.timeOfDay = save.timeOfDay;
         restoredRoads = save.edges.length > 0;
@@ -268,7 +275,7 @@ function main(): void {
 
   const save = () => {
     try {
-      const json = serialize({ seed, timeOfDay: atmosphere.timeOfDay, graph, growth });
+      const json = serialize({ seed, timeOfDay: atmosphere.timeOfDay, graph, growth, quarry });
       window.localStorage.setItem(saveKeyFor(seed), json);
     } catch {
       // localStorage unavailable/full — autosave silently no-ops rather than crashing the game

@@ -13,8 +13,9 @@ import {
 } from './construction/queue';
 import { sampleHeadingAt } from './roads/path';
 import { EventBus } from '../core/events';
+import { QuarrySim, placeQuarry, type QuarryPlacement } from './quarry';
 
-const SAVE_VERSION = 1 as const;
+const SAVE_VERSION = 2 as const;
 
 export interface SaveV1 {
   version: 1;
@@ -28,16 +29,37 @@ export interface SaveV1 {
   // `construction:stage` events, so it needs no save slot at all.
 }
 
+/**
+ * v2 (Task 34): additive `quarry` field — the one-per-island landmark's placement, or `null` if no
+ * road has ever been committed in this world (so no quarry has been placed yet). A v1 save (no
+ * `quarry` field at all) migrates forward in `deserialize`: since v1 predates the quarry, its
+ * absence there just means "not yet computed from this save's data" rather than "no quarry" — the
+ * migration path re-derives it deterministically from the same placement function `restoreWorld`
+ * would otherwise use live, so an old save gets a quarry exactly where a fresh world with the same
+ * seed + same first road would have gotten one.
+ */
+export interface SaveV2 {
+  version: 2;
+  seed: string;
+  timeOfDay: number;
+  edges: { ctrl: P2[]; stage: Stage }[];
+  growth: { dev: number[]; spawned: SpawnRecord[] };
+  quarry: QuarryPlacement | null;
+}
+
+export type AnySave = SaveV2;
+
 /** Minimal shape `serialize` needs from the live world. */
 interface SerializableWorld {
   seed: string;
   timeOfDay: number;
   graph: RoadGraph;
   growth: GrowthSim;
+  quarry: QuarrySim;
 }
 
 export function serialize(world: SerializableWorld): string {
-  const save: SaveV1 = {
+  const save: SaveV2 = {
     version: SAVE_VERSION,
     seed: world.seed,
     timeOfDay: world.timeOfDay,
@@ -48,38 +70,14 @@ export function serialize(world: SerializableWorld): string {
       dev: world.growth.devLevels.map((v) => Math.round(v * 1000) / 1000),
       spawned: world.growth.spawned.slice(),
     },
+    quarry: world.quarry.placement,
   };
   return JSON.stringify(save);
 }
 
-/** Returns `null` on parse error or version mismatch — caller should start a fresh world. */
-export function deserialize(json: string): SaveV1 | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(json);
-  } catch {
-    return null;
-  }
-  if (
-    typeof parsed !== 'object' ||
-    parsed === null ||
-    (parsed as { version?: unknown }).version !== SAVE_VERSION
-  ) {
-    return null;
-  }
-  const p = parsed as Partial<SaveV1>;
-  if (
-    typeof p.seed !== 'string' ||
-    typeof p.timeOfDay !== 'number' ||
-    !Number.isFinite(p.timeOfDay) || // Minor 9: reject NaN/Infinity, not just "is a number"
-    !Array.isArray(p.edges) ||
-    !p.growth ||
-    !Array.isArray(p.growth.dev) ||
-    !Array.isArray(p.growth.spawned)
-  ) {
-    return null;
-  }
-  for (const e of p.edges) {
+function validateEdges(edges: unknown): edges is { ctrl: P2[]; stage: Stage }[] {
+  if (!Array.isArray(edges)) return false;
+  for (const e of edges) {
     if (
       typeof e !== 'object' ||
       e === null ||
@@ -95,10 +93,89 @@ export function deserialize(json: string): SaveV1 | null {
       ) ||
       !STAGES.includes((e as { stage?: unknown }).stage as Stage)
     ) {
-      return null;
+      return false;
     }
   }
-  return p as SaveV1;
+  return true;
+}
+
+function validQuarry(q: unknown): q is QuarryPlacement | null {
+  if (q === null) return true;
+  if (typeof q !== 'object') return false;
+  const p = q as Partial<QuarryPlacement>;
+  return (
+    typeof p.x === 'number' && Number.isFinite(p.x) &&
+    typeof p.z === 'number' && Number.isFinite(p.z) &&
+    typeof p.rot === 'number' && Number.isFinite(p.rot)
+  );
+}
+
+/** Loosely-typed shape covering both v1 and v2 on-disk saves, used only inside `deserialize` before
+ * the version-specific validation/migration below settles on a real `SaveV2`. */
+interface RawSaveShape {
+  version?: unknown;
+  seed?: unknown;
+  timeOfDay?: unknown;
+  edges?: unknown;
+  growth?: { dev?: unknown; spawned?: unknown };
+  quarry?: unknown;
+}
+
+/** Returns `null` on parse error or unrecognized version — caller should start a fresh world.
+ * Migrates a v1 save forward to v2 shape (see SaveV2's doc comment) — the migration itself only
+ * fills in `quarry: undefined` (deferred to `restoreWorld`, which has the Heightfield + first
+ * edge's samples needed to actually compute a placement); this function's job is just to accept
+ * the older shape rather than reject it outright. */
+export function deserialize(json: string): SaveV2 | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const p = parsed as RawSaveShape;
+  if (p.version !== 1 && p.version !== 2) return null;
+
+  if (
+    typeof p.seed !== 'string' ||
+    typeof p.timeOfDay !== 'number' ||
+    !Number.isFinite(p.timeOfDay) || // Minor 9: reject NaN/Infinity, not just "is a number"
+    !validateEdges(p.edges) ||
+    !p.growth ||
+    !Array.isArray(p.growth.dev) ||
+    !Array.isArray(p.growth.spawned)
+  ) {
+    return null;
+  }
+  const dev = p.growth.dev as number[];
+  const spawned = p.growth.spawned as SpawnRecord[];
+
+  if (p.version === 1) {
+    // Migration: v1 has no `quarry` slot at all. Mark it `undefined` here (distinct from an
+    // explicit `null`, which v2 uses to mean "no road ever committed, no quarry yet") so
+    // `restoreWorld` knows to compute one from the restored graph's first edge rather than assume
+    // there's genuinely nothing to place.
+    return {
+      version: 2,
+      seed: p.seed,
+      timeOfDay: p.timeOfDay,
+      edges: p.edges,
+      growth: { dev, spawned },
+      quarry: undefined as unknown as QuarryPlacement | null,
+    };
+  }
+
+  if (!('quarry' in p) || !validQuarry(p.quarry)) return null;
+
+  return {
+    version: 2,
+    seed: p.seed,
+    timeOfDay: p.timeOfDay,
+    edges: p.edges,
+    growth: { dev, spawned },
+    quarry: p.quarry,
+  };
 }
 
 /** Minimal shape `restoreWorld` needs from the live world it's restoring into. */
@@ -114,6 +191,17 @@ interface RestoreDeps {
    * forced directly below rather than rebuilt by the crew.
    */
   queue?: BuildQueue;
+  /**
+   * Optional: the live QuarrySim, if one exists (mirrors `queue?` above). When present, the saved
+   * placement (if any) is fed back in via `restore()` BEFORE any edges are re-committed below — this
+   * disarms QuarrySim's own `roads:edgeAdded` listener so the replayed first edge doesn't trigger a
+   * second, redundant auto-placement/`quarry:placed` emit. If the save predates Task 34 (v1
+   * migrated forward, `save.quarry === undefined`) and at least one road exists, a placement is
+   * computed here from the restored graph's very first edge — same deterministic function a live
+   * first-road commit would have used — so an old save gets a quarry exactly where a fresh world
+   * with the same seed + same first road would.
+   */
+  quarry?: QuarrySim;
 }
 
 /**
@@ -125,10 +213,14 @@ interface RestoreDeps {
  * ungraded terrain under an already-built road. Finally restores growth state and emits
  * `roads:changed` once so downstream systems (lane markings, growth road-distance field) recompute.
  */
-export function restoreWorld(save: SaveV1, deps: RestoreDeps): void {
-  const { bus, hf, graph, growth, queue } = deps;
+export function restoreWorld(save: SaveV2, deps: RestoreDeps): void {
+  const { bus, hf, graph, growth, queue, quarry } = deps;
   const gradeRadius = ROAD_WIDTH / 2;
   const offset = ROAD_WIDTH / 2 - 0.8;
+
+  // Feed back an already-known placement BEFORE any edges are re-committed (see quarry?'s doc
+  // comment above) so QuarrySim's own listener is disarmed ahead of the replay.
+  if (quarry && save.quarry) quarry.restore(save.quarry);
 
   for (const saved of save.edges) {
     // DOCUMENTED-SKIP: only the first id returned by `commitChain` is used below. A normal save
@@ -194,6 +286,24 @@ export function restoreWorld(save: SaveV1, deps: RestoreDeps): void {
   }
 
   growth.restore(save.growth.dev, save.growth.spawned);
+
+  // v1-migration case (Task 34): `save.quarry === undefined` means this save predates the quarry
+  // feature entirely (deserialize's migration path leaves it unset, distinct from an explicit
+  // `null`, which means "v2 save, but no road had been committed yet"). If at least one road now
+  // exists in the restored graph, place a quarry the same deterministic way a live first-road
+  // commit would have: using the FIRST edge in restoration order and this world's own seed. A save
+  // with zero edges simply has nothing to anchor a placement to yet — QuarrySim's still-armed
+  // `roads:edgeAdded` listener will place one normally whenever the player draws their first road.
+  if (quarry && save.quarry === undefined && !quarry.placement) {
+    const [firstEdge] = graph.edges.values();
+    if (firstEdge) {
+      const placement = placeQuarry(hf, firstEdge.samples, save.seed);
+      if (placement) {
+        quarry.restore(placement);
+        bus.emit('quarry:placed', placement);
+      }
+    }
+  }
 
   // Final emit after all stages are forced: `commitChain` already fired `roads:changed` per edge,
   // but at that point each edge was still 'surveyed' (stage is forced afterward above), so growth's

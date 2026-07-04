@@ -16,6 +16,9 @@ export interface GameEvents {
   // Task 31: ambient wilderness clearing. `indices` are positions into the WildernessTree[] array
   // the renderer/sim were both constructed with (stable per tree for the life of the world).
   'wilderness:cleared': { indices: number[] };
+  // Task 34: quarry landmark placed (first road commit ever, or replayed on restore — see
+  // src/sim/quarry.ts). Additive event; renderers build the pad+prop in response.
+  'quarry:placed': { x: number; z: number; rot: number };
 }
 
 type Handler<T> = (payload: T) => void;
