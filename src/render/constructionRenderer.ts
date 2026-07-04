@@ -117,9 +117,13 @@ const TIRE_MARK_FADE = 20; // seconds
 const TIRE_MARK_INTERVAL = 0.25; // seconds between mark stamps per active vehicle
 const TIRE_MARK_COLOR = '#2a2420';
 
-// --- Floodlight ------------------------------------------------------------------------------
+// --- Floodlight (Task 37: towers stake down at fixed stations, like the T27 cones) -------------
 const FLOODLIGHT_EASE = 1.2; // seconds to ease in/out with night + job-active state
 const FLOODLIGHT_COLOR = '#ffcf8a';
+const FLOODLIGHT_SPACING = 70; // target arclength (u) between successive tower stations
+const FLOODLIGHT_PERP_OFFSET = ROAD_WIDTH_HALF + 2.2; // ± units from the centerline, per spec
+const FLOODLIGHT_CAP = 6; // per-crew tower budget (mirrors CONE_CAP's cap-then-widen-spacing approach)
+const FLOODLIGHT_LIGHT_EASE = 0.8; // seconds to cross-fade the single shared SpotLight between towers
 
 // --- Bridge construction theater (Task 22) -----------------------------------------------------
 const BRIDGE_SPAN_LENGTH = BRIDGE_PYLON_SPACING; // 16u, matches roadRenderer's pylon spacing/deck masking
@@ -1467,42 +1471,209 @@ function buildGrader(): VehicleRig {
   return { kind: 'roller', group, body, beaconMat, wheels, materials };
 }
 
-/** A single floodlight-tower prop: a pole + emissive head + one THREE.SpotLight (budgeted). */
-interface FloodlightRig {
-  group: THREE.Group;
-  light: THREE.SpotLight;
-  headMat: THREE.MeshStandardMaterial;
-  poleMat: THREE.MeshStandardMaterial;
-}
+const floodlightPoleDummy = new THREE.Object3D();
+const floodlightHeadDummy = new THREE.Object3D();
 
-function buildFloodlight(scene: THREE.Scene): FloodlightRig {
-  const group = new THREE.Group();
-  const poleMat = flatMat('#4a4a4a');
-  const headMat = flatMat('#e8e8e0', FLOODLIGHT_COLOR);
+/**
+ * Task 37: floodlight TOWERS now stake down at fixed stations along a crew's job edge, exactly
+ * like the T27 `ConePool` — placed once when the crew's job starts on a new edge and left
+ * untouched (including through demolish jobs) for the job's whole duration, fading with the same
+ * dressing signal as cones/stockpile/workers. Stations: both edge ends plus interior stations
+ * targeting `FLOODLIGHT_SPACING` of arclength, alternating sides at `±FLOODLIGHT_PERP_OFFSET`,
+ * capped at `FLOODLIGHT_CAP` towers (spacing widens automatically past the cap — same approach as
+ * cones). Poles and heads are each a single InstancedMesh (2 draw calls total regardless of tower
+ * count) with a shared emissive head material so night-gating stays a single intensity write.
+ *
+ * The LIGHT budget is unchanged: exactly one real THREE.SpotLight per crew, owned by the renderer
+ * (not this pool) and repositioned to whichever tower is nearest the crew's current work front —
+ * see `updateFloodlight`/`nearestTowerIndex`.
+ */
+class FloodlightTowerPool {
+  readonly poleMesh: THREE.InstancedMesh;
+  readonly headMesh: THREE.InstancedMesh;
+  readonly headMat: THREE.MeshStandardMaterial;
+  readonly poleMat: THREE.MeshStandardMaterial;
+  private readonly posX: Float32Array;
+  private readonly posY: Float32Array;
+  private readonly posZ: Float32Array;
+  private readonly heading: Float32Array;
+  private liveCount = 0;
+  private visibility = 0;
+  private placedEdgeId: number | null = null;
 
-  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.22, 6, 8), poleMat);
-  pole.position.y = 3;
-  group.add(pole);
+  constructor() {
+    this.poleMat = flatMat('#4a4a4a');
+    this.headMat = flatMat('#e8e8e0', FLOODLIGHT_COLOR);
 
-  const head = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.6, 0.5), headMat);
-  head.position.set(0.3, 6.1, 0);
-  head.rotation.z = -0.35;
-  group.add(head);
+    const poleGeo = new THREE.CylinderGeometry(0.18, 0.22, 6, 8);
+    poleGeo.translate(0, 3, 0);
+    this.poleMesh = new THREE.InstancedMesh(poleGeo, this.poleMat, FLOODLIGHT_CAP);
+    this.poleMesh.count = FLOODLIGHT_CAP;
+    this.poleMesh.frustumCulled = false;
 
-  // Single budgeted SpotLight, shadowless (Zen perf constraint — no extra shadow-map draw calls).
-  const light = new THREE.SpotLight(FLOODLIGHT_COLOR, 0, 40, THREE.MathUtils.degToRad(35), 0.4, 1.2);
-  light.castShadow = false;
-  light.position.set(0.3, 6.1, 0);
-  const target = new THREE.Object3D();
-  target.position.set(4, 0, 0);
-  group.add(target);
-  light.target = target;
-  group.add(light);
+    const headGeo = new THREE.BoxGeometry(1.1, 0.6, 0.5);
+    headGeo.translate(0.3, 6.1, 0);
+    headGeo.rotateZ(-0.35);
+    this.headMesh = new THREE.InstancedMesh(headGeo, this.headMat, FLOODLIGHT_CAP);
+    this.headMesh.count = FLOODLIGHT_CAP;
+    this.headMesh.frustumCulled = false;
 
-  group.visible = false;
-  scene.add(group);
+    this.posX = new Float32Array(FLOODLIGHT_CAP);
+    this.posY = new Float32Array(FLOODLIGHT_CAP);
+    this.posZ = new Float32Array(FLOODLIGHT_CAP);
+    this.heading = new Float32Array(FLOODLIGHT_CAP);
+  }
 
-  return { group, light, headMat, poleMat };
+  /** Computes fixed tower stations along `samples` and uploads them once — idempotent per edge,
+   * same one-shot-per-edge gate as `ConePool.place` (see `onProgress`). */
+  place(edgeId: number, samples: RoadSample[], hf: Heightfield): void {
+    this.placedEdgeId = edgeId;
+    if (samples.length < 2) {
+      this.liveCount = 0;
+      return;
+    }
+
+    const dist = new Float32Array(samples.length);
+    for (let i = 1; i < samples.length; i++) {
+      const a = samples[i - 1], b = samples[i];
+      dist[i] = dist[i - 1] + Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+    }
+    const total = dist[dist.length - 1];
+
+    let interiorCount = total > 0 ? Math.floor(total / FLOODLIGHT_SPACING) : 0;
+    let stationCount = Math.max(2, interiorCount + 1);
+    if (stationCount > FLOODLIGHT_CAP) stationCount = FLOODLIGHT_CAP;
+
+    const stations: number[] = [];
+    if (stationCount <= 2) {
+      stations.push(0, total);
+    } else {
+      for (let i = 0; i < stationCount; i++) {
+        stations.push((total * i) / (stationCount - 1));
+      }
+    }
+
+    let idx = 0;
+    let sampleCursor = 0;
+    for (const t of stations) {
+      if (idx >= FLOODLIGHT_CAP) break;
+      while (sampleCursor < samples.length - 2 && dist[sampleCursor + 1] < t) sampleCursor++;
+      const a = samples[sampleCursor];
+      const b = samples[Math.min(sampleCursor + 1, samples.length - 1)];
+      const segLen = dist[Math.min(sampleCursor + 1, samples.length - 1)] - dist[sampleCursor];
+      const u = segLen > 1e-6 ? clamp01((t - dist[sampleCursor]) / segLen) : 0;
+      const x = a.x + (b.x - a.x) * u;
+      const z = a.z + (b.z - a.z) * u;
+      const onBridge = u < 0.5 ? a.bridge : b.bridge;
+      const groundY = onBridge ? a.y + (b.y - a.y) * u : hf.heightAt(x, z);
+
+      const headingRad = Math.atan2(b.z - a.z, b.x - a.x);
+      const perpX = -Math.sin(headingRad);
+      const perpZ = Math.cos(headingRad);
+      // alternate sides per station (unlike cones, which place a pair each station)
+      const side = idx % 2 === 0 ? -1 : 1;
+
+      this.posX[idx] = x + perpX * side * FLOODLIGHT_PERP_OFFSET;
+      this.posY[idx] = groundY;
+      this.posZ[idx] = z + perpZ * side * FLOODLIGHT_PERP_OFFSET;
+      // face back toward the road so the emissive head reads as aimed down-road
+      this.heading[idx] = headingRad + (side === -1 ? Math.PI / 2 : -Math.PI / 2);
+      idx++;
+    }
+    this.liveCount = idx;
+    this.uploadMatrices();
+  }
+
+  /** Clears any placed towers (job removed/reset without a new placement following immediately). */
+  clear(): void {
+    this.placedEdgeId = null;
+    this.liveCount = 0;
+  }
+
+  get edgeId(): number | null {
+    return this.placedEdgeId;
+  }
+
+  get count(): number {
+    return this.liveCount;
+  }
+
+  /** World position of tower `i` (valid for `i < count`). */
+  towerPos(i: number): { x: number; y: number; z: number } {
+    return { x: this.posX[i], y: this.posY[i], z: this.posZ[i] };
+  }
+
+  towerHeading(i: number): number {
+    return this.heading[i];
+  }
+
+  /** Index of the tower nearest (x,z) among the placed, live towers; -1 if none are placed. */
+  nearestTowerIndex(x: number, z: number): number {
+    let best = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < this.liveCount; i++) {
+      const d = Math.hypot(this.posX[i] - x, this.posZ[i] - z);
+      if (d < bestDist) {
+        bestDist = d;
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  private uploadMatrices(): void {
+    for (let i = 0; i < FLOODLIGHT_CAP; i++) {
+      if (i >= this.liveCount) {
+        floodlightPoleDummy.position.set(0, -9999, 0);
+        floodlightPoleDummy.scale.setScalar(0.001);
+        floodlightPoleDummy.rotation.set(0, 0, 0);
+        floodlightHeadDummy.position.set(0, -9999, 0);
+        floodlightHeadDummy.scale.setScalar(0.001);
+        floodlightHeadDummy.rotation.set(0, 0, 0);
+      } else {
+        floodlightPoleDummy.position.set(this.posX[i], this.posY[i], this.posZ[i]);
+        floodlightPoleDummy.rotation.set(0, this.heading[i], 0);
+        floodlightPoleDummy.scale.setScalar(this.curScale);
+        floodlightHeadDummy.position.set(this.posX[i], this.posY[i], this.posZ[i]);
+        floodlightHeadDummy.rotation.set(0, this.heading[i], 0);
+        floodlightHeadDummy.scale.setScalar(this.curScale);
+      }
+      floodlightPoleDummy.updateMatrix();
+      this.poleMesh.setMatrixAt(i, floodlightPoleDummy.matrix);
+      floodlightHeadDummy.updateMatrix();
+      this.headMesh.setMatrixAt(i, floodlightHeadDummy.matrix);
+    }
+    this.poleMesh.instanceMatrix.needsUpdate = true;
+    this.headMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  private curScale = 0.001; // last-uploaded scale, reused by uploadMatrices when only fade changes
+
+  /** `active` = this crew currently has a job in progress (same shared signal as cones). Positions
+   * never change here — only the shared fade scale, and (deliverable 3) the shared head material's
+   * night-driven emissive intensity, set by the caller via `setHeadEmissive`. */
+  update(dt: number, active: boolean): void {
+    this.visibility = damp(this.visibility, active ? 1 : 0, 1 / FADE_DURATION, dt);
+    const scale = Math.max(0.001, easeOutCubic(clamp01(this.visibility)));
+    this.curScale = scale;
+    const visibleCount = active || this.visibility > 0.001 ? this.liveCount : 0;
+    this.uploadMatrices();
+    this.poleMesh.visible = scale > 0.001 && visibleCount > 0;
+    this.headMesh.visible = scale > 0.001 && visibleCount > 0;
+  }
+
+  /** Shared emissive intensity for every tower head in this crew (night-gated, cheap — one write
+   * touches every placed tower since they share `headMat`). */
+  setHeadEmissive(intensity: number): void {
+    this.headMat.emissiveIntensity = intensity;
+  }
+
+  dispose(): void {
+    this.poleMesh.geometry.dispose();
+    this.headMesh.geometry.dispose();
+    this.poleMat.dispose();
+    this.headMat.dispose();
+  }
 }
 
 /**
@@ -1549,8 +1720,21 @@ interface CrewSlot {
   stockpileVisibility: number;
   stockpileEdgeId: number | null;
   stockpileScale: number; // eased 0..1 depletion level (Task 26 deliverable 4), 1 = full mound
-  floodlight: FloodlightRig;
-  floodlightVisibility: number;
+
+  // --- Task 37: floodlight towers -------------------------------------------------------------
+  // Towers themselves are a fixed-station instanced pool, placed once per edge exactly like cones
+  // (see FloodlightTowerPool). The LIGHT budget stays at exactly one real THREE.SpotLight per crew
+  // — `floodlightLight` is owned here (not by the tower pool) and repositioned each frame to
+  // whichever tower is nearest the crew's current work front, cross-fading (`floodlightLightMix`)
+  // between the previous and new anchor tower over FLOODLIGHT_LIGHT_EASE seconds so it never pops
+  // or visibly slides between towers.
+  floodlightTowers: FloodlightTowerPool;
+  floodlightLight: THREE.SpotLight;
+  floodlightLightTarget: THREE.Object3D;
+  floodlightVisibility: number; // night && job-active eased 0..1 (drives light intensity + head glow)
+  floodlightAnchorTower: number; // index of the tower the light is currently at/easing toward, -1 = none
+  floodlightLightMix: number; // 0..1 cross-fade progress from the previous anchor to the current one
+  floodlightPrevPos: THREE.Vector3; // world pos of the previous anchor tower, for the cross-fade
   // scratch fields for updateSiteDressing -> cones.update handoff (avoids a per-frame allocation)
   dressingActive: boolean;
   dressingPos: THREE.Vector3;
@@ -1844,7 +2028,23 @@ export class ConstructionRenderer {
     stockpile.group.scale.setScalar(0.001);
     this.scene.add(stockpile.group);
 
-    const floodlight = buildFloodlight(this.scene);
+    // Floodlight towers (Task 37): fixed-station instanced pool (2 draw calls, poles + heads),
+    // placed once per edge exactly like cones — see `onProgress`/`updateSiteDressing`. The single
+    // budgeted SpotLight per crew is built here directly (not by the pool) since it's repositioned
+    // to whichever tower is nearest the work front rather than belonging to any one tower.
+    const floodlightTowers = new FloodlightTowerPool();
+    this.scene.add(floodlightTowers.poleMesh);
+    this.scene.add(floodlightTowers.headMesh);
+
+    const floodlightLight = new THREE.SpotLight(
+      FLOODLIGHT_COLOR, 0, 40, THREE.MathUtils.degToRad(35), 0.4, 1.2,
+    );
+    floodlightLight.castShadow = false; // shadowless — Zen perf constraint, no extra shadow-map draw calls
+    floodlightLight.visible = false;
+    const floodlightLightTarget = new THREE.Object3D();
+    floodlightLight.target = floodlightLightTarget;
+    this.scene.add(floodlightLight);
+    this.scene.add(floodlightLightTarget);
 
     // 'roller' is never itself a target `vehicle` on a progress event (queue.ts only ever emits
     // excavator/truck/paver/liner) — it only trails the paver during 'paved', so its state is
@@ -1884,8 +2084,13 @@ export class ConstructionRenderer {
       stockpileVisibility: 0,
       stockpileEdgeId: null,
       stockpileScale: 1,
-      floodlight,
+      floodlightTowers,
+      floodlightLight,
+      floodlightLightTarget,
       floodlightVisibility: 0,
+      floodlightAnchorTower: -1,
+      floodlightLightMix: 1,
+      floodlightPrevPos: new THREE.Vector3(),
       dressingActive: false,
       dressingPos: new THREE.Vector3(),
       dressingHeading: 0,
@@ -2088,6 +2293,16 @@ export class ConstructionRenderer {
     // demolish jobs, which get the same treatment since this only keys off edgeId, not direction.
     if (edge && slot.cones.edgeId !== e.edgeId) {
       slot.cones.place(e.edgeId, edge.samples, this.hf);
+    }
+
+    // Static floodlight towers (Task 37): same fixed-station, one-shot-per-edge placement as
+    // cones above — towers stay exactly where placed for the job's whole duration (including
+    // demolish jobs). Resetting the placement also drops the light's current anchor so it picks a
+    // fresh nearest tower next frame instead of easing from a now-stale index.
+    if (edge && slot.floodlightTowers.edgeId !== e.edgeId) {
+      slot.floodlightTowers.place(e.edgeId, edge.samples, this.hf);
+      slot.floodlightAnchorTower = -1;
+      slot.floodlightLightMix = 1;
     }
 
     // Survey stakes (deliverable 2): the surveyor plants a real stake every STAKE_SPACING as it
@@ -2573,6 +2788,11 @@ export class ConstructionRenderer {
     // the next job (even on the same edge, e.g. immediate resume) re-places fresh stations.
     slot.cones.update(dt, jobActive);
     if (!jobActive && slot.stockpileVisibility < 0.001) slot.cones.clear();
+
+    // Floodlight towers (Task 37): same fixed-position, fade-with-the-crew signal as cones. Free
+    // the placed-edge gate once fully faded so the next job re-places fresh stations.
+    slot.floodlightTowers.update(dt, jobActive);
+    if (!jobActive && slot.stockpileVisibility < 0.001) slot.floodlightTowers.clear();
   }
 
   /**
@@ -3353,13 +3573,16 @@ export class ConstructionRenderer {
   }
 
   /**
-   * Floodlight-tower prop: appears near the work front when it's night AND a job is actively
-   * being reported (any vehicle kind active this frame), easing in/out with both day/night and
-   * job start/end rather than popping — `floodlightVisibility` chases 1 only when both conditions
-   * hold simultaneously, so a job that's already running when night falls eases the light in, and
-   * a job that finishes mid-night eases it back out, exactly like a job starting after dark does.
-   * Positioned just off to the side of whichever vehicle is currently the primary one (first
-   * active found).
+   * Floodlight towers (Task 37): the towers themselves are fixed props (placed once per edge,
+   * faded by `updateSiteDressing` exactly like cones — see there). This method only drives the
+   * ONE budgeted SpotLight per crew: it finds whichever tower is nearest the crew's current work
+   * front and parents the light's *aim* there, cross-fading over `FLOODLIGHT_LIGHT_EASE` seconds
+   * whenever the nearest tower changes (so the light eases from the old tower to the new one
+   * instead of popping or visibly sliding along the road), plus the shared night-gated visibility
+   * that also drives every placed tower head's emissive glow — appears when it's night AND a job
+   * is actively being reported (any vehicle kind active this frame), eased in/out exactly as
+   * before so a job already running when night falls eases the light in, and a job that finishes
+   * mid-night eases it back out.
    */
   private updateFloodlight(slot: CrewSlot, dt: number, night: boolean): void {
     let anchor: VehicleState | null = null;
@@ -3375,21 +3598,48 @@ export class ConstructionRenderer {
     const target = wantVisible ? 1 : 0;
     slot.floodlightVisibility = damp(slot.floodlightVisibility, target, 1 / FLOODLIGHT_EASE, dt);
 
-    const visible = slot.floodlightVisibility > 0.01;
-    slot.floodlight.group.visible = visible;
+    const towers = slot.floodlightTowers;
+    const visible = slot.floodlightVisibility > 0.01 && anchor !== null && towers.count > 0;
+    slot.floodlightLight.visible = visible;
+
     if (visible && anchor) {
-      const perpX = -Math.sin(anchor.curHeading);
-      const perpZ = Math.cos(anchor.curHeading);
-      slot.floodlight.group.position.set(
-        anchor.curPos.x + perpX * 6,
-        anchor.curPos.y,
-        anchor.curPos.z + perpZ * 6,
-      );
-      slot.floodlight.group.rotation.y = -anchor.curHeading + Math.PI / 2;
+      const nearest = towers.nearestTowerIndex(anchor.curPos.x, anchor.curPos.z);
+      if (nearest !== slot.floodlightAnchorTower) {
+        // Anchor tower changed (work front advanced past the midpoint to the next tower, or a
+        // fresh placement reset it to -1): capture the light's last world position as the
+        // cross-fade's starting point and begin easing toward the new tower from there.
+        if (slot.floodlightAnchorTower >= 0) {
+          slot.floodlightPrevPos.copy(slot.floodlightLight.position);
+        } else if (nearest >= 0) {
+          // First pick after placement/reset — start already at the chosen tower, no fade-slide.
+          const p = towers.towerPos(nearest);
+          slot.floodlightPrevPos.set(p.x, p.y, p.z);
+        }
+        slot.floodlightAnchorTower = nearest;
+        slot.floodlightLightMix = 0;
+      }
+
+      if (nearest >= 0) {
+        slot.floodlightLightMix = Math.min(1, slot.floodlightLightMix + dt / FLOODLIGHT_LIGHT_EASE);
+        const mixT = easeOutCubic(slot.floodlightLightMix);
+        const p = towers.towerPos(nearest);
+        const lightY = p.y + 6.1; // matches the tower head's mounted height
+        slot.floodlightLight.position.set(
+          THREE.MathUtils.lerp(slot.floodlightPrevPos.x, p.x, mixT),
+          THREE.MathUtils.lerp(slot.floodlightPrevPos.y, lightY, mixT),
+          THREE.MathUtils.lerp(slot.floodlightPrevPos.z, p.z, mixT),
+        );
+        // Aim down-road at the work front (the anchor vehicle's current position).
+        slot.floodlightLightTarget.position.copy(anchor.curPos);
+      }
     }
 
-    slot.floodlight.light.intensity = slot.floodlightVisibility * 6;
-    slot.floodlight.headMat.emissiveIntensity = slot.floodlightVisibility * 2.2;
+    // Intensity cross-fades with the anchor-tower mix too, so a light easing between two towers
+    // dips slightly rather than holding full brightness while visibly translating (reads as "the
+    // beam is swinging to the next tower", not "the light teleported").
+    const mixEase = slot.floodlightAnchorTower >= 0 ? easeOutCubic(slot.floodlightLightMix) : 1;
+    slot.floodlightLight.intensity = slot.floodlightVisibility * 6 * (0.4 + 0.6 * mixEase);
+    towers.setHeadEmissive(slot.floodlightVisibility * 2.2);
   }
 
   private disposeRig(rig: VehicleRig): void {
@@ -3418,12 +3668,11 @@ export class ConstructionRenderer {
       });
       for (const m of slot.stockpile.materials) m.dispose();
 
-      this.scene.remove(slot.floodlight.group);
-      slot.floodlight.group.traverse((obj) => {
-        if (obj instanceof THREE.Mesh) obj.geometry.dispose();
-      });
-      slot.floodlight.headMat.dispose();
-      slot.floodlight.poleMat.dispose();
+      this.scene.remove(slot.floodlightTowers.poleMesh);
+      this.scene.remove(slot.floodlightTowers.headMesh);
+      slot.floodlightTowers.dispose();
+      this.scene.remove(slot.floodlightLight);
+      this.scene.remove(slot.floodlightLightTarget);
 
       for (const w of [slot.flagger, slot.spotter, slot.stockpileWorker]) {
         this.scene.remove(w.group);
