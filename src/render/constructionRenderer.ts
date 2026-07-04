@@ -2760,7 +2760,7 @@ export class ConstructionRenderer {
       // Task 34: head toward the quarry once one exists; falls back to "toward the nearest map
       // edge" unchanged when it doesn't (no road committed yet).
       const target = shuttleAwayTarget(truck.curPos.x, truck.curPos.z, this.quarryPosition);
-      truck.shuttleAwayPos.set(target.x, truck.curPos.y, target.z);
+      truck.shuttleAwayPos.set(target.x, this.hf.heightAt(target.x, target.z), target.z);
     }
   }
 
