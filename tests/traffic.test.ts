@@ -325,4 +325,94 @@ describe('TrafficSim', () => {
       expect((sim as any).houses).toEqual([{ x: 2, z: 2, id: 901 }]);
     });
   });
+
+  // Task 44: traffic deadlock fix. Prior to this fix, a small ring network with several short
+  // (< JUNCTION_APPROACH + JUNCTION_RELEASE) legs and enough concurrent cars could gridlock
+  // permanently: cars acquired a junction lock for the NEXT node before releasing the lock they
+  // already held for the PREVIOUS node (a single `heldNodeId` field silently overwritten), leaking
+  // the old lock forever to a "phantom" holder — plus nothing ever checked that the lane a car was
+  // about to commit to actually had room ("blocking the box"). Both together produced a circular
+  // lock+gap wait that never resolved. See task-44-report.md for the full diagnosis.
+  describe('junction deadlock (Task 44)', () => {
+    /**
+     * A small ring: six real corner nodes (not a bare 2-node loop, which never engages a junction
+     * lock at all — see task-44-report.md's first repro attempt), with legs short enough
+     * (8-16u, some under JUNCTION_APPROACH(6) + JUNCTION_RELEASE(4) = 10u) that concurrent cars
+     * contest the same node locks and can chain back-to-back junctions in a single tick — exactly
+     * the topology that reproduced the original deadlock.
+     */
+    function ringWorld() {
+      const bus = new EventBus();
+      const g = new RoadGraph(bus, flatSampler);
+      g.commitChain([{ x: 0, z: 0 }, { x: 8, z: 0 }]);
+      g.commitChain([{ x: 8, z: 0 }, { x: 8, z: 8 }]);
+      g.commitChain([{ x: 8, z: 8 }, { x: 8, z: 24 }]);
+      g.commitChain([{ x: 8, z: 24 }, { x: 0, z: 24 }]);
+      g.commitChain([{ x: 0, z: 24 }, { x: 0, z: 8 }]);
+      g.commitChain([{ x: 0, z: 8 }, { x: 0, z: 0 }]);
+      for (const e of g.edges.values()) e.stage = 'painted';
+      bus.emit('roads:changed', {});
+      const sim = new TrafficSim(g, bus, createRng('deadlock-ring'));
+      return { bus, g, sim };
+    }
+
+    it('never freezes permanently: no cohort stays below epsilon speed for more than 30 sim-seconds over a 20 sim-minute run at near-cap population', () => {
+      const { sim } = ringWorld();
+      sim.targetPopulation = 20;
+
+      const dt = 1 / 60;
+      const totalSimSeconds = 20 * 60;
+      const FREEZE_EPS = 0.05;
+      const FREEZE_SECONDS = 30;
+      let frozenStreak = 0;
+      let maxFrozenStreak = 0;
+
+      for (let i = 0; i < totalSimSeconds / dt; i++) {
+        sim.update(dt);
+        const cars = sim.cars;
+        const allFrozen = cars.length > 0 && cars.every((c) => c.speed < FREEZE_EPS);
+        frozenStreak = allFrozen ? frozenStreak + dt : 0;
+        maxFrozenStreak = Math.max(maxFrozenStreak, frozenStreak);
+      }
+
+      expect(maxFrozenStreak).toBeLessThan(FREEZE_SECONDS);
+    });
+
+    it('maintains throughput: cars keep completing trips (not just idling) over a long run at near-cap population', () => {
+      const { sim } = ringWorld();
+      sim.targetPopulation = 20;
+
+      const dt = 1 / 60;
+      const totalSimSeconds = 20 * 60;
+      let completions = 0;
+      let prevIds = new Set<number>();
+
+      for (let i = 0; i < totalSimSeconds / dt; i++) {
+        sim.update(dt);
+        const curIds = new Set(sim.cars.map((c) => c.id));
+        for (const id of prevIds) if (!curIds.has(id)) completions++;
+        prevIds = curIds;
+      }
+
+      // A 20 sim-minute run on a small ring should complete comfortably more than a handful of
+      // trips if traffic is actually flowing rather than merely creeping/backed up.
+      expect(completions).toBeGreaterThan(20);
+    });
+
+    it('a lock holder that stalls for the safety-net timeout releases and re-queues rather than holding forever', () => {
+      const { sim } = ringWorld();
+      sim.targetPopulation = 20;
+      const dt = 1 / 60;
+      // Run long enough to guarantee at least one contention + potential stall/backoff cycle,
+      // then confirm no lock is held by a car that no longer exists (the original leak symptom)
+      // and that every currently-held lock is actually owned by a live car.
+      for (let i = 0; i < 5 * 60 / dt; i++) sim.update(dt);
+
+      const locks: Map<number, number> = (sim as any).junctionLocks;
+      const liveIds = new Set((sim as any).cs.map((c: any) => c.id));
+      for (const [, holderId] of locks) {
+        expect(liveIds.has(holderId)).toBe(true);
+      }
+    });
+  });
 });

@@ -26,6 +26,24 @@ const JUNCTION_APPROACH = 6; // u from lane end where a car must hold the juncti
 const JUNCTION_RELEASE = 4; // u into the next lane where the lock is released
 const SPAWN_INTERVAL = 1; // seconds, max one spawn per second
 
+// Task 44 (deadlock fix): "don't block the box" — a car may only ACQUIRE a junction lock if the
+// lane it's about to enter has at least this much clear space ahead of wherever the car would
+// enter it (s=0). This is the same HARD_GAP used for same-lane car-following, so a car never
+// commits to a junction it can't actually clear — the dominant deadlock cause (circular lock+gap
+// waits) never forms in the first place. See task-44-report.md for the diagnosed cycle.
+const BOX_CLEARANCE = HARD_GAP;
+
+// Task 44 (deadlock fix): safety net for any residual cycle (e.g. one that forms across more than
+// two junctions, or before this fix existed in a save). A car that holds a junction lock but has
+// been essentially stationary for this many sim-seconds voluntarily releases the lock and re-queues
+// behind a small per-car jittered back-off (drawn from the sim rng, so it stays deterministic)
+// before it's allowed to contend for a lock again. This never despawns/teleports the car — it just
+// waits a bit longer, then re-tries normally.
+const STALE_LOCK_TIMEOUT = 8; // sim-seconds
+const STALE_SPEED_EPS = 0.05; // u/s, "essentially stationary" threshold
+const STALE_BACKOFF_MIN = 0.5; // seconds
+const STALE_BACKOFF_MAX = 2; // seconds
+
 // Task 32: trip-endpoint weighting toward settlement nodes. Weight map recompute is throttled the
 // same way GrowthSim throttles its road-distance recompute (see growth.ts's RECOMPUTE_INTERVAL
 // doc comment) so a flurry of growth:spawn events during active development doesn't repeatedly
@@ -80,6 +98,14 @@ interface Car {
   speed: number;
   color: number;
   heldNodeId: number | null; // junction node id whose lock this car currently holds, if any
+  // Task 44 (deadlock fix): sim-seconds this car has continuously held heldNodeId while
+  // essentially stationary (speed < STALE_SPEED_EPS). Reset to 0 whenever the car moves or
+  // releases/acquires a (different) lock. Drives the stale-lock safety net.
+  stalledHeldSeconds: number;
+  // Task 44 (deadlock fix): sim-time (this.simTime) before which this car must not attempt to
+  // acquire a NEW junction lock, set after the safety net force-releases a stale lock so the same
+  // car doesn't immediately re-win the same contested lock every tick. 0 = no back-off pending.
+  lockBackoffUntil: number;
 }
 
 export interface TrafficCar {
@@ -276,6 +302,7 @@ export class TrafficSim {
       if (this.junctionLocks.get(c.heldNodeId) === c.id) this.junctionLocks.delete(c.heldNodeId);
       c.heldNodeId = null;
     }
+    c.stalledHeldSeconds = 0;
   }
 
   /**
@@ -342,6 +369,8 @@ export class TrafficSim {
       speed: 0,
       color,
       heldNodeId: null,
+      stalledHeldSeconds: 0,
+      lockBackoffUntil: 0,
     };
     this.cs.push(car);
   }
@@ -365,6 +394,24 @@ export class TrafficSim {
     if (gap >= SOFT_GAP) return GAP_SPEED_CAP;
     const u = (gap - HARD_GAP) / (SOFT_GAP - HARD_GAP);
     return GAP_SPEED_CAP * u;
+  }
+
+  /**
+   * Task 44 (deadlock fix), "don't block the box": true if entering `lane` at s=0 right now would
+   * land at least BOX_CLEARANCE clear of the nearest car already on it. A car is only allowed to
+   * ACQUIRE a junction lock when this holds for the lane it's about to commit to — otherwise it
+   * would sit in the intersection holding the lock while unable to actually clear it, which is
+   * exactly how the circular lock+gap wait cycles formed (see task-44-report.md). Looking at the
+   * lane's occupancy directly (rather than only the lock) also naturally covers single-lane loops
+   * back to the same node, since the "next lane" occupancy is checked regardless of who owns its
+   * lock.
+   */
+  private exitLaneClear(laneId: number): boolean {
+    for (const other of this.cs) {
+      if (other.laneId !== laneId) continue;
+      if (other.s < BOX_CLEARANCE) return false;
+    }
+    return true;
   }
 
   /**
@@ -403,12 +450,57 @@ export class TrafficSim {
         const nodeId = lane.to;
         const holder = this.junctionLocks.get(nodeId);
         if (holder === undefined) {
-          this.junctionLocks.set(nodeId, c.id);
-          c.heldNodeId = nodeId;
+          // Task 44 (deadlock fix), part 1: never acquire a second lock while still holding one.
+          // Two back-to-back short lanes could otherwise put a car within JUNCTION_APPROACH of the
+          // NEXT node before it had reached JUNCTION_RELEASE into the lane that carries the lock it
+          // already holds — silently overwriting `heldNodeId` and leaking the first lock forever
+          // (it belonged to no car that would ever release it). Simply refusing to acquire until
+          // the current lock is released removes the leak at the source.
+          //
+          // Task 44 (deadlock fix), part 2: "don't block the box" — also require the exit lane
+          // (`c.route[c.routeIndex + 1]`) to have clear space before committing to the junction, so
+          // a car never sits in the intersection holding the lock while itself gap-blocked on the
+          // far side. Combined with part 1 this prevents essentially all lock+gap circular waits.
+          //
+          // Task 44 (deadlock fix), part 3: honor a pending back-off from the stale-lock safety net
+          // (see below) so a car that was just force-released doesn't immediately re-win the same
+          // contested lock on the very next tick.
+          const nextLane = c.route[c.routeIndex + 1];
+          const canAcquire =
+            c.heldNodeId === null &&
+            c.lockBackoffUntil <= this.simTime &&
+            (!nextLane || this.exitLaneClear(nextLane.id));
+          if (canAcquire) {
+            this.junctionLocks.set(nodeId, c.id);
+            c.heldNodeId = nodeId;
+          } else {
+            blockedByJunction = true;
+          }
         } else if (holder !== c.id) {
           blockedByJunction = true;
         } else {
           c.heldNodeId = nodeId;
+        }
+      }
+
+      // Task 44 (deadlock fix), safety net: track how long this car has held a lock while
+      // essentially stationary. If it crosses STALE_LOCK_TIMEOUT, force-release the lock and
+      // apply a small seeded jittered back-off before it may contend for a (any) lock again —
+      // breaks any residual cycle that part 1/2 above didn't prevent outright (e.g. one spanning
+      // more than two junctions), without ever teleporting or despawning the car. Runs BEFORE the
+      // gap/target-speed calculation below so a force-release this tick correctly re-blocks the car
+      // (it no longer holds the lock it still needs) rather than letting it surge forward on a lock
+      // it just gave up.
+      if (c.heldNodeId !== null) {
+        if (c.speed < STALE_SPEED_EPS) {
+          c.stalledHeldSeconds += dt;
+          if (c.stalledHeldSeconds >= STALE_LOCK_TIMEOUT) {
+            this.releaseLock(c);
+            c.lockBackoffUntil = this.simTime + STALE_BACKOFF_MIN + this.rng() * (STALE_BACKOFF_MAX - STALE_BACKOFF_MIN);
+            if (!isLastLane && distToLaneEnd <= JUNCTION_APPROACH) blockedByJunction = true;
+          }
+        } else {
+          c.stalledHeldSeconds = 0;
         }
       }
 
