@@ -25,6 +25,51 @@ const JUNCTION_APPROACH = 6; // u from lane end where a car must hold the juncti
 const JUNCTION_RELEASE = 4; // u into the next lane where the lock is released
 const SPAWN_INTERVAL = 1; // seconds, max one spawn per second
 
+// Task 32: trip-endpoint weighting toward settlement nodes. Weight map recompute is throttled the
+// same way GrowthSim throttles its road-distance recompute (see growth.ts's RECOMPUTE_INTERVAL
+// doc comment) so a flurry of growth:spawn events during active development doesn't repeatedly
+// re-scan every node's neighborhood.
+const WEIGHT_RECOMPUTE_INTERVAL = 2; // sim-seconds
+const SETTLEMENT_SEARCH_RADIUS = 20; // u, matches Addendum D Task 32's "within 20u" spec
+const HOUSE_WEIGHT = 3;
+const BUILDING_WEIGHT = 5;
+const BASE_NODE_WEIGHT = 1;
+
+// Task 32: commute pulse — spawn-interval multiplier as a function of timeOfDay (0..1, where 0/1
+// is midnight). Two gaussian-ish bumps at the morning/evening commute peaks, a dip at deep night.
+// Implemented as a multiplier on the spawn timer's effective rate (bigger multiplier = faster
+// spawning = busier), so `SPAWN_INTERVAL` is divided by this value.
+const MORNING_PEAK = 0.3;
+const EVENING_PEAK = 0.75;
+const PEAK_SIGMA = 0.06;
+const PEAK_BUMP = 0.6; // peaks reach 1 + 0.6 = 1.6x rate
+const NIGHT_CENTER = 0.95;
+const NIGHT_SIGMA = 0.08;
+const NIGHT_DIP = 0.6; // deep night dips toward 1 - 0.6 = 0.4x rate
+
+/** Wrapped (circular) gaussian distance on the [0,1) timeOfDay ring. */
+function wrappedGaussian(t: number, center: number, sigma: number): number {
+  let d = Math.abs(t - center);
+  d = Math.min(d, 1 - d); // shortest distance around the ring
+  return Math.exp(-(d * d) / (2 * sigma * sigma));
+}
+
+/**
+ * Rate multiplier on the spawn timer for a given timeOfDay: >1 during commute peaks (busiest ~0.3
+ * and ~0.75), <1 at deep night (~0.95), 1 elsewhere. Deterministic pure function of timeOfDay.
+ */
+function commuteRateMultiplier(timeOfDay: number): number {
+  const t = ((timeOfDay % 1) + 1) % 1; // normalize into [0,1)
+  const morning = wrappedGaussian(t, MORNING_PEAK, PEAK_SIGMA);
+  const evening = wrappedGaussian(t, EVENING_PEAK, PEAK_SIGMA);
+  const peakBoost = PEAK_BUMP * Math.max(morning, evening);
+  const night = wrappedGaussian(t, NIGHT_CENTER, NIGHT_SIGMA);
+  const nightDip = NIGHT_DIP * night;
+  // Peaks and night dip are mutually exclusive in practice (far apart on the ring) — combine
+  // additively and clamp to a sane floor so nothing ever reaches/crosses zero.
+  return Math.max(0.15, 1 + peakBoost - nightDip);
+}
+
 interface Car {
   id: number;
   route: Lane[];
@@ -111,6 +156,17 @@ export class TrafficSim {
   private spawnTimer = 0;
   private junctionLocks = new Map<number, number>(); // nodeId -> carId holding the lock
 
+  // Task 32: settlement positions accumulated from growth:spawn (houses/buildings only), used to
+  // build a per-node weight map for trip-endpoint selection. Recompute is throttled the same way
+  // GrowthSim throttles its own road-distance recompute.
+  private houses: Array<{ x: number; z: number }> = [];
+  private buildings: Array<{ x: number; z: number }> = [];
+  private nodeWeights = new Map<number, number>();
+  private totalWeight = 0;
+  private simTime = 0;
+  private lastWeightRecomputeAt = -Infinity;
+  private weightRecomputePending = true; // compute once up front even with no settlements yet
+
   constructor(
     private graph: RoadGraph,
     bus: EventBus,
@@ -118,6 +174,12 @@ export class TrafficSim {
   ) {
     this.lg = buildLaneGraph(this.graph);
     bus.on('roads:changed', () => this.onRoadsChanged());
+    bus.on('growth:spawn', (e) => {
+      if (e.kind === 'house') this.houses.push({ x: e.x, z: e.z });
+      else if (e.kind === 'building') this.buildings.push({ x: e.x, z: e.z });
+      else return;
+      this.weightRecomputePending = true;
+    });
   }
 
   private onRoadsChanged(): void {
@@ -129,6 +191,28 @@ export class TrafficSim {
       if (!stillValid) this.releaseLock(c);
       return stillValid;
     });
+    // Nodes changed — the weight map keys (node ids) may now be stale/incomplete; recompute on
+    // the same throttle as growth-driven recomputes.
+    this.weightRecomputePending = true;
+  }
+
+  /** Recomputes `nodeWeights`/`totalWeight` from current node positions + settlement records. */
+  private recomputeWeights(): void {
+    this.nodeWeights.clear();
+    this.totalWeight = 0;
+    for (const [nodeId, pos] of this.lg.nodePos) {
+      let housesNear = 0;
+      let buildingsNear = 0;
+      for (const h of this.houses) {
+        if (Math.hypot(h.x - pos.x, h.z - pos.z) <= SETTLEMENT_SEARCH_RADIUS) housesNear++;
+      }
+      for (const b of this.buildings) {
+        if (Math.hypot(b.x - pos.x, b.z - pos.z) <= SETTLEMENT_SEARCH_RADIUS) buildingsNear++;
+      }
+      const weight = BASE_NODE_WEIGHT + HOUSE_WEIGHT * housesNear + BUILDING_WEIGHT * buildingsNear;
+      this.nodeWeights.set(nodeId, weight);
+      this.totalWeight += weight;
+    }
   }
 
   private releaseLock(c: Car): void {
@@ -138,13 +222,38 @@ export class TrafficSim {
     }
   }
 
+  /**
+   * Draws one node id. Weighted by `nodeWeights` when a settlement exists (totalWeight > 0);
+   * uniform fallback otherwise (no settlement yet, or a degenerate all-zero weight map).
+   */
+  private drawNode(nodeIds: number[]): number {
+    if (this.totalWeight <= 0) {
+      return nodeIds[Math.floor(this.rng() * nodeIds.length)];
+    }
+    let r = this.rng() * this.totalWeight;
+    for (const id of nodeIds) {
+      const w = this.nodeWeights.get(id) ?? BASE_NODE_WEIGHT;
+      r -= w;
+      if (r <= 0) return id;
+    }
+    // Floating-point fallthrough (r ends up just barely positive) — return the last node.
+    return nodeIds[nodeIds.length - 1];
+  }
+
   private pickSpawnPair(): { from: number; to: number; route: Lane[] } | null {
+    if (this.weightRecomputePending && this.simTime - this.lastWeightRecomputeAt >= WEIGHT_RECOMPUTE_INTERVAL) {
+      this.recomputeWeights();
+      this.lastWeightRecomputeAt = this.simTime;
+      this.weightRecomputePending = false;
+    }
+
     const nodeIds = [...this.lg.nodePos.keys()];
     if (nodeIds.length < 2) return null;
-    // Bounded attempts to find a distinct pair with a valid route.
+    // Bounded attempts to find a distinct, routable pair. Origin and destination are drawn
+    // independently (each its own weighted draw) — still require distinct + routable.
     for (let attempt = 0; attempt < 20; attempt++) {
-      const from = nodeIds[Math.floor(this.rng() * nodeIds.length)];
-      const to = nodeIds[Math.floor(this.rng() * nodeIds.length)];
+      const from = this.drawNode(nodeIds);
+      const to = this.drawNode(nodeIds);
       if (from === to) continue;
       const route = findRoute(this.lg, from, to);
       if (route && route.length > 0) return { from, to, route };
@@ -202,10 +311,19 @@ export class TrafficSim {
     return GAP_SPEED_CAP * u;
   }
 
-  update(dt: number): void {
+  /**
+   * Advances the sim by `dt` seconds. `timeOfDay` (0..1, render-side Atmosphere state) drives the
+   * commute-pulse spawn-rate multiplier — the sim itself stays a pure function of its inputs
+   * (no wall-clock reads), so passing the same `dt`/`timeOfDay` sequence twice is deterministic.
+   * Defaults to a neutral timeOfDay (no pulse) for callers/tests that don't care about commute
+   * timing.
+   */
+  update(dt: number, timeOfDay = 0): void {
+    this.simTime += dt;
+    const effectiveInterval = SPAWN_INTERVAL / commuteRateMultiplier(timeOfDay);
     this.spawnTimer += dt;
-    while (this.spawnTimer >= SPAWN_INTERVAL) {
-      this.spawnTimer -= SPAWN_INTERVAL;
+    while (this.spawnTimer >= effectiveInterval) {
+      this.spawnTimer -= effectiveInterval;
       this.trySpawn();
     }
 

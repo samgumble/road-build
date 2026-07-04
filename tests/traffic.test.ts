@@ -27,6 +27,22 @@ function world() {
   return { bus, g, sim };
 }
 
+/**
+ * A network with several distinct nodes to draw endpoints from: a straight chain plus a branch,
+ * split into multiple node-bearing segments so `pickSpawnPair` has more than 2 candidates and a
+ * weighted draw toward one cluster is statistically distinguishable from uniform.
+ */
+function multiNodeWorld() {
+  const bus = new EventBus();
+  const g = new RoadGraph(bus, flatSampler);
+  g.commitChain([{ x: 0, z: 0 }, { x: 50, z: 0 }, { x: 100, z: 0 }, { x: 150, z: 0 }, { x: 200, z: 0 }]);
+  g.commitChain([{ x: 100, z: 0 }, { x: 100, z: 100 }, { x: 100, z: 200 }]);
+  for (const e of g.edges.values()) e.stage = 'painted';
+  bus.emit('roads:changed', {});
+  const sim = new TrafficSim(g, bus, createRng('traffic'));
+  return { bus, g, sim };
+}
+
 describe('TrafficSim', () => {
   it('spawns cars up to targetPopulation and moves them', () => {
     const { sim } = world();
@@ -62,5 +78,90 @@ describe('TrafficSim', () => {
     for (const id of [...g.edges.keys()]) g.removeEdge(id);
     sim.update(1 / 60);
     expect(sim.cars.length).toBe(0);
+  });
+
+  it('weights spawn endpoints toward nodes near clustered houses (statistical, seeded)', () => {
+    const { bus, g, sim } = multiNodeWorld();
+    // Cluster several houses near the far end of the branch (the last-committed node) and none
+    // near any other node, so that node's weight should dominate the draw.
+    const nodesBefore = [...g.nodes.values()];
+    const targetNode = nodesBefore.reduce((a, b) => (b.z > a.z ? b : a));
+    for (let k = 0; k < 6; k++) {
+      bus.emit('growth:spawn', { kind: 'house', x: targetNode.x + k * 0.5, z: targetNode.z - 2 + k * 0.5, rot: 0 });
+    }
+    // Throttled recompute mirrors GrowthSim's pattern — advance sim time past the throttle window.
+    sim.update(2.1, 0.5);
+
+    const targetNodeId = targetNode.id;
+
+    let hitsAtTarget = 0;
+    let totalDraws = 0;
+    const nodeCount = g.nodes.size;
+    for (let i = 0; i < 2000; i++) {
+      const picked = (sim as any).pickSpawnPair();
+      if (!picked) continue;
+      totalDraws++;
+      if (picked.from === targetNodeId || picked.to === targetNodeId) hitsAtTarget++;
+    }
+    expect(totalDraws).toBeGreaterThan(0);
+    const observedRate = hitsAtTarget / totalDraws;
+    // Uniform baseline: each draw picks 2 of nodeCount nodes, so P(hit target) ~ 2/nodeCount.
+    const uniformRate = 2 / nodeCount;
+    expect(observedRate).toBeGreaterThan(uniformRate * 1.5);
+  });
+
+  it('falls back to uniform-like behavior with no settlements yet', () => {
+    const { sim } = multiNodeWorld();
+    // No growth:spawn events emitted — weight map should be empty/zero everywhere, so pickSpawnPair
+    // still succeeds (uniform fallback) rather than always returning null.
+    let successes = 0;
+    for (let i = 0; i < 200; i++) {
+      const picked = (sim as any).pickSpawnPair();
+      if (picked) successes++;
+    }
+    expect(successes).toBeGreaterThan(0);
+  });
+
+  it('spawns cars at a lower rate at deep night than during a commute peak', () => {
+    const { sim: daySim } = multiNodeWorld();
+    daySim.targetPopulation = 1000; // effectively uncapped so rate is spawn-timer-bound, not population-bound
+    let daySpawns = 0;
+    for (let i = 0; i < 60 * 60; i++) {
+      const before = (daySim as any).cs.length;
+      daySim.update(1 / 60, 0.3); // morning commute peak
+      const after = (daySim as any).cs.length;
+      if (after > before) daySpawns++;
+    }
+
+    const { sim: nightSim } = multiNodeWorld();
+    nightSim.targetPopulation = 1000;
+    let nightSpawns = 0;
+    for (let i = 0; i < 60 * 60; i++) {
+      const before = (nightSim as any).cs.length;
+      nightSim.update(1 / 60, 0.95); // deep night
+      const after = (nightSim as any).cs.length;
+      if (after > before) nightSpawns++;
+    }
+
+    expect(nightSpawns).toBeLessThan(daySpawns);
+  });
+
+  it('is deterministic across two independent runs with the same seed and inputs', () => {
+    function run() {
+      const { bus, sim } = multiNodeWorld();
+      for (let k = 0; k < 4; k++) {
+        bus.emit('growth:spawn', { kind: 'house', x: 100 + k, z: 198, rot: 0 });
+      }
+      const timeOfDays = [0.1, 0.3, 0.5, 0.75, 0.95];
+      const positions: Array<{ x: number; z: number }> = [];
+      for (let i = 0; i < 60 * 30; i++) {
+        sim.update(1 / 60, timeOfDays[i % timeOfDays.length]);
+        for (const c of sim.cars) positions.push({ x: c.pos.x, z: c.pos.z });
+      }
+      return positions;
+    }
+    const a = run();
+    const b = run();
+    expect(a).toEqual(b);
   });
 });
