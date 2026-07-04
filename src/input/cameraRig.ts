@@ -10,6 +10,14 @@ const MAX_RADIUS = 620;
 const MIN_POLAR = 0.15; // near-vertical guard (radians from +Y)
 const MAX_POLAR = Math.PI / 2 - 0.02; // don't go below horizon
 
+// Task 29 (mobile): two-finger gesture tuning. Pan speed reuses the same goalRadius-scaled factor
+// as the mouse MMB pan (panByScreenDelta) so the two feel consistent at any zoom level. Pinch and
+// twist are read from the two touch pointers' centroid/distance/angle deltas frame-to-frame (via
+// pointer events, not TouchEvent — this app already standardized on pointer events for mouse, so
+// touch gestures are built the same way rather than introducing a second input API).
+const PINCH_ZOOM_SENSITIVITY = 1.0; // multiplies the inverse distance-ratio applied to goalRadius
+const TWIST_ORBIT_SENSITIVITY = 1.0; // radians of azimuth per radian of measured twist
+
 export class CameraRig {
   target = new THREE.Vector3(0, 0, 0);
   idle = false;
@@ -34,6 +42,16 @@ export class CameraRig {
   private lastX = 0;
   private lastY = 0;
 
+  // Task 29: active touch pointers (pointerType === 'touch' only), keyed by pointerId. Mouse/pen
+  // input never enters this map, so every desktop path above is completely unaffected.
+  private touches = new Map<number, { x: number; y: number }>();
+  private twoFingerLastCenter: { x: number; y: number } | null = null;
+  private twoFingerLastDist = 0;
+  private twoFingerLastAngle = 0;
+  /** Set by main.ts to let DrawTool know a two-finger gesture just started, so it can cancel any
+   * in-progress single-finger draw chain cleanly (reuses the pointercancel path). */
+  onTwoFingerStart: (() => void) | null = null;
+
   private disposers: Array<() => void> = [];
 
   constructor(private camera: THREE.PerspectiveCamera, private domElement: HTMLElement) {
@@ -54,6 +72,21 @@ export class CameraRig {
 
     const onPointerDown = (e: PointerEvent) => {
       this.registerInput();
+
+      // Task 29 (mobile): touch pointers never drive the RMB/MMB paths above (touch has no
+      // `button` semantics the way mouse does — DrawTool owns single-finger touch for
+      // drawing/demolish). Track every touch pointer here purely to recognize a *second* finger
+      // landing, which starts a two-finger camera gesture and cedes control away from DrawTool.
+      if (e.pointerType === 'touch') {
+        this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (this.touches.size === 2) {
+          el.setPointerCapture(e.pointerId);
+          this.beginTwoFingerGesture();
+          this.onTwoFingerStart?.();
+        }
+        return;
+      }
+
       if (e.button === 2) {
         this.rightDown = true;
         this.lastX = e.clientX;
@@ -70,6 +103,14 @@ export class CameraRig {
     };
 
     const onPointerMove = (e: PointerEvent) => {
+      if (e.pointerType === 'touch') {
+        if (!this.touches.has(e.pointerId)) return;
+        this.registerInput();
+        this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (this.touches.size >= 2) this.updateTwoFingerGesture();
+        return;
+      }
+
       if (!this.rightDown && !this.middleDown) return;
       this.registerInput();
       const dx = e.clientX - this.lastX;
@@ -86,9 +127,22 @@ export class CameraRig {
     };
 
     const onPointerUp = (e: PointerEvent) => {
+      if (e.pointerType === 'touch') {
+        this.touches.delete(e.pointerId);
+        if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+        if (this.touches.size < 2) this.twoFingerLastCenter = null;
+        return;
+      }
+
       if (e.button === 2) this.rightDown = false;
       if (e.button === 1) this.middleDown = false;
       if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+    };
+
+    const onPointerCancel = (e: PointerEvent) => {
+      if (e.pointerType !== 'touch') return;
+      this.touches.delete(e.pointerId);
+      this.twoFingerLastCenter = null;
     };
 
     const onWheel = (e: WheelEvent) => {
@@ -128,6 +182,7 @@ export class CameraRig {
     el.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerCancel);
     el.addEventListener('wheel', onWheel, { passive: false });
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
@@ -137,6 +192,7 @@ export class CameraRig {
       () => el.removeEventListener('pointerdown', onPointerDown),
       () => window.removeEventListener('pointermove', onPointerMove),
       () => window.removeEventListener('pointerup', onPointerUp),
+      () => window.removeEventListener('pointercancel', onPointerCancel),
       () => el.removeEventListener('wheel', onWheel),
       () => window.removeEventListener('keydown', onKeyDown),
       () => window.removeEventListener('keyup', onKeyUp),
@@ -158,6 +214,60 @@ export class CameraRig {
     const right = new THREE.Vector3(forward.z, 0, -forward.x);
     this.goalTarget.addScaledVector(right, -dx * panSpeed);
     this.goalTarget.addScaledVector(forward, dy * panSpeed);
+  }
+
+  /**
+   * Task 29 (mobile): two-finger touch gesture recognition, combining pan/pinch/twist into one
+   * frame-to-frame delta the same way desktop combines MMB-pan + wheel-dolly + RMB-orbit, just
+   * driven by the two active touch pointers' centroid/distance/angle instead of separate mouse
+   * buttons. `this.touches` only ever contains `pointerType === 'touch'` entries (see onPointerDown
+   * above), so this never runs for mouse/pen input.
+   */
+  private twoFingerPoints(): [{ x: number; y: number }, { x: number; y: number }] {
+    const pts = [...this.touches.values()];
+    return [pts[0], pts[1]];
+  }
+
+  private beginTwoFingerGesture(): void {
+    const [a, b] = this.twoFingerPoints();
+    this.twoFingerLastCenter = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    this.twoFingerLastDist = Math.hypot(b.x - a.x, b.y - a.y);
+    this.twoFingerLastAngle = Math.atan2(b.y - a.y, b.x - a.x);
+  }
+
+  private updateTwoFingerGesture(): void {
+    const [a, b] = this.twoFingerPoints();
+    const center = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    const dist = Math.hypot(b.x - a.x, b.y - a.y);
+    const angle = Math.atan2(b.y - a.y, b.x - a.x);
+
+    if (!this.twoFingerLastCenter) {
+      this.twoFingerLastCenter = center;
+      this.twoFingerLastDist = dist;
+      this.twoFingerLastAngle = angle;
+      return;
+    }
+
+    // Pan: centroid screen-space delta, same treatment as MMB pan.
+    const dx = center.x - this.twoFingerLastCenter.x;
+    const dy = center.y - this.twoFingerLastCenter.y;
+    if (dx !== 0 || dy !== 0) this.panByScreenDelta(dx, dy);
+
+    // Pinch: distance ratio drives the dolly, inverted (fingers spreading = zoom in = smaller
+    // radius) — same clamp range as the wheel dolly.
+    if (this.twoFingerLastDist > 1e-3 && dist > 1e-3) {
+      const factor = (this.twoFingerLastDist / dist) * PINCH_ZOOM_SENSITIVITY + (1 - PINCH_ZOOM_SENSITIVITY);
+      this.goalRadius = THREE.MathUtils.clamp(this.goalRadius * factor, MIN_RADIUS, MAX_RADIUS);
+    }
+
+    // Twist: change in the finger-pair's angle drives azimuth orbit, mirroring RMB drag's yaw.
+    let deltaAngle = angle - this.twoFingerLastAngle;
+    deltaAngle = Math.atan2(Math.sin(deltaAngle), Math.cos(deltaAngle));
+    this.goalAzimuth -= deltaAngle * TWIST_ORBIT_SENSITIVITY;
+
+    this.twoFingerLastCenter = center;
+    this.twoFingerLastDist = dist;
+    this.twoFingerLastAngle = angle;
   }
 
   private pointerToNdc(clientX: number, clientY: number): THREE.Vector2 {

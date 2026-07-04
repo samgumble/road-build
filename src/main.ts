@@ -143,14 +143,24 @@ function main(): void {
 
   const audio = new AmbientAudio(bus);
   // Autoplay policy: the AudioContext can only be created from a user gesture, so we build it
-  // lazily on the first pointerdown anywhere on the canvas and never again.
+  // lazily on the first qualifying gesture and never again (`start()` no-ops on repeat calls).
+  // Task 29 (iOS quirk): pointerdown alone doesn't reliably count as a user-activation gesture on
+  // iOS Safari in every version/context, and touch input's pointerdown-then-pointerup sequence
+  // means touchend is a safe second trigger to also listen for — both are {once:true} and
+  // AmbientAudio.start() is itself idempotent, so whichever fires first wins and the other is inert.
   canvas.addEventListener('pointerdown', () => audio.start(), { once: true });
+  canvas.addEventListener('touchend', () => audio.start(), { once: true });
 
   // Draw tool owns LMB (survey preview + stakes + commit, demolish-click); `drawTool.mode` is
   // flipped between 'draw' / 'demolish' / 'none' by the HUD toolbar below.
   const drawTool = new DrawTool(canvas, camera, terrain.mesh, graph, hf, scene, (edgeId) =>
     buildQueue.enqueueDemolish(edgeId),
   );
+
+  // Task 29 (mobile): the instant a second finger lands, CameraRig starts a two-finger gesture and
+  // DrawTool must cede cleanly — cancel any in-progress single-finger draw chain via the same path
+  // pointercancel already uses, rather than letting the second touch corrupt the chain.
+  cameraRig.onTwoFingerStart = () => drawTool.cancelActiveDrag();
 
   let lastFrameTime = performance.now();
   let populationTimer = 0;

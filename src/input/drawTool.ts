@@ -128,6 +128,12 @@ export class DrawTool {
   private chain: P2[] = [];
   private chainValid = false;
 
+  // Task 29 (mobile): tracks active touch pointer ids on this element so a second finger landing
+  // mid-draw can be recognized and the in-progress chain cancelled cleanly (reusing the
+  // pointercancel path) rather than treating the second touch as a draw continuation. Mouse/pen
+  // pointers never enter this set.
+  private activeTouchIds = new Set<number>();
+
   // preview scene objects (drawing)
   private previewGroup: THREE.Group;
   private previewLine: THREE.Line | null = null;
@@ -198,6 +204,19 @@ export class DrawTool {
     const el = this.dom;
 
     const onPointerDown = (e: PointerEvent) => {
+      // Task 29 (mobile): touch contacts are never distinguished by `button` the way mouse buttons
+      // are — every simultaneous touch reports `button === 0`. Track each touch pointer that lands
+      // on the canvas; a *second* finger landing mid-draw must cancel the in-progress chain and
+      // cede to CameraRig's two-finger gesture rather than being treated as a second draw start or
+      // silently ignored while corrupting `this.dragging`'s single-pointer assumption.
+      if (e.pointerType === 'touch') {
+        this.activeTouchIds.add(e.pointerId);
+        if (this.activeTouchIds.size >= 2) {
+          this.cancelActiveDrag();
+          return;
+        }
+      }
+
       if (e.button !== 0) return; // LMB only; never touch RMB/MMB
       if (this.mode === 'none') return;
 
@@ -222,6 +241,11 @@ export class DrawTool {
     };
 
     const onPointerMove = (e: PointerEvent) => {
+      // A second touch is already down — camera gestures own input until fingers lift (see
+      // onPointerDown above, which already cancelled any in-progress draw when the 2nd finger
+      // landed). Ignore hover/draw updates from either finger while this holds.
+      if (e.pointerType === 'touch' && this.activeTouchIds.size >= 2) return;
+
       if (this.mode === 'demolish' && !this.dragging) {
         this.updateDemolishHover(e.clientX, e.clientY);
         return;
@@ -243,8 +267,10 @@ export class DrawTool {
     };
 
     const onPointerUp = (e: PointerEvent) => {
+      if (e.pointerType === 'touch') this.activeTouchIds.delete(e.pointerId);
       if (e.button !== 0) return;
       if (!this.dragging) return;
+      if (this.pointerId !== e.pointerId) return;
       this.dragging = false;
       if (this.pointerId !== null && el.hasPointerCapture(this.pointerId)) {
         el.releasePointerCapture(this.pointerId);
@@ -272,23 +298,9 @@ export class DrawTool {
     // Browser/OS can cancel a drag mid-flight (e.g. touch gesture reinterpreted, pen leaving
     // range, window losing focus). Abort cleanly: release capture, reset chain state, and fade
     // out the in-progress preview exactly like an invalid pointerup would.
-    const onPointerCancel = () => {
-      if (!this.dragging) return;
-      this.dragging = false;
-      if (this.pointerId !== null) {
-        try {
-          if (el.hasPointerCapture(this.pointerId)) {
-            el.releasePointerCapture(this.pointerId);
-          }
-        } catch {
-          // pointer capture already released/invalid — nothing to clean up
-        }
-      }
-      this.pointerId = null;
-      this.chainValid = false;
-      this.startFade();
-      this.chain = [];
-      this.hoverRing.visible = false;
+    const onPointerCancel = (e: PointerEvent) => {
+      if (e.pointerType === 'touch') this.activeTouchIds.delete(e.pointerId);
+      this.cancelActiveDrag();
     };
 
     el.addEventListener('pointerdown', onPointerDown);
@@ -377,6 +389,32 @@ export class DrawTool {
     if (!found) return;
     this.demolish(found.edgeId);
     this.hoverVisible = false;
+    this.hoverRing.visible = false;
+  }
+
+  /**
+   * Cancels any in-progress draw chain cleanly — same effect as a browser/OS pointercancel
+   * (release capture, drop the chain, fade the rejected preview). Public so CameraRig can call it
+   * directly (via `onTwoFingerStart`, wired in main.ts) the instant a second finger lands,
+   * cleanly ceding control to the two-finger camera gesture (Task 29). No-ops if nothing is
+   * dragging.
+   */
+  cancelActiveDrag(): void {
+    if (!this.dragging) return;
+    this.dragging = false;
+    if (this.pointerId !== null) {
+      try {
+        if (this.dom.hasPointerCapture(this.pointerId)) {
+          this.dom.releasePointerCapture(this.pointerId);
+        }
+      } catch {
+        // pointer capture already released/invalid — nothing to clean up
+      }
+    }
+    this.pointerId = null;
+    this.chainValid = false;
+    this.startFade();
+    this.chain = [];
     this.hoverRing.visible = false;
   }
 
