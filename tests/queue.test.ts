@@ -856,4 +856,45 @@ describe('BuildQueue', () => {
       expect(vehiclesSeen.has('surveyor')).toBe(false);
     });
   });
+
+  describe('closed loops (Task 41)', () => {
+    /** Finds an anchor whose full `span`x`span` square (all 4 corners + edges roughly) sits on
+     * land, so a closed-loop chain around it is valid per `validateChain`'s land-endpoint check
+     * and doesn't hit water mid-loop. */
+    function findLoopAnchor(hf: Heightfield, span: number): { x: number; z: number } {
+      outer: for (let x = -160; x <= 160 - span; x += 8) {
+        for (let z = -160; z <= 160 - span; z += 8) {
+          const corners = [
+            [x, z], [x + span, z], [x + span, z + span], [x, z + span],
+          ];
+          if (corners.every(([cx, cz]) => hf.isLand(cx, cz))) return { x, z };
+        }
+      }
+      throw new Error('no loop anchor found');
+    }
+
+    it('a closed-loop chain commits as two edges and the queue builds BOTH halves to painted', () => {
+      const bus = new EventBus();
+      const hf = new Heightfield('q-test-loop', bus);
+      const graph = new RoadGraph(bus, makeSampler(hf));
+      const queue = new BuildQueue(graph, hf, bus);
+      const a = findLoopAnchor(hf, 32);
+
+      const ids = graph.commitChain([
+        { x: a.x, z: a.z },
+        { x: a.x + 32, z: a.z },
+        { x: a.x + 32, z: a.z + 32 },
+        { x: a.x, z: a.z + 32 },
+        { x: a.x, z: a.z },
+      ]);
+      expect(ids).toHaveLength(2);
+
+      run(queue, 180); // both halves' crews build to painted (may not run concurrently if only shared crews)
+
+      for (const id of ids) {
+        expect(graph.edges.get(id)!.stage).toBe('painted');
+      }
+      expect(queue.busy).toBe(false);
+    });
+  });
 });

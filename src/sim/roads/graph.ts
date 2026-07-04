@@ -119,7 +119,26 @@ export class RoadGraph {
       const sub = ctrl.slice(cuts[c], cuts[c + 1] + 1);
       const a = this.addNode(sub[0]);
       const b = this.addNode(sub[sub.length - 1]);
-      if (a === b) continue;
+      if (a === b) {
+        // Closed chain (T41 "closed-loop roads"): a stroke that returns to its own start snaps
+        // onto the same node at both ends (T18's magnetSnap onto the start stake makes this the
+        // common case, not a rare one) — the old behavior silently discarded the whole sub-chain
+        // here, which is exactly the "can't complete a loop" bug. Commit it as TWO half-loop edges
+        // instead: split `sub` at the control point nearest half its total arclength, mint a
+        // midpoint node there, and wire edges start->mid and mid->start. Both halves then behave
+        // as perfectly normal edges (own construction job, own lanes both directions, own
+        // rendering) — nothing downstream needs to know the road happens to form a ring.
+        const halfIds = this.commitClosedLoop(sub, a);
+        for (const id of halfIds) {
+          ids.push(id);
+          this.bus.emit('roads:edgeAdded', { edgeId: id });
+        }
+        // Degenerate loop (commitClosedLoop bailed): if `a` was a brand-new node minted just now
+        // by the addNode(sub[0]) call above (i.e. it's still edgeless), prune it rather than
+        // leaving an orphan node with nothing attached — mirrors removeEdge's own orphan cleanup.
+        if (halfIds.length === 0 && this.edgesAtNode(a).length === 0) this.pruneOrphanNode(a);
+        continue;
+      }
       if (sub.length === 2 && this.hasEdgeBetween(a, b)) continue;
       const id = this.makeEdge(a, b, sub, 'surveyed');
       ids.push(id);
@@ -129,20 +148,78 @@ export class RoadGraph {
     return ids;
   }
 
+  /**
+   * Splits a closed sub-chain (`sub[0]` and `sub[last]` are the same snapped point, already
+   * resolved to node `startNode`) into two half-loop edges sharing a new midpoint node. Returns
+   * the committed edge ids, or `[]` if the loop is degenerate (see below) — callers must not
+   * assume a non-empty result.
+   *
+   * Split point: the interior control-point index nearest half the chain's total arclength
+   * (measured along `sub`'s own control points, not the sampled/curved path — cheap, deterministic,
+   * and plenty accurate for choosing a topological split point).
+   *
+   * Degenerate cases deliberately left as a no-op (matching the old flat `if (a === b) continue`
+   * for anything that still can't form a real loop):
+   *  - fewer than 3 DISTINCT control points (e.g. an immediate there-and-back double-tap) — there's
+   *    no interior point to split at, so this is exactly as degenerate as any other zero-length
+   *    chain and stays skipped.
+   *  - a split point that would leave either half with fewer than 3 control points (2 = just the
+   *    two endpoint nodes, no interior point at all). `hasEdgeBetween`'s interior-less dedupe
+   *    exists precisely to reject a second edge like that between the same two nodes, so rather
+   *    than fight it, treat the whole loop as too small to safely halve and skip it entirely.
+   */
+  private commitClosedLoop(sub: P2[], startNode: number): number[] {
+    // sub[0] === sub[last] (same snapped point) — distinct points are sub[0..last-1].
+    const distinct = sub.slice(0, sub.length - 1);
+    if (distinct.length < 3) return [];
+
+    const legLen: number[] = [0];
+    for (let i = 1; i < sub.length; i++) {
+      legLen.push(legLen[i - 1] + Math.hypot(sub[i].x - sub[i - 1].x, sub[i].z - sub[i - 1].z));
+    }
+    const total = legLen[legLen.length - 1];
+    const half = total / 2;
+
+    // Candidate split indices: interior points only (1..sub.length-2) so both halves keep the
+    // shared start/end point plus at least one interior point of their own.
+    let splitIndex = -1;
+    let bestDelta = Infinity;
+    for (let i = 1; i < sub.length - 1; i++) {
+      const delta = Math.abs(legLen[i] - half);
+      if (delta < bestDelta) { bestDelta = delta; splitIndex = i; }
+    }
+    if (splitIndex < 0) return [];
+
+    const firstHalf = sub.slice(0, splitIndex + 1); // start .. mid
+    const secondHalf = sub.slice(splitIndex); // mid .. start
+    if (firstHalf.length < 3 || secondHalf.length < 3) return []; // would produce an interior-less half
+
+    const midNode = this.addNode(sub[splitIndex]);
+    const idA = this.makeEdge(startNode, midNode, firstHalf, 'surveyed');
+    const idB = this.makeEdge(midNode, startNode, secondHalf, 'surveyed');
+    return [idA, idB];
+  }
+
   removeEdge(edgeId: number): void {
     const e = this.edges.get(edgeId);
     if (!e) return;
     this.unindexEdge(e);
     this.edges.delete(edgeId);
     for (const nid of [e.a, e.b]) {
-      if (this.edgesAtNode(nid).length === 0) {
-        const n = this.nodes.get(nid)!;
-        this.points.delete(key({ x: n.x, z: n.z }));
-        this.nodes.delete(nid);
-      }
+      if (this.edgesAtNode(nid).length === 0) this.pruneOrphanNode(nid);
     }
     this.bus.emit('roads:edgeRemoved', { edgeId });
     this.bus.emit('roads:changed', {});
+  }
+
+  /** Removes a node with no attached edges from both `nodes` and the `points` index. Caller must
+   * have already verified `edgesAtNode(nodeId).length === 0` — shared by `removeEdge`'s orphan
+   * cleanup and `commitChain`'s degenerate-closed-loop bail-out. */
+  private pruneOrphanNode(nodeId: number): void {
+    const n = this.nodes.get(nodeId);
+    if (!n) return;
+    this.points.delete(key({ x: n.x, z: n.z }));
+    this.nodes.delete(nodeId);
   }
 
   private hasEdgeBetween(a: number, b: number): boolean {

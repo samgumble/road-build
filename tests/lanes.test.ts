@@ -53,4 +53,52 @@ describe('lane graph', () => {
     const total = route.reduce((s, l) => s + l.length, 0);
     expect(total).toBeLessThan(200); // took a 2-edge leg (~128u), not a silly loop
   });
+
+  describe('closed loops (Task 41)', () => {
+    function loopGraph(): RoadGraph {
+      const g = new RoadGraph(new EventBus(), flatSampler);
+      g.commitChain([
+        { x: 0, z: 0 }, { x: 32, z: 0 }, { x: 32, z: 32 }, { x: 0, z: 32 }, { x: 0, z: 0 },
+      ]);
+      for (const e of g.edges.values()) e.stage = 'painted';
+      return g;
+    }
+
+    it('builds 4 lanes (2 per half-loop edge) once both halves are painted', () => {
+      const g = loopGraph();
+      expect(g.edges.size).toBe(2);
+      const lg = buildLaneGraph(g);
+      expect(lg.lanes.size).toBe(4);
+    });
+
+    it('findRoute reaches the midpoint node going either direction around the loop', () => {
+      const g = loopGraph();
+      const lg = buildLaneGraph(g);
+      const start = [...g.nodes.values()].find((n) => n.x === 0 && n.z === 0)!.id;
+      const [e1, e2] = [...g.edges.values()];
+      const midNode = e1.a === start ? e1.b : e1.a;
+      // sanity: e2 also touches start and the same midpoint (it's the other half of the ring)
+      expect([e2.a, e2.b]).toContain(start);
+      expect([e2.a, e2.b]).toContain(midNode);
+
+      const route = findRoute(lg, start, midNode);
+      expect(route).not.toBeNull();
+      expect(route!.length).toBeGreaterThan(0);
+      expect(route![0].from).toBe(start);
+      expect(route![route!.length - 1].to).toBe(midNode);
+
+      // The route can only have taken ONE of the two edges (whichever the A* found shorter/first);
+      // confirm a route also exists using the OTHER edge by excluding the one just used and
+      // checking a route still reaches the midpoint via the remaining lanes (proves both halves
+      // are independently traversable, i.e. you can go around the loop either way).
+      const usedEdgeIds = new Set(route!.map((l) => l.edgeId));
+      const otherEdge = [...g.edges.values()].find((e) => !usedEdgeIds.has(e.id))!;
+      expect(otherEdge).toBeDefined();
+      // the other edge's lanes exist and connect start<->midNode directly too
+      const otherLanes = [...lg.lanes.values()].filter((l) => l.edgeId === otherEdge.id);
+      expect(otherLanes.length).toBe(2);
+      expect(otherLanes.some((l) => l.from === start && l.to === midNode)).toBe(true);
+      expect(otherLanes.some((l) => l.from === midNode && l.to === start)).toBe(true);
+    });
+  });
 });
