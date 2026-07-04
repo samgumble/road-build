@@ -94,4 +94,51 @@ describe('ConstructionRenderer convoy (Task 36)', () => {
     expect(graph.edges.get(edgeId)!.stage).toBe('painted');
     expect(sawExcavator).toBe(false);
   });
+
+  /** Task 46 (Groundwork stutter fix) regression: the 'truck' vehicle kind is shared across three
+   * roles that can all be live on the SAME crew at once in a concurrent-front train job — an idle
+   * anchor beside the excavator during 'graded' (possibly mid-shuttle, see updateTruckShuttle),
+   * the real hauling vehicle during 'gravel' (onProgress's generic handler), and the paver-dock
+   * anchor during 'paved'. Before this fix, a real 'gravel' or 'paved' progress event for this
+   * crew's later front would unconditionally overwrite the shuttling truck's targetPos — mid-flight
+   * — via onProgress's generic handler / the 'paved' branch, fighting updateTruckShuttle's own
+   * targetPos writes every single sim tick. Since stepVehicle's damping can only ever move curPos a
+   * FRACTION of the way toward whatever targetPos happens to be this frame, and targetPos itself
+   * kept getting reset every tick, curPos never actually converged: even with `targetPos` numerically
+   * unchanged for many consecutive frames (no legitimate reason to move further away), the gap
+   * before the fix kept climbing instead of shrinking. This test asserts the actual invariant that
+   * matters — while `targetPos` holds still for several consecutive frames (the truck isn't mid a
+   * legitimate long "departing"/"returning" drive, whose target can legitimately be ~world-scale
+   * distances away and is crossed while fading in/out), curPos's distance to it must be
+   * NON-INCREASING, i.e. converging, never diverging. */
+  it('the truck vehicle converges (never diverges) toward a held-still target during a concurrent-front train job', () => {
+    const { queue, renderer, edgeId, graph } = buildRig('shuttle-contention-test', 260);
+
+    function truckSnapshot(): { d: number; tx: number; tz: number } | null {
+      const slot = (renderer as unknown as {
+        crews: { states: Map<string, { hasTarget: boolean; curPos: THREE.Vector3; targetPos: THREE.Vector3 }> }[];
+      }).crews[0];
+      const truck = slot.states.get('truck');
+      if (!truck || !truck.hasTarget) return null;
+      return { d: truck.curPos.distanceTo(truck.targetPos), tx: truck.targetPos.x, tz: truck.targetPos.z };
+    }
+
+    const dt = 1 / 60;
+    let prev: { d: number; tx: number; tz: number } | null = null;
+    let worstGrowth = 0; // largest single-frame increase in d while targetPos held still
+    for (let i = 0; i < 150 * 60 && graph.edges.get(edgeId)!.stage !== 'painted'; i++) {
+      queue.update(dt);
+      renderer.update(dt, false);
+      const cur = truckSnapshot();
+      if (cur && prev && cur.tx === prev.tx && cur.tz === prev.tz) {
+        worstGrowth = Math.max(worstGrowth, cur.d - prev.d);
+      }
+      prev = cur;
+    }
+    expect(graph.edges.get(edgeId)!.stage).toBe('painted');
+    // Damping is monotonically convergent by construction (see easing.ts's damp()) whenever the
+    // target holds still, so this should be ~0 (a hair of float slack); the pre-fix bug violated it
+    // by tens of units per frame for as long as the contention lasted.
+    expect(worstGrowth).toBeLessThan(0.01);
+  });
 });

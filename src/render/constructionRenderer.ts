@@ -2345,7 +2345,22 @@ export class ConstructionRenderer {
     if (e.onBreak) slot.lastBreakSeenAt = this.clock;
 
     const state = this.stateFor(e.crew, e.vehicle as Exclude<VehicleKind, 'crane'>);
-    this.applyProgressTarget(state, e.edgeId, new THREE.Vector3(e.pos.x, e.pos.y, e.pos.z), e.heading);
+    // Task 36 concurrent-front pipeline finding (Groundwork stutter, Task 46): the truck kind is
+    // shared across three roles that can all be live on the SAME crew at once — an idle anchor
+    // beside the excavator during 'graded' (may be mid-shuttle, see updateTruckShuttle), the real
+    // hauling vehicle during 'gravel' (THIS generic handler, `e.vehicle === 'truck'`), and the
+    // paver-dock anchor during 'paved' (see the dedicated branch below). Without this gate, a real
+    // 'gravel'-stage progress event (this crew's later front already hauling gravel) would
+    // unconditionally overwrite targetPos here, fighting updateTruckShuttle's own targetPos writes
+    // every sim tick and producing an unbounded tug-of-war — the truck visibly gliding toward the
+    // gravel front's position instead of driving off to "dump" its spoil, worse the more sim ticks
+    // batch into one rendered frame at higher timeScale. Every other vehicle kind has no shuttle
+    // concept, so the gate only applies to 'truck'.
+    if (e.vehicle !== 'truck' || state.shuttlePhase === 'idle') {
+      this.applyProgressTarget(state, e.edgeId, new THREE.Vector3(e.pos.x, e.pos.y, e.pos.z), e.heading);
+    } else {
+      state.currentEdgeId = e.edgeId;
+    }
     slot.lastSeenAt.set(e.vehicle, this.clock);
     state.stage = e.stage;
     state.demolish = e.demolish;
@@ -2449,7 +2464,22 @@ export class ConstructionRenderer {
       const tx = e.pos.x - Math.cos(e.heading) * dockDist;
       const tz = e.pos.z - Math.sin(e.heading) * dockDist;
       const ty = this.hf.heightAt(tx, tz);
-      this.applyProgressTarget(truckState, e.edgeId, new THREE.Vector3(tx, ty, tz), e.heading);
+      // Same shuttlePhase === 'idle' gate as the 'graded' branch above (Task 36 concurrent-front
+      // pipeline finding): a fresh grading front's truck can still be mid-shuttle (departing/away/
+      // returning to "dump" its spoil) on this SAME crew while the paved front is already active
+      // further back along the edge. Without this gate, every paved-stage progress tick called
+      // applyProgressTarget unconditionally, overwriting the shuttling truck's targetPos back to
+      // the paver dock position — fighting updateTruckShuttle's own targetPos writes (see there)
+      // every single sim tick and producing an unbounded tug-of-war (the truck visibly gliding
+      // toward the dock, then snapping back toward its shuttle destination, worse the more sim
+      // ticks batch into one rendered frame at higher timeScale). While not idle, only keep
+      // currentEdgeId in sync so a later real idle sighting on this edge is still treated as the
+      // "same session" rather than a same-kind handoff.
+      if (truckState.shuttlePhase === 'idle') {
+        this.applyProgressTarget(truckState, e.edgeId, new THREE.Vector3(tx, ty, tz), e.heading);
+      } else {
+        truckState.currentEdgeId = e.edgeId;
+      }
       slot.lastSeenAt.set('truck', this.clock);
       truckState.stage = 'paved';
       truckState.demolish = false;
