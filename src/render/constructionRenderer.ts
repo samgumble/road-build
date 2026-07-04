@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { VehicleKind, Stage } from '../core/types';
+import type { VehicleKind, Stage, RoadSample } from '../core/types';
 import { STAGES } from '../core/types';
 import { EventBus } from '../core/events';
 import { RoadGraph } from '../sim/roads/graph';
@@ -1140,70 +1140,137 @@ class StakePool {
 }
 
 const coneDummy = new THREE.Object3D();
-const CONE_COUNT = 6; // fixed instance count: 3 either side of the active work front (must stay even — ConePool splits it in half per side)
-const CONE_OFFSET = 10; // ± units from the work front, per spec
-const CONE_LAMBDA = 6; // position damping as the front advances
+const CONE_SPACING = 14; // target arclength (u) between successive flanking pairs
+const CONE_PERP_OFFSET = ROAD_WIDTH_HALF + 0.8; // ± units from the centerline, per spec
+const CONE_CAP = 48; // per-crew instance budget (Addendum C, Task 27) — 24 pairs max
 
-/** Instanced traffic cones bracketing the active work front (site dressing, Task 21 deliverable
- * 5): a fixed CONE_COUNT set of instances is repositioned each frame (damped) to sit in a small
- * cluster ±CONE_OFFSET ahead/behind the current work-front position, easing to scale 0 when no job
- * is active. One InstancedMesh — one draw call regardless of instance count. */
+/** Instanced traffic cones lining a crew's active job (Addendum C, Task 27): positions are
+ * computed ONCE, when a crew's job starts on a given edge, from that edge's samples — a pair
+ * flanking the roadway (±CONE_PERP_OFFSET) roughly every CONE_SPACING units of arclength, plus one
+ * pair at each end, capped at CONE_CAP (spacing widens if the edge would otherwise need more).
+ * They stay exactly where placed for the whole job (no re-tracking of the moving work front) and
+ * simply fade in/out with the crew's dressing signal. One InstancedMesh — one draw call regardless
+ * of instance count. */
 class ConePool {
   readonly mesh: THREE.InstancedMesh;
-  private readonly curX: Float32Array;
-  private readonly curY: Float32Array;
-  private readonly curZ: Float32Array;
-  private initialized = false;
+  private readonly posX: Float32Array;
+  private readonly posY: Float32Array;
+  private readonly posZ: Float32Array;
+  private liveCount = 0; // how many of CONE_CAP instances are placed for the current job
   private visibility = 0; // eased 0..1
+  private placedEdgeId: number | null = null;
 
   constructor() {
     const geo = new THREE.ConeGeometry(0.28, 0.6, 8);
     geo.translate(0, 0.3, 0);
     const mat = flatMat('#e8641b', '#5a2200');
-    this.mesh = new THREE.InstancedMesh(geo, mat, CONE_COUNT);
-    this.mesh.count = CONE_COUNT;
+    this.mesh = new THREE.InstancedMesh(geo, mat, CONE_CAP);
+    this.mesh.count = CONE_CAP;
     this.mesh.frustumCulled = false;
-    this.curX = new Float32Array(CONE_COUNT);
-    this.curY = new Float32Array(CONE_COUNT);
-    this.curZ = new Float32Array(CONE_COUNT);
+    this.posX = new Float32Array(CONE_CAP);
+    this.posY = new Float32Array(CONE_CAP);
+    this.posZ = new Float32Array(CONE_CAP);
   }
 
-  /** `active` = a job is currently in progress somewhere; `pos`/`heading` = the current work
-   * front. Cones cluster in two rows of three either side of the road, offset along the direction
-   * of travel so they read as bracketing the work rather than sitting on the vehicle's path. */
-  update(dt: number, active: boolean, pos: THREE.Vector3, heading: number): void {
+  /** Computes fixed cone positions along `samples` (an edge's road samples, already elevation- and
+   * bridge-flagged) and uploads them once. Idempotent per edge: callers gate this behind "has this
+   * crew's job just started on a new edge" (see `ConstructionRenderer.onProgress`) so re-placement
+   * never happens mid-job. `hf` supplies ground height for non-bridge samples; bridge samples use
+   * their own deck `y` directly (mirrors the convention elsewhere in this file — see
+   * `nearestSampleBridge`). */
+  place(edgeId: number, samples: RoadSample[], hf: Heightfield): void {
+    this.placedEdgeId = edgeId;
+    if (samples.length < 2) {
+      this.liveCount = 0;
+      return;
+    }
+
+    // Cumulative arclength per sample, so we can walk by distance rather than sample index.
+    const dist = new Float32Array(samples.length);
+    for (let i = 1; i < samples.length; i++) {
+      const a = samples[i - 1], b = samples[i];
+      dist[i] = dist[i - 1] + Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+    }
+    const total = dist[dist.length - 1];
+
+    // Station list: both ends plus evenly-spaced interior stations. Widen spacing (rather than
+    // dropping the end pairs) if the naive ~CONE_SPACING interval would exceed the per-crew cap.
+    const maxPairs = CONE_CAP / 2;
+    let interiorCount = total > 0 ? Math.floor(total / CONE_SPACING) : 0;
+    // +1 for each end station beyond the interior ones (start=0, end=total already implied when
+    // interiorCount counts intervals) — total stations = interiorCount + 1, clamp to the cap.
+    let stationCount = Math.max(2, interiorCount + 1);
+    if (stationCount > maxPairs) stationCount = maxPairs;
+
+    const stations: number[] = [];
+    if (stationCount <= 2) {
+      stations.push(0, total);
+    } else {
+      for (let i = 0; i < stationCount; i++) {
+        stations.push((total * i) / (stationCount - 1));
+      }
+    }
+
+    let idx = 0;
+    let sampleCursor = 0;
+    for (const t of stations) {
+      if (idx >= CONE_CAP) break;
+      // Advance the cursor to the sample bracket containing arclength t.
+      while (sampleCursor < samples.length - 2 && dist[sampleCursor + 1] < t) sampleCursor++;
+      const a = samples[sampleCursor];
+      const b = samples[Math.min(sampleCursor + 1, samples.length - 1)];
+      const segLen = dist[Math.min(sampleCursor + 1, samples.length - 1)] - dist[sampleCursor];
+      const u = segLen > 1e-6 ? clamp01((t - dist[sampleCursor]) / segLen) : 0;
+      const x = a.x + (b.x - a.x) * u;
+      const z = a.z + (b.z - a.z) * u;
+      const onBridge = u < 0.5 ? a.bridge : b.bridge;
+      const groundY = onBridge ? a.y + (b.y - a.y) * u : hf.heightAt(x, z);
+
+      const heading = Math.atan2(b.z - a.z, b.x - a.x);
+      const perpX = -Math.sin(heading);
+      const perpZ = Math.cos(heading);
+
+      for (const side of [-1, 1]) {
+        if (idx >= CONE_CAP) break;
+        this.posX[idx] = x + perpX * side * CONE_PERP_OFFSET;
+        this.posY[idx] = groundY;
+        this.posZ[idx] = z + perpZ * side * CONE_PERP_OFFSET;
+        idx++;
+      }
+    }
+    this.liveCount = idx;
+  }
+
+  /** Clears any placed cones (job removed/reset without a new placement following immediately). */
+  clear(): void {
+    this.placedEdgeId = null;
+    this.liveCount = 0;
+  }
+
+  get edgeId(): number | null {
+    return this.placedEdgeId;
+  }
+
+  /** `active` = this crew currently has a job in progress (same signal cones/stockpile/workers
+   * all share). Positions never change here — only the shared fade scale. */
+  update(dt: number, active: boolean): void {
     this.visibility = damp(this.visibility, active ? 1 : 0, 1 / FADE_DURATION, dt);
     const scale = easeOutCubic(clamp01(this.visibility));
-    const cosH = Math.cos(heading);
-    const sinH = Math.sin(heading);
-    const perpX = -sinH;
-    const perpZ = cosH;
-    const half = CONE_COUNT / 2;
+    const visibleCount = active || this.visibility > 0.001 ? this.liveCount : 0;
 
-    for (let i = 0; i < CONE_COUNT; i++) {
-      const side = i < half ? -1 : 1;
-      const along = (i % half) - (half - 1) / 2; // -1, 0, 1 for 3-per-side
-      const targetX = pos.x + perpX * side * (ROAD_WIDTH_HALF + 1.5) + cosH * along * CONE_OFFSET * 0.6;
-      const targetZ = pos.z + perpZ * side * (ROAD_WIDTH_HALF + 1.5) + sinH * along * CONE_OFFSET * 0.6;
-      const targetY = pos.y;
-      if (!this.initialized) {
-        this.curX[i] = targetX;
-        this.curY[i] = targetY;
-        this.curZ[i] = targetZ;
+    for (let i = 0; i < CONE_CAP; i++) {
+      if (i >= visibleCount) {
+        coneDummy.position.set(0, -9999, 0);
+        coneDummy.scale.setScalar(0.001);
       } else {
-        this.curX[i] = damp(this.curX[i], targetX, CONE_LAMBDA, dt);
-        this.curY[i] = damp(this.curY[i], targetY, CONE_LAMBDA, dt);
-        this.curZ[i] = damp(this.curZ[i], targetZ, CONE_LAMBDA, dt);
+        coneDummy.position.set(this.posX[i], this.posY[i], this.posZ[i]);
+        coneDummy.scale.setScalar(Math.max(0.001, scale));
       }
-
-      coneDummy.position.set(this.curX[i], this.curY[i], this.curZ[i]);
-      coneDummy.scale.setScalar(Math.max(0.001, scale));
       coneDummy.updateMatrix();
       this.mesh.setMatrixAt(i, coneDummy.matrix);
     }
-    this.initialized = true;
     this.mesh.instanceMatrix.needsUpdate = true;
-    this.mesh.visible = scale > 0.001;
+    this.mesh.visible = scale > 0.001 && visibleCount > 0;
   }
 
   dispose(): void {
@@ -1823,6 +1890,14 @@ export class ConstructionRenderer {
       slot.stockpile.group.rotation.y = -e.heading;
     }
 
+    // Static work-zone cones (Addendum C, Task 27): fixed positions computed ONCE from the
+    // edge's samples the moment this crew's job starts on it (same one-shot-per-edge gate as the
+    // stockpile above), then left exactly where placed for the job's entire duration — including
+    // demolish jobs, which get the same treatment since this only keys off edgeId, not direction.
+    if (edge && slot.cones.edgeId !== e.edgeId) {
+      slot.cones.place(e.edgeId, edge.samples, this.hf);
+    }
+
     // Survey stakes (deliverable 2): the surveyor plants a real stake every STAKE_SPACING as it
     // passes; grading later sweeps them away as the work front overtakes the surveyed line.
     // Stakes are a shared pool keyed by edgeId (not crew) — two crews never share an edge, so no
@@ -2259,10 +2334,10 @@ export class ConstructionRenderer {
 
   /**
    * Site dressing (deliverable 5): finds whichever of THIS CREW's vehicles is currently the
-   * "primary" active one (same anchor-picking approach as updateFloodlight) to serve as the work
-   * front for bracketing cones, and fades the job-start stockpile in/out with whether ANY job is
-   * currently active on this crew (cones/stockpile both belong to "this crew has a job in
-   * progress", not any one vehicle kind).
+   * "primary" active one (same anchor-picking approach as updateFloodlight) to serve as the
+   * flagger/spotter's follow anchor, and fades the job-start stockpile + the (already fixed-
+   * position, per Task 27) cone line in/out with whether ANY job is currently active on this crew
+   * (cones/stockpile both belong to "this crew has a job in progress", not any one vehicle kind).
    */
   private updateSiteDressing(slot: CrewSlot, dt: number): void {
     let anchor: VehicleState | null = null;
@@ -2287,7 +2362,11 @@ export class ConstructionRenderer {
     slot.stockpile.group.scale.setScalar(Math.max(0.001, scale));
     if (!jobActive) slot.stockpileEdgeId = null; // free the anchor once fully faded/no job running
 
-    slot.cones.update(dt, slot.dressingActive, slot.dressingPos, slot.dressingHeading);
+    // Cones (Task 27): positions are already fixed (set once in onProgress); only the shared
+    // fade-with-the-crew signal is driven from here. Free the placed-edge gate once fully faded so
+    // the next job (even on the same edge, e.g. immediate resume) re-places fresh stations.
+    slot.cones.update(dt, jobActive);
+    if (!jobActive && slot.stockpileVisibility < 0.001) slot.cones.clear();
   }
 
   /**
