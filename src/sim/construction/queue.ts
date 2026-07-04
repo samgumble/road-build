@@ -1,7 +1,7 @@
 import { STAGES } from '../../core/types';
 import type { Stage, VehicleKind } from '../../core/types';
 import { ROAD_WIDTH, CELL } from '../../core/constants';
-import { RoadGraph } from '../roads/graph';
+import { RoadGraph, RoadEdge } from '../roads/graph';
 import { sampleAt, sampleHeadingAt } from '../roads/path';
 import { Heightfield } from '../terrain/heightfield';
 import { EventBus } from '../../core/events';
@@ -89,6 +89,26 @@ interface Job {
   resumeAt?: number;
 }
 
+// --- Task 36: pipelined stage train ---------------------------------------------------------
+// A fresh (non-resumed, non-demolish) build job runs all 4 buildable stages (graded/gravel/paved/
+// painted, indices 0-3 below — NOT the same indexing as `STAGES`, which also has 'surveyed' at 0)
+// as concurrent FRONTS along the edge once the survey pass completes, instead of walking them
+// strictly one at a time. `FRONT_STAGES[i]` names the stage each front index builds.
+const FRONT_STAGES: BuildableStage[] = ['graded', 'gravel', 'paved', 'painted'];
+const FRONT_COUNT = FRONT_STAGES.length;
+
+/** A following front may never advance to within this many arclength units of the front ahead of
+ * it, unless that leading front has already finished (reached the edge's end). This is what makes
+ * the train "pipeline" rather than overlap: each stage's vehicle/crew works its own stretch behind
+ * the one ahead, closing the gap only once there's nothing left ahead to run into. */
+const TRAIN_SPACING = 30;
+
+/** One work front's progress within a train job — see `ActiveJob.fronts`. */
+interface Front {
+  t: number; // arclength progress into this front's own stage pass
+  done: boolean; // true once this front has reached the edge's end (that stage is complete)
+}
+
 interface ActiveJob extends Job {
   stageIndex: number; // index into STAGES of the stage currently being built/undone
   t: number; // arclength progress within the current stage's pass
@@ -98,10 +118,22 @@ interface ActiveJob extends Job {
    * at/after 'graded', i.e. already past the point a survey pass would cover). */
   surveying: boolean;
 
+  /**
+   * Task 36: once survey completes, a fresh (non-resumed) build job switches to running all 4
+   * buildable stages as concurrent fronts — see `Front` and `TRAIN_SPACING` above. `null` for
+   * demolish jobs and for resumed jobs, both of which collapse to the pre-Task-36 sequential
+   * `stageIndex`/`t` walk (see the binding spec's "resume mid-train collapses to sequential" and
+   * "demolish conversion mid-train collapses to sequential demolish" allowances) — `stageIndex`/`t`
+   * remain the single source of truth for those two cases exactly as before this task.
+   */
+  fronts: Front[] | null;
+
   // --- Task 33: work rhythm ------------------------------------------------------------------
   /** Seconds of ACTIVE (non-survey, non-break) work until the next break fires; re-rolled from
    * `[BREAK_INTERVAL_MIN, BREAK_INTERVAL_MAX]` (seeded) every time a break starts. Survey time
-   * never counts down this timer (see `surveying` early-return in `updateCrew`). */
+   * never counts down this timer (see `surveying` early-return in `updateCrew`). One break clock
+   * per CREW (Task 33 as extended by Task 36): a break freezes every one of the crew's active
+   * fronts at once, not just one stage's. */
   breakClock: number;
   /** Seconds remaining in the CURRENT break; > 0 while on break. `t`/terrain/vehicle progress is
    * fully frozen while this is > 0 — only `construction:progress` keeps firing (stationary
@@ -223,6 +255,27 @@ export class BuildQueue {
       const active = this.crews[activeCrewIdx]!;
       if (!active.demolish) {
         active.demolish = true;
+        if (active.fronts) {
+          // Task 36: converting a job mid-train collapses to the pre-Task-36 sequential demolish
+          // walk, per the binding spec's documented allowance — demolish from `edge.stage` (the
+          // last COMPLETED stage; a train job keeps `edge.stage` updated as each front finishes,
+          // exactly like the sequential path always did) rather than from wherever any individual
+          // front's own `t` happened to be. Every in-flight front's partial work is simply
+          // abandoned here: the demolition walk below re-covers that same ground in reverse, so
+          // whatever a not-yet-complete front had already built visually regresses under the
+          // demolition crew as it passes back over it (acceptable per spec — documented above and
+          // in the Task 36 report).
+          active.fronts = null;
+          const edgeNow = this.graph.edges.get(edgeId);
+          // `edge.stage` is still 'surveyed' if the graded front hasn't finished yet (nothing
+          // completed at all) — mirror the sequential path's own convention (a fresh build always
+          // starts a demolish-eligible stageIndex at 'graded', t: 0) rather than indexing
+          // STAGES.indexOf('surveyed') (0), which would desync `t`'s "forward progress into
+          // stageIndex" meaning from a stage whose speed/vehicle table doesn't even cover it.
+          const completedStage = edgeNow && edgeNow.stage !== 'surveyed' ? edgeNow.stage : null;
+          active.stageIndex = completedStage ? STAGES.indexOf(completedStage) : STAGES.indexOf('graded');
+          active.t = completedStage && edgeNow ? edgeNow.length : 0;
+        }
         // t currently measures forward progress into `stageIndex`; walking in reverse from here
         // is fine as-is — the reverse loop in update() treats t as "remaining distance in this
         // stage's pass" once demolish is true, so we keep t as the current forward progress and
@@ -330,16 +383,20 @@ export class BuildQueue {
           continue;
         }
         this.crews[freeIdx] = {
-          edgeId: job.edgeId, demolish: true, stageIndex, t: edge.length, surveying: false,
+          edgeId: job.edgeId, demolish: true, stageIndex, t: edge.length, surveying: false, fronts: null,
           breakClock: this.rollBreakInterval(), breakRemaining: 0,
         };
       } else {
         const stageIndex = job.resumeAt ?? STAGES.indexOf('graded');
         // Only a genuinely fresh build (no `resumeAt`) gets a survey pass — a resumed job by
-        // definition starts at/after 'graded', i.e. the edge is already past 'surveyed'.
+        // definition starts at/after 'graded', i.e. the edge is already past 'surveyed'. Task 36:
+        // that same "fresh vs. resumed" split is also exactly when the pipelined train applies —
+        // a resumed job collapses to the pre-Task-36 sequential walk (`fronts: null`), per the
+        // binding spec's documented allowance. `fronts` for a fresh build is allocated lazily once
+        // the survey pass completes (see `updateCrew`), so it starts `null` here regardless.
         const surveying = job.resumeAt === undefined;
         this.crews[freeIdx] = {
-          edgeId: job.edgeId, demolish: false, stageIndex, t: 0, surveying,
+          edgeId: job.edgeId, demolish: false, stageIndex, t: 0, surveying, fronts: null,
           breakClock: this.rollBreakInterval(), breakRemaining: 0,
         };
       }
@@ -395,42 +452,63 @@ export class BuildQueue {
         onBreak: false, // Task 33: survey is exempt from breaks
       });
       if (job.t >= edge.length) {
-        // Survey pass complete — no stage transition (the edge is already 'surveyed'); hand off
-        // to normal graded-stage building starting fresh from t=0.
+        // Survey pass complete — no stage transition (the edge is already 'surveyed'). Task 36:
+        // a fresh (non-resumed) build job hands off into the pipelined train (`fronts`, allocated
+        // here) instead of the old single stageIndex/t walk. `resumeAt` jobs never set
+        // `job.surveying` true in the first place (see `maybeStartNext`), so the only other way to
+        // reach this handoff is a job that was converted to demolish MID-SURVEY by
+        // `enqueueDemolish` (the edge has no built structure yet, so there's nothing to walk back
+        // through) — that must fall through to the pre-Task-36 sequential path exactly as before
+        // this task (finish the survey harmlessly, then the very next tick's `job.t <= 0` check
+        // instant-removes it), NOT be handed a fresh set of fronts to build forward with.
         job.surveying = false;
-        job.t = 0;
+        if (!job.demolish) {
+          job.fronts = Array.from({ length: FRONT_COUNT }, () => ({ t: 0, done: false }));
+        } else {
+          job.t = 0;
+        }
       }
       return;
     }
 
     // --- Task 33: work rhythm (breaks) --------------------------------------------------------
     // Survey is already handled (and returned) above, so anything reaching here is real staged
-    // work — eligible for breaks. A break in progress freezes `t`/terrain progress entirely;
-    // `construction:progress` still fires every tick with the CURRENT stationary pos/heading (via
-    // the normal path below, since we fall through rather than returning) so renderers can react
-    // via the additive `onBreak` field, but stage advancement/grading/emission of NEW terrain
-    // deformation is skipped for the duration.
+    // work — eligible for breaks. A break in progress freezes `t`/terrain progress (and, for a
+    // train job, EVERY front's `t`) entirely; `construction:progress` still fires every tick with
+    // each working vehicle's CURRENT stationary pos/heading so renderers can react via the
+    // additive `onBreak` field, but stage advancement/grading/emission of NEW terrain deformation
+    // is skipped for the duration. One break clock per CREW (unchanged from Task 33): a break
+    // freezes every one of the crew's active fronts at once, not just one stage's.
     if (job.breakRemaining > 0) {
       job.breakRemaining = Math.max(0, job.breakRemaining - dt);
-      const stage = STAGES[job.stageIndex] as BuildableStage;
-      const vehicle: VehicleKind = job.demolish ? 'excavator' : STAGE_VEHICLE[stage];
-      const clampedT = Math.max(0, Math.min(edge.length, job.t));
-      let { pos, heading } = sampleAt(edge.samples, clampedT);
-      if (job.demolish) heading += Math.PI;
-      this.bus.emit('construction:progress', {
-        edgeId: job.edgeId,
-        stage,
-        t: clampedT,
-        pos,
-        heading,
-        vehicle,
-        demolish: job.demolish,
-        crew,
-        onBreak: true,
-      });
+      if (job.fronts) {
+        this.emitTrainBreak(crew, job, edge);
+      } else {
+        const stage = STAGES[job.stageIndex] as BuildableStage;
+        const vehicle: VehicleKind = job.demolish ? 'excavator' : STAGE_VEHICLE[stage];
+        const clampedT = Math.max(0, Math.min(edge.length, job.t));
+        let { pos, heading } = sampleAt(edge.samples, clampedT);
+        if (job.demolish) heading += Math.PI;
+        this.bus.emit('construction:progress', {
+          edgeId: job.edgeId,
+          stage,
+          t: clampedT,
+          pos,
+          heading,
+          vehicle,
+          demolish: job.demolish,
+          crew,
+          onBreak: true,
+        });
+      }
       if (job.breakRemaining <= 0) {
         job.breakClock = this.rollBreakInterval();
       }
+      return;
+    }
+
+    if (job.fronts) {
+      this.updateTrain(crew, job, edge, dt, night);
       return;
     }
 
@@ -457,54 +535,7 @@ export class BuildQueue {
     let { pos, heading } = sampleAt(edge.samples, clampedT);
 
     if (stage === 'graded') {
-      const nearest = nearestSampleIndex(edge.samples, clampedT);
-      if (!edge.samples[nearest]?.bridge) {
-        // `flattenCircle`'s full-strength core is only ~0.35*radius, so a single centerline pass
-        // at GRADE_RADIUS leaves the ribbon's edges (out toward the road's actual half-width)
-        // under-flattened — on a ridge crossing this shows up as terrain poking back up through
-        // the graded strip. Cut the full road width by flattening three times per update: once on
-        // the centerline and once at each perpendicular offset toward the road's edges, all with
-        // the same target height and radius.
-        const perpX = -Math.sin(heading);
-        const perpZ = Math.cos(heading);
-        const offset = ROAD_WIDTH / 2 - 0.8;
-        this.hf.flattenCircle(pos.x, pos.z, pos.y, GRADE_RADIUS);
-        this.hf.flattenCircle(pos.x + perpX * offset, pos.z + perpZ * offset, pos.y, GRADE_RADIUS);
-        this.hf.flattenCircle(pos.x - perpX * offset, pos.z - perpZ * offset, pos.y, GRADE_RADIUS);
-        // Mid-construction clamp (Task 24 finding): `flattenCircle`'s blend pulls nearby terrain
-        // toward the CURRENT vehicle position's own elevation (`pos.y`) every update as it moves
-        // forward along a climbing/dipping profile — on a cross-slope this can actually RAISE a
-        // vertex slightly behind-and-to-the-side of the vehicle back up on a later frame, because
-        // that frame's (higher/lower) `pos.y` target differs from the true graded profile at the
-        // vertex's own location. Clamping at the live `pos` with `pos.y` as the ceiling (an
-        // earlier version of this fix) chases the same problem — its ceiling rises and falls with
-        // the vehicle too, so it can't out-converge flattenCircle's re-raising.
-        //
-        // Fix: clamp using the trailing (already-passed) sample's OWN `y`, not the live vehicle
-        // position/elevation — exactly the same reasoning the graded-completion finalization pass
-        // below already uses per sample, just applied incrementally as the crew advances instead
-        // of once at the very end. Every sample the excavator has already passed gets re-clamped,
-        // every frame, against its own correct target height, so it converges to the same
-        // no-allowance-inside-the-corridor ceiling the finalization sweep guarantees, without
-        // waiting for the whole edge to finish.
-        for (const i of trailingSampleIndices(edge.samples, nearest)) {
-          const s = edge.samples[i];
-          if (s.bridge) continue;
-          const sHeading = sampleHeadingAt(edge.samples, i);
-          this.hf.clampBelow(s.x, s.z, s.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, sHeading, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
-        }
-        // Endpoint cap (Task 24 finding): the road's very first sample has no "before" neighbor,
-        // so it's the one spot where the anisotropic along-axis flat zone can't be helped along by
-        // an adjacent sample's own circle — a small (sub-0.1u) residual can otherwise sit at the
-        // tip until the graded-completion finalization sweep below reaches it. That's an
-        // imperceptible residual, but it's cheap (one extra sample) to just keep the tip
-        // re-clamped every update once the crew has moved past it, same as the finalization sweep
-        // does for every sample. Only meaningful once the front has actually passed sample 0.
-        if (nearest > 0 && !edge.samples[0].bridge) {
-          const cap = edge.samples[0];
-          this.hf.clampBelow(cap.x, cap.z, cap.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, sampleHeadingAt(edge.samples, 0), CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
-        }
-      }
+      this.gradeTerrainAt(edge, clampedT, pos, heading);
     }
 
     // demolish crews face the direction of travel (reverse)
@@ -527,22 +558,7 @@ export class BuildQueue {
     if (!job.demolish && job.t >= edge.length) {
       edge.stage = stage;
       if (stage === 'graded') {
-        // Finalization pass (playtest fix: "the land is still rendering above the cleared road
-        // in some areas"): the per-update 3-track `flattenCircle` blend above tracks the vehicle
-        // as it moves, but its smoothstep falloff can still leave terrain vertices above the
-        // roadbed on cross-slopes between passes. Now that grading for this edge is fully
-        // complete, sweep every non-bridge sample once more with a hard `clampBelow` so no
-        // terrain can poke through the cut, regardless of any blend gaps left by the moving cut.
-        // Uses the same anisotropic radii as the per-update clamp above (Task 24) — a hard,
-        // allowance-free ceiling across the whole visible corridor plus margin perpendicular to
-        // the road, but kept narrow along the road's own arclength so it can't reach a
-        // neighboring sample with a meaningfully different target elevation on hilly terrain.
-        for (let i = 0; i < edge.samples.length; i++) {
-          const s = edge.samples[i];
-          if (s.bridge) continue;
-          const sHeading = sampleHeadingAt(edge.samples, i);
-          this.hf.clampBelow(s.x, s.z, s.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, sHeading, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
-        }
+        this.finalizeGrading(edge);
       }
       this.bus.emit('construction:stage', { edgeId: job.edgeId, stage, crew });
       if (stage === 'painted') {
@@ -584,6 +600,194 @@ export class BuildQueue {
         job.stageIndex = prevIndex;
         job.t = edge.length;
       }
+    }
+  }
+
+  /**
+   * Task 36: advances every not-yet-complete front of a train job by one tick. A front may only
+   * advance while it's at least `TRAIN_SPACING` units behind the front ahead of it, OR that front
+   * ahead has already finished (reached the edge's end) — see `TRAIN_SPACING`'s doc comment. Front
+   * 0 (graded) has no front ahead of it and is gated only by the survey pass already having
+   * completed (guaranteed by the caller: `updateCrew` only reaches here once `job.surveying` is
+   * false). `construction:progress` fires once per tick for every front that hasn't finished yet
+   * (whether it actually advanced this tick or is currently waiting on the spacing gate) so the
+   * renderer's per-(crew, vehicle-kind) liveness timers keep every not-yet-finished front's vehicle
+   * on-site and visible, including one idling behind a closer-than-30u leader — this is what reads
+   * as a strung-out convoy rather than a single roaming vehicle. Stage completion for front `i`
+   * always happens in order: front `i` can only reach the edge's end once front `i-1` is marked
+   * `done` (the spacing gate above forbids `front[i].t` from ever reaching `edge.length` while
+   * `front[i-1]` is both not-done AND less than `TRAIN_SPACING` ahead — and `front[i-1]` itself
+   * can't be less than `TRAIN_SPACING` ahead of a `t` that has already reached `edge.length` unless
+   * `edge.length` itself is smaller than `TRAIN_SPACING`, i.e. a very short edge — see the class
+   * doc / Task 36 report for that short-edge degenerate case), so `edge.stage`'s "last completed
+   * stage" semantics (lanes/growth/wilderness reacting to 'painted' completion) are preserved
+   * exactly as the sequential single-front walk always guaranteed.
+   */
+  private updateTrain(crew: number, job: ActiveJob, edge: RoadEdge, dt: number, night: boolean): void {
+    const fronts = job.fronts!;
+    let breakClockTicked = false;
+
+    for (let i = 0; i < FRONT_COUNT; i++) {
+      const front = fronts[i];
+      if (front.done) continue;
+
+      const stage = FRONT_STAGES[i];
+      const leader = i > 0 ? fronts[i - 1] : null;
+      const gated = leader !== null && !leader.done && front.t > leader.t - TRAIN_SPACING;
+
+      if (!gated) {
+        const baseSpeed = STAGE_SPEED[stage];
+        const speed = night ? baseSpeed * NIGHT_SPEED_MULTIPLIER : baseSpeed;
+        front.t = Math.min(edge.length, front.t + speed * dt);
+
+        // Break cadence (Task 33): one clock per CREW, ticked once per tick (not once per front)
+        // by actual elapsed active-work time — mirrors the sequential path's own bookkeeping.
+        if (!breakClockTicked) {
+          job.breakClock -= dt;
+          if (job.breakClock <= 0) job.breakRemaining = BREAK_DURATION;
+          breakClockTicked = true;
+        }
+      }
+
+      const clampedT = Math.max(0, Math.min(edge.length, front.t));
+      const { pos, heading } = sampleAt(edge.samples, clampedT);
+
+      if (stage === 'graded' && !gated) {
+        this.gradeTerrainAt(edge, clampedT, pos, heading);
+      }
+
+      this.bus.emit('construction:progress', {
+        edgeId: job.edgeId,
+        stage,
+        t: clampedT,
+        pos,
+        heading,
+        vehicle: STAGE_VEHICLE[stage],
+        demolish: false,
+        crew,
+        onBreak: false,
+      });
+
+      if (front.t >= edge.length) {
+        front.done = true;
+        edge.stage = stage;
+        if (stage === 'graded') this.finalizeGrading(edge);
+        this.bus.emit('construction:stage', { edgeId: job.edgeId, stage, crew });
+        if (stage === 'painted') {
+          this.bus.emit('roads:changed', {});
+        }
+      }
+    }
+
+    if (fronts.every((f) => f.done)) {
+      // Task 33: record this crew's last job site (the edge's end — where the crew finished) for
+      // future nearest-crew assignment — mirrors the sequential path's own bookkeeping at the same
+      // moment ('painted' front completing).
+      const last = edge.samples[edge.samples.length - 1];
+      this.crewLastSite[crew] = { x: last.x, z: last.z };
+      this.crews[crew] = null;
+      this.maybeStartNext();
+    }
+  }
+
+  /** Break-frozen progress emission for a train job (Task 36 extension of Task 33's break theater):
+   * every not-yet-complete front reports its current STATIONARY position with `onBreak: true`, same
+   * as the sequential path's single stationary emission, so every working vehicle in the convoy
+   * reads as paused rather than just the one the sequential model used to track. */
+  private emitTrainBreak(crew: number, job: ActiveJob, edge: RoadEdge): void {
+    const fronts = job.fronts!;
+    for (let i = 0; i < FRONT_COUNT; i++) {
+      const front = fronts[i];
+      if (front.done) continue;
+      const stage = FRONT_STAGES[i];
+      const clampedT = Math.max(0, Math.min(edge.length, front.t));
+      const { pos, heading } = sampleAt(edge.samples, clampedT);
+      this.bus.emit('construction:progress', {
+        edgeId: job.edgeId,
+        stage,
+        t: clampedT,
+        pos,
+        heading,
+        vehicle: STAGE_VEHICLE[stage],
+        demolish: false,
+        crew,
+        onBreak: true,
+      });
+    }
+  }
+
+  /** The per-update 3-track `flattenCircle` grading blend plus trailing/endpoint clamp — shared by
+   * both the sequential graded pass and the train's graded front (Task 36 extraction; behavior
+   * byte-for-byte unchanged from the pre-Task-36 inline version). */
+  private gradeTerrainAt(edge: RoadEdge, clampedT: number, pos: { x: number; y: number; z: number }, heading: number): void {
+    const nearest = nearestSampleIndex(edge.samples, clampedT);
+    if (edge.samples[nearest]?.bridge) return;
+    // `flattenCircle`'s full-strength core is only ~0.35*radius, so a single centerline pass
+    // at GRADE_RADIUS leaves the ribbon's edges (out toward the road's actual half-width)
+    // under-flattened — on a ridge crossing this shows up as terrain poking back up through
+    // the graded strip. Cut the full road width by flattening three times per update: once on
+    // the centerline and once at each perpendicular offset toward the road's edges, all with
+    // the same target height and radius.
+    const perpX = -Math.sin(heading);
+    const perpZ = Math.cos(heading);
+    const offset = ROAD_WIDTH / 2 - 0.8;
+    this.hf.flattenCircle(pos.x, pos.z, pos.y, GRADE_RADIUS);
+    this.hf.flattenCircle(pos.x + perpX * offset, pos.z + perpZ * offset, pos.y, GRADE_RADIUS);
+    this.hf.flattenCircle(pos.x - perpX * offset, pos.z - perpZ * offset, pos.y, GRADE_RADIUS);
+    // Mid-construction clamp (Task 24 finding): `flattenCircle`'s blend pulls nearby terrain
+    // toward the CURRENT vehicle position's own elevation (`pos.y`) every update as it moves
+    // forward along a climbing/dipping profile — on a cross-slope this can actually RAISE a
+    // vertex slightly behind-and-to-the-side of the vehicle back up on a later frame, because
+    // that frame's (higher/lower) `pos.y` target differs from the true graded profile at the
+    // vertex's own location. Clamping at the live `pos` with `pos.y` as the ceiling (an
+    // earlier version of this fix) chases the same problem — its ceiling rises and falls with
+    // the vehicle too, so it can't out-converge flattenCircle's re-raising.
+    //
+    // Fix: clamp using the trailing (already-passed) sample's OWN `y`, not the live vehicle
+    // position/elevation — exactly the same reasoning the graded-completion finalization pass
+    // below already uses per sample, just applied incrementally as the crew advances instead
+    // of once at the very end. Every sample the excavator has already passed gets re-clamped,
+    // every frame, against its own correct target height, so it converges to the same
+    // no-allowance-inside-the-corridor ceiling the finalization sweep guarantees, without
+    // waiting for the whole edge to finish.
+    for (const i of trailingSampleIndices(edge.samples, nearest)) {
+      const s = edge.samples[i];
+      if (s.bridge) continue;
+      const sHeading = sampleHeadingAt(edge.samples, i);
+      this.hf.clampBelow(s.x, s.z, s.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, sHeading, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
+    }
+    // Endpoint cap (Task 24 finding): the road's very first sample has no "before" neighbor,
+    // so it's the one spot where the anisotropic along-axis flat zone can't be helped along by
+    // an adjacent sample's own circle — a small (sub-0.1u) residual can otherwise sit at the
+    // tip until the graded-completion finalization sweep below reaches it. That's an
+    // imperceptible residual, but it's cheap (one extra sample) to just keep the tip
+    // re-clamped every update once the crew has moved past it, same as the finalization sweep
+    // does for every sample. Only meaningful once the front has actually passed sample 0.
+    if (nearest > 0 && !edge.samples[0].bridge) {
+      const cap = edge.samples[0];
+      this.hf.clampBelow(cap.x, cap.z, cap.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, sampleHeadingAt(edge.samples, 0), CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
+    }
+  }
+
+  /** Hard finalization clamp sweep run once grading is fully complete — shared by both the
+   * sequential graded pass and the train's graded front (Task 36 extraction; behavior byte-for-byte
+   * unchanged from the pre-Task-36 inline version). */
+  private finalizeGrading(edge: RoadEdge): void {
+    // Finalization pass (playtest fix: "the land is still rendering above the cleared road
+    // in some areas"): the per-update 3-track `flattenCircle` blend above tracks the vehicle
+    // as it moves, but its smoothstep falloff can still leave terrain vertices above the
+    // roadbed on cross-slopes between passes. Now that grading for this edge is fully
+    // complete, sweep every non-bridge sample once more with a hard `clampBelow` so no
+    // terrain can poke through the cut, regardless of any blend gaps left by the moving cut.
+    // Uses the same anisotropic radii as the per-update clamp above (Task 24) — a hard,
+    // allowance-free ceiling across the whole visible corridor plus margin perpendicular to
+    // the road, but kept narrow along the road's own arclength so it can't reach a
+    // neighboring sample with a meaningfully different target elevation on hilly terrain.
+    for (let i = 0; i < edge.samples.length; i++) {
+      const s = edge.samples[i];
+      if (s.bridge) continue;
+      const sHeading = sampleHeadingAt(edge.samples, i);
+      this.hf.clampBelow(s.x, s.z, s.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, sHeading, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
     }
   }
 }
