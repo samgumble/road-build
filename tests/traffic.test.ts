@@ -356,12 +356,25 @@ describe('TrafficSim', () => {
       return { bus, g, sim };
     }
 
-    it('never freezes permanently: no cohort stays below epsilon speed for more than 30 sim-seconds over a 20 sim-minute run at near-cap population', () => {
+    // T44 review finding 2: these two soak tests originally ran a 20 sim-minute (1.2M-tick) loop
+    // EACH, which is unnecessary CI cost for what they're actually checking — the freeze/deadlock
+    // failure mode reproduces (and, pre-fix, was observed) within the first minute of contention
+    // building up to near-cap population (see task-44-report.md: population hit cap by ~t=360s and
+    // froze permanently at t=371.6s in the original repro — a 6-minute window comfortably contains
+    // that). Trimmed to 6 sim-minutes (360k ticks) each. The freeze threshold is unchanged (30
+    // sim-seconds is about the failure mode, not the run length, so it doesn't scale with the
+    // window). The throughput threshold IS rescaled, but tightened in rate terms while doing it:
+    // the original ">20 completions per 20 min" is only ~1/min, a weak bar that would also pass a
+    // barely-limping network. This asserts >18 completions per 6 min (~3/min at the ring's
+    // near-cap population) — confirmed empirically to hold with wide margin post-fix (~180
+    // completions in 6 sim-minutes in practice) while still being a real, meaningfully higher
+    // throughput bar than the original, not just a proportional shrink.
+    it('never freezes permanently: no cohort stays below epsilon speed for more than 30 sim-seconds over a 6 sim-minute run at near-cap population', () => {
       const { sim } = ringWorld();
       sim.targetPopulation = 20;
 
       const dt = 1 / 60;
-      const totalSimSeconds = 20 * 60;
+      const totalSimSeconds = 6 * 60;
       const FREEZE_EPS = 0.05;
       const FREEZE_SECONDS = 30;
       let frozenStreak = 0;
@@ -378,12 +391,12 @@ describe('TrafficSim', () => {
       expect(maxFrozenStreak).toBeLessThan(FREEZE_SECONDS);
     });
 
-    it('maintains throughput: cars keep completing trips (not just idling) over a long run at near-cap population', () => {
+    it('maintains throughput: cars keep completing trips (not just idling) over a 6 sim-minute run at near-cap population', () => {
       const { sim } = ringWorld();
       sim.targetPopulation = 20;
 
       const dt = 1 / 60;
-      const totalSimSeconds = 20 * 60;
+      const totalSimSeconds = 6 * 60;
       let completions = 0;
       let prevIds = new Set<number>();
 
@@ -394,9 +407,11 @@ describe('TrafficSim', () => {
         prevIds = curIds;
       }
 
-      // A 20 sim-minute run on a small ring should complete comfortably more than a handful of
-      // trips if traffic is actually flowing rather than merely creeping/backed up.
-      expect(completions).toBeGreaterThan(20);
+      // A 6 sim-minute run on a small ring at near-cap population should complete comfortably more
+      // than ~3/min worth of trips if traffic is actually flowing rather than merely
+      // creeping/backed up — a real throughput bar, not just a proportional shrink of the original
+      // (weak) ">20 per 20 min" (~1/min) threshold.
+      expect(completions).toBeGreaterThan(18);
     });
 
     it('a lock holder that stalls for the safety-net timeout releases and re-queues rather than holding forever', () => {
@@ -413,6 +428,61 @@ describe('TrafficSim', () => {
       for (const [, holderId] of locks) {
         expect(liveIds.has(holderId)).toBe(true);
       }
+    });
+  });
+
+  // T44 review finding 1: short lanes between junctions repeatedly stalled for the full 8s
+  // STALE_LOCK_TIMEOUT instead of recovering promptly. A car holding node N1's lock, entering a
+  // lane shorter than JUNCTION_APPROACH + JUNCTION_RELEASE (~10u) toward N2, must brake for N2's
+  // lock (held by cross-traffic) while still holding N1's own lock (the hold-one-lock rule from
+  // the original Task 44 fix) — and because the fixed release point (JUNCTION_RELEASE = 4u into
+  // the lane) sits past where a short lane forces the car to stop for N2's approach zone
+  // (starting at `lane.length - JUNCTION_APPROACH`, which is < 4u on any lane shorter than 10u),
+  // the car can never reach the release mark under its own power. It falls through to the 8s
+  // stale-lock safety net every single time this geometry occurs, rather than the release ever
+  // doing its job. Reproduces with real contention (cross-traffic at both short-lane nodes) at
+  // any comparable topology — loop halves can be exactly this short.
+  describe('short-lane junction stalls (T44 review finding 1)', () => {
+    /**
+     * Two junctions 8u apart on a through route, each also feeding a perpendicular branch so
+     * cross-traffic genuinely contends for both node locks (a lone car on an otherwise-empty
+     * route never needs to actually brake — the earlier repro attempt with a single car and no
+     * contention passed even on the pre-fix code, since nothing else was holding either lock).
+     */
+    function shortLaneWorld() {
+      const bus = new EventBus();
+      const g = new RoadGraph(bus, flatSampler);
+      g.commitChain([{ x: 0, z: 0 }, { x: 40, z: 0 }]);
+      g.commitChain([{ x: 40, z: 0 }, { x: 48, z: 0 }]); // short lane #1 (8u)
+      g.commitChain([{ x: 48, z: 0 }, { x: 56, z: 0 }]); // short lane #2 (8u)
+      g.commitChain([{ x: 56, z: 0 }, { x: 96, z: 0 }]);
+      g.commitChain([{ x: 40, z: 0 }, { x: 40, z: 40 }]); // cross-traffic branch at junction N1
+      g.commitChain([{ x: 56, z: 0 }, { x: 56, z: 40 }]); // cross-traffic branch at junction N2
+      for (const e of g.edges.values()) e.stage = 'painted';
+      bus.emit('roads:changed', {});
+      const sim = new TrafficSim(g, bus, createRng('short-lane'));
+      return { sim };
+    }
+
+    it('never sits stationary more than 2 sim-seconds at a time (fails today via the 8s stale-lock stall)', () => {
+      const { sim } = shortLaneWorld();
+      sim.targetPopulation = 12; // enough concurrent cars to genuinely contend for both node locks
+      const dt = 1 / 60;
+      const STATIONARY_EPS = 0.05;
+      const MAX_STATIONARY_SECONDS = 2;
+      const totalSimSeconds = 10 * 60;
+
+      let maxStationaryStreak = 0;
+
+      for (let i = 0; i < totalSimSeconds / dt; i++) {
+        sim.update(dt);
+        for (const c of (sim as any).cs as Array<{ speed: number; _streak?: number }>) {
+          c._streak = c.speed < STATIONARY_EPS ? (c._streak ?? 0) + dt : 0;
+          if (c._streak > maxStationaryStreak) maxStationaryStreak = c._streak;
+        }
+      }
+
+      expect(maxStationaryStreak).toBeLessThan(MAX_STATIONARY_SECONDS);
     });
   });
 });

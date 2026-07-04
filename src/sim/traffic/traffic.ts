@@ -23,7 +23,13 @@ const HARD_GAP = 5; // u, gapSpeed = 0 below this
 const SOFT_GAP = 14; // u, gapSpeed reaches "unconstrained" at this gap
 const GAP_SPEED_CAP = 14; // u/s, the "unconstrained" gap speed ceiling
 const JUNCTION_APPROACH = 6; // u from lane end where a car must hold the junction lock
-const JUNCTION_RELEASE = 4; // u into the next lane where the lock is released
+// Task 44 review finding 1 (short-lane stalls): this is a CEILING on the release point, not the
+// release point itself — see `releaseAt()` below. On any lane shorter than
+// JUNCTION_APPROACH + JUNCTION_RELEASE (~10u), a fixed 4u release mark sits past where the car is
+// forced to brake for the NEXT junction's approach zone (which starts at `lane.length -
+// JUNCTION_APPROACH`), so the car could never reach the release mark under its own power and
+// always fell through to the 8s stale-lock safety net instead.
+const JUNCTION_RELEASE = 4; // u into the next lane where the lock is released, on a lane long enough to reach it
 const SPAWN_INTERVAL = 1; // seconds, max one spawn per second
 
 // Task 44 (deadlock fix): "don't block the box" — a car may only ACQUIRE a junction lock if the
@@ -166,6 +172,45 @@ function maxSpeedAt(lane: Lane, s: number): number {
     acc += segLen;
   }
   return arr[arr.length - 1];
+}
+
+/**
+ * Task 44 review finding 1 (short-lane stalls): the junction-lock release point, scaled down for
+ * lanes shorter than `JUNCTION_APPROACH + JUNCTION_RELEASE` (~10u) so a car can actually reach it.
+ *
+ * The original fixed `JUNCTION_RELEASE` (4u) assumed every lane was long enough that the release
+ * mark (4u in) always came BEFORE the next junction's approach zone (which starts
+ * `JUNCTION_APPROACH` = 6u before the lane's end, i.e. at `lane.length - JUNCTION_APPROACH`).
+ * That's false on any lane shorter than ~10u: the approach zone to the NEXT node starts before
+ * s=4, so a car holding the PREVIOUS node's lock hits "must acquire the next lock, but still
+ * holding this one" (the hold-one-lock rule) before it ever reaches the release mark — the
+ * approach check forces its target speed to 0 (see `blockedByJunction` below) and it brakes to a
+ * stop short of s=4, permanently: `c.s` stops advancing once speed hits 0, so it can never cross
+ * the release mark under its own power either. It falls through to the 8s stale-lock safety net
+ * instead of recovering promptly, every single time this geometry occurs. Loop halves and short
+ * blocks are routinely this short.
+ *
+ * `lane.length * 0.4` (40% into the lane) is the primary, geometric term: ROAD_WIDTH is 6u, so a
+ * junction's physical footprint (where two roads of that width cross) has a radius of roughly
+ * ROAD_WIDTH / 2 = 3u from the node center. A car 40% into even the shortest lanes this fix
+ * targets (e.g. 8u, per the review finding's example geometry) is already ~3.2u past the node it
+ * just left — physically clear of the junction footprint, exactly the intent `JUNCTION_RELEASE`
+ * was always going for on longer lanes.
+ *
+ * That alone isn't sufficient, though: 40% of an 8u lane is s=3.2, which is still PAST where the
+ * NEXT junction's approach zone begins (s = 8 - 6 = 2) — a car would still brake to a stop at
+ * s≈2..3.2 before ever reaching the release mark, same bug, just a narrower window. The second
+ * `lane.length - JUNCTION_APPROACH` term is the actual correctness clamp: it caps the release
+ * point so it never sits inside (or past) the next junction's approach zone, guaranteeing the car
+ * can always physically reach `releaseAt` before the approach check could ever force it to stop.
+ * Floored at 0 for lanes shorter than JUNCTION_APPROACH itself (release is then immediate — there
+ * is no room to be anywhere in the lane without also being in next junction's approach zone).
+ * Lanes at or above the original ~10u threshold are unaffected (neither `Math.min` term is
+ * smaller than `JUNCTION_RELEASE` there), so this only changes behavior on the short lanes that
+ * were actually broken.
+ */
+function releaseAt(lane: Lane): number {
+  return Math.max(0, Math.min(JUNCTION_RELEASE, lane.length * 0.4, lane.length - JUNCTION_APPROACH));
 }
 
 /**
@@ -442,6 +487,17 @@ export class TrafficSim {
       const isLastLane = c.routeIndex >= c.route.length - 1;
       const distToLaneEnd = lane.length - c.s;
 
+      // Release the PREVIOUS junction's lock once `releaseAt(lane)` into the current lane — lane-
+      // scaled (see `releaseAt`'s doc comment; Task 44 review finding 1) so short lanes release
+      // before the approach-zone check below can ever see this car still holding it. Checked here,
+      // BEFORE the acquire attempt for the NEXT junction (rather than only at the end of the tick,
+      // as originally), so a release earned by last tick's movement actually counts this tick —
+      // otherwise a short lane could sit exactly on the acquire branch's `heldNodeId === null`
+      // check with a lock it was already geometrically entitled to have released.
+      if (c.heldNodeId !== null && lane.from === c.heldNodeId && c.s >= releaseAt(lane)) {
+        this.releaseLock(c);
+      }
+
       // Junction lock handling: within JUNCTION_APPROACH of the lane end and there IS a next
       // lane (i.e. not the final lane of the route), the car must hold the lock on `lane.to`
       // to be allowed to proceed past the approach point.
@@ -454,8 +510,16 @@ export class TrafficSim {
           // Two back-to-back short lanes could otherwise put a car within JUNCTION_APPROACH of the
           // NEXT node before it had reached JUNCTION_RELEASE into the lane that carries the lock it
           // already holds — silently overwriting `heldNodeId` and leaking the first lock forever
-          // (it belonged to no car that would ever release it). Simply refusing to acquire until
-          // the current lock is released removes the leak at the source.
+          // (it belonged to no car that would ever release it). Refusing to acquire until the
+          // current lock is released removes THAT leak at the source — but on its own it does NOT
+          // close the underlying situation "outright": on a lane shorter than
+          // JUNCTION_APPROACH + JUNCTION_RELEASE (~10u), refusing to acquire just means the car
+          // brakes to a stop instead of leaking a lock, and — with the ORIGINAL fixed
+          // JUNCTION_RELEASE release point — it could never reach that release mark on its own,
+          // so it sat there for the full STALE_LOCK_TIMEOUT (8s) every time this geometry occurred
+          // (loop halves and short blocks routinely are this short). See `releaseAt()`'s doc
+          // comment (Task 44 review finding 1) for the lane-scaled release point that actually
+          // closes this stall, rather than merely trading a permanent leak for a repeated 8s wait.
           //
           // Task 44 (deadlock fix), part 2: "don't block the box" — also require the exit lane
           // (`c.route[c.routeIndex + 1]`) to have clear space before committing to the junction, so
@@ -531,11 +595,14 @@ export class TrafficSim {
         c.s = overflow;
       }
 
-      // Release lock once 4u into the (possibly just-entered) next lane.
+      // Release lock once `releaseAt(currentLane)` into the (possibly just-entered) next lane.
+      // This mirrors the same check at the top of the loop, needed here too for a car that both
+      // enters a new lane AND clears `releaseAt` for it within this same tick (e.g. a very short
+      // lane fully crossed in one tick) — the top-of-loop check only sees last tick's lane/s.
       if (c.heldNodeId !== null) {
         const currentLane = this.lg.lanes.get(c.laneId);
         const enteredNextLane = currentLane && currentLane.from === c.heldNodeId;
-        if (enteredNextLane && c.s >= JUNCTION_RELEASE) {
+        if (enteredNextLane && c.s >= releaseAt(currentLane)) {
           this.releaseLock(c);
         }
       }
