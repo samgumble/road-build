@@ -6,6 +6,7 @@ const MASTER_GAIN = 0.5;
 const MUSIC_GAIN = 0.4;
 const SFX_GAIN = 0.6;
 const MUTE_RAMP = 0.3; // seconds
+const MUSIC_TOGGLE_RAMP = 0.3; // seconds, ramped like MUTE_RAMP so flipping MUSIC never clicks
 
 // Pad
 const PAD_ROOTS_HZ = [110.0, 130.81, 146.83, 164.81, 98.0]; // A2, C3, D3, E3, G2
@@ -17,12 +18,34 @@ const PAD_FILTER_EASE_TIME = 10; // seconds to fully ease across the night/day c
 const PAD_TREMOLO_HZ = 0.08;
 const PAD_TREMOLO_DEPTH = 0.15; // +-15%
 const PAD_DETUNE_CENTS = 7; // detune between the two triangle voices
-const PAD_VOICE_GAIN = 0.5; // per voice-pair gain (two pairs alternate, only one fully audible at a time)
-// Sub voice: was a sine one octave *below* the root (root/2, ~55-98Hz) at full voice gain — that
-// was the reported "drone". Moved up an octave to sit *at* the root (still reinforcing the
-// fundamental, not muddying below it) and cut hard so it reads as warmth, not rumble.
-const PAD_SUB_RATIO = 1; // multiplier on root frequency (was 0.5 = one octave down)
-const PAD_SUB_GAIN_MULT = 0.42; // fraction of PAD_VOICE_GAIN the sub voice runs at (was implicitly 1.0)
+// Task 39 ("de-drone"): the sub-oscillator voice (a sine reinforcing the root — a previous fix
+// already moved it up an octave to sit at the root rather than below it, but it was still
+// present/always-on) has been removed entirely per repeated user feedback ("the background drone
+// is distracting") — see the removed PadVoice.sub/subGain fields. The remaining two-triangle voice
+// gain is also cut by ~8dB on top of that, and the whole pad is now a FALLBACK that only plays when
+// zero real music tracks loaded successfully (see MusicPlayer below / AmbientAudio.buildPad's
+// gating) rather than always-on background music.
+const PAD_VOICE_GAIN = 0.5 * 0.4; // per voice-pair gain (two pairs alternate); *0.4 ~= -8dB cut
+
+// Real ambient music tracks (Task 39): a small rotation of pre-recorded CC0 ambient tracks (see
+// public/music/LICENSE.txt for sourcing) played one at a time through HTMLAudioElement ->
+// MediaElementAudioSourceNode -> the music bus, with a slow crossfade between tracks and generous
+// silence gaps — this is a zen game, and continuous wall-to-wall music would undercut that as much
+// as the old drone did. Lazy-loaded well after boot (first gesture + a delay) so it never competes
+// with initial load, and any track that fails to load/play is just skipped rather than surfaced.
+const MUSIC_TRACKS: { file: string; title: string }[] = [
+  { file: 'contemplation.mp3', title: 'Contemplation' },
+  { file: 'ice-shine-bells.ogg', title: 'Ice Shine Bells' },
+  { file: 'the-fade.mp3', title: 'The Fade' },
+];
+const MUSIC_BASE_URL = 'music/';
+const TRACK_CROSSFADE = 6; // seconds, equal-power crossfade between outgoing/incoming tracks
+const TRACK_GAP_MIN = 30; // seconds of silence between one track ending and the next starting
+const TRACK_GAP_MAX = 90;
+const TRACK_LOAD_DELAY_MIN = 3; // seconds after the qualifying gesture before we even start fetching
+const TRACK_LOAD_DELAY_MAX = 6;
+const TRACK_GAIN = 0.9; // per-track element gain (tracks are already mixed/mastered; this just
+// trims a little headroom into the shared music bus, distinct from the synthesized pad's gain)
 
 // Pluck / arpeggio (the "chill music" layer)
 const PLUCK_SCALE_STEPS = [0, 3, 5, 7, 10]; // pentatonic minor intervals (semitones) over the chord root
@@ -113,46 +136,60 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
-/** One alternating voice-pair slot for the pad (two detuned triangles + sub sine), so chord
- * changes can crossfade between the outgoing and incoming root without clicks. The sub voice has
- * its own inner gain (scaled by PAD_SUB_GAIN_MULT) so it can sit quieter than the triangles while
- * still following the same outer crossfade envelope. */
+/** One alternating voice-pair slot for the pad (two detuned triangles — no sub-oscillator, see
+ * Task 39's de-drone removal above), so chord changes can crossfade between the outgoing and
+ * incoming root without clicks. */
 interface PadVoice {
   gain: GainNode;
   oscA: OscillatorNode;
   oscB: OscillatorNode;
-  sub: OscillatorNode;
-  subGain: GainNode;
 }
 
 /**
  * Generative ambient audio: a slowly shifting pentatonic pad bed, a sparse generative kalimba/bell
  * pluck arpeggio layer (through a ping-pong feedback delay) riding over the same chord roots, an
- * optional day-only high shimmer, day/night birds and crickets, and construction sfx (engine
- * rumble, stage-complete blips, demolish reverse-beeper). Everything is synthesized — no audio
- * files. Built lazily via `start()` on first user gesture (autoplay policy); until then no
- * `AudioContext` or nodes exist.
+ * optional day-only high shimmer, day/night birds and crickets, construction sfx (engine rumble,
+ * stage-complete blips, demolish reverse-beeper), and (Task 39) a slow-rotating background of real
+ * CC0 ambient music tracks. Built lazily via `start()` on first user gesture (autoplay policy);
+ * until then no `AudioContext` or nodes exist. The real tracks themselves are lazy-loaded even
+ * later — a few seconds after `start()` — so they never compete with anything at boot; the
+ * synthesized pad is a silent fallback that only becomes audible if zero tracks ever load
+ * successfully (offline/dev/blocked network).
  *
  * All one-shot and looping scheduling is driven by `ctx.currentTime` lookahead scheduling inside
  * `update()`, which is called once per render frame — there is no `setInterval` anywhere in this
- * class. Continuous sound sources (pad voices, pluck delay bus, shimmer osc, engine rumble, cricket
- * burst noise) are created once in `start()`/on first gate-open and reused; only true one-shots
- * (bird chirps, blips, beeper pulses, pluck/bell notes) allocate and discard nodes.
+ * class except the music track rotation's load-delay/gap timers, which use `window.setTimeout`
+ * because they span user-gesture/network-load boundaries rather than per-frame audio scheduling
+ * (see `MusicPlayer`). Continuous sound sources (pad voices, pluck delay bus, shimmer osc, engine
+ * rumble, cricket burst noise) are created once in `start()`/on first gate-open and reused; only
+ * true one-shots (bird chirps, blips, beeper pulses, pluck/bell notes) allocate and discard nodes.
  */
 export class AmbientAudio {
   private ctx: AudioContext | null = null;
   private master: GainNode | null = null;
   private sfxBus: GainNode | null = null;
+  /** Task 39: gain node sitting between `master` and `musicBus`, ramped by the MUSIC HUD toggle
+   * (independent of MUTE, which zeroes `master` and kills everything). Holds real tracks +
+   * pad-fallback ONLY — the pluck/shimmer layers stay on `musicBus` directly (unaffected by this
+   * toggle), matching the spec's "pluck stays SFX-adjacent on its current bus" instruction. */
+  private musicToggleGain: GainNode | null = null;
+  private _musicOn = true;
 
   private _muted = false;
 
-  // Pad
+  // Pad (Task 39: now a fallback, only unmuted when MusicPlayer has zero tracks loaded — see
+  // `updatePadFallbackGate`)
   private padVoices: [PadVoice, PadVoice] | null = null;
   private padActiveIdx = 0; // which of padVoices[] is the "current" (most recently entering) pair
   private padChordTimer = 0;
   private padChordIdx = 0;
   private padFilter: BiquadFilterNode | null = null;
   private padFilterCutoff = PAD_FILTER_DAY;
+  private padFallbackGain: GainNode | null = null; // gates the whole pad on/off based on track load state
+  private padFallbackCurrent = 0; // eased 0..1 toward updatePadFallbackGate's target
+
+  // Real ambient music track rotation (Task 39)
+  private musicPlayer: MusicPlayer | null = null;
 
   // Pluck / arpeggio layer
   private pluckBus: GainNode | null = null;
@@ -222,12 +259,14 @@ export class AmbientAudio {
     window.addEventListener('construction:graderScrape', this.onGraderScrape);
   }
 
-  /** Detaches the DOM listener registered in the constructor — call once when tearing down the
-   * whole ambient audio system (mirrors the dispose pattern other renderers in this codebase use,
-   * though AmbientAudio itself has no other disposable resources: AudioContext nodes are meant to
-   * live for the page's lifetime). */
+  /** Detaches the DOM listener registered in the constructor and (Task 39) tears down the music
+   * rotation's pending timers/`<audio>` elements — call once when tearing down the whole ambient
+   * audio system. Every synthesized AudioContext node otherwise still lives for the page's lifetime
+   * by design; `musicPlayer` is the one part of this class with real disposable resources
+   * (setTimeout handles, `<audio>` element network activity). */
   dispose(): void {
     window.removeEventListener('construction:graderScrape', this.onGraderScrape);
+    this.musicPlayer?.dispose();
   }
 
   get muted(): boolean {
@@ -244,6 +283,25 @@ export class AmbientAudio {
     this.master.gain.linearRampToValueAtTime(target, now + MUTE_RAMP);
   }
 
+  /** Task 39: MUSIC HUD toggle — controls ONLY the music-bus routing for real tracks + the pad
+   * fallback (via `musicToggleGain`), ramped so flipping it never clicks. Independent of `muted`:
+   * MUTE still master-kills everything (tracks, pad, pluck, birds, construction sfx alike), while
+   * this only silences the tracks/pad-fallback layer. Defaults to true (music on) and is expected
+   * to be persisted/restored by the caller (see Hud's localStorage wiring). */
+  get musicOn(): boolean {
+    return this._musicOn;
+  }
+
+  set musicOn(v: boolean) {
+    this._musicOn = v;
+    if (!this.ctx || !this.musicToggleGain) return;
+    const now = this.ctx.currentTime;
+    const target = v ? 1 : 0;
+    this.musicToggleGain.gain.cancelScheduledValues(now);
+    this.musicToggleGain.gain.setValueAtTime(this.musicToggleGain.gain.value, now);
+    this.musicToggleGain.gain.linearRampToValueAtTime(target, now + MUSIC_TOGGLE_RAMP);
+  }
+
   /** Builds the AudioContext and full node graph. Call once, from a user-gesture handler
    * (pointerdown). Safe to call more than once — no-ops after the first successful build. */
   start(): void {
@@ -257,9 +315,23 @@ export class AmbientAudio {
     master.connect(ctx.destination);
     this.master = master;
 
+    // musicBus: pluck/shimmer's existing, un-toggled home (Task 39 spec: these stay exactly as-is,
+    // "SFX-adjacent", unaffected by the MUSIC toggle — only MUTE reaches them, via `master`).
     const musicBus = ctx.createGain();
     musicBus.gain.value = MUSIC_GAIN;
     musicBus.connect(master);
+
+    // trackBus: real tracks + pad-fallback's home, gated by `musicToggleGain` (the MUSIC toggle) on
+    // its way to `master`. Kept at the same nominal level as musicBus so toggling MUSIC off/on
+    // doesn't change the overall balance of what's left playing.
+    const musicToggleGain = ctx.createGain();
+    musicToggleGain.gain.value = this._musicOn ? 1 : 0;
+    musicToggleGain.connect(master);
+    this.musicToggleGain = musicToggleGain;
+
+    const trackBus = ctx.createGain();
+    trackBus.gain.value = MUSIC_GAIN;
+    trackBus.connect(musicToggleGain);
 
     const sfxBus = ctx.createGain();
     sfxBus.gain.value = SFX_GAIN;
@@ -268,10 +340,16 @@ export class AmbientAudio {
 
     this.noiseBuffer = this.buildNoiseBuffer(ctx);
 
-    this.buildPad(ctx, musicBus);
+    this.buildPad(ctx, trackBus);
     this.buildPluckBus(ctx, musicBus);
     if (SHIMMER_ENABLED) this.buildShimmer(ctx, musicBus);
     this.buildConstructionBed(ctx, sfxBus);
+
+    this.musicPlayer = new MusicPlayer(ctx, trackBus);
+    // Lazy-load well after this first gesture (never block boot): a few seconds' delay, then the
+    // player fetches/decodes tracks on its own schedule (see MusicPlayer.beginLoading).
+    const delay = (TRACK_LOAD_DELAY_MIN + Math.random() * (TRACK_LOAD_DELAY_MAX - TRACK_LOAD_DELAY_MIN)) * 1000;
+    window.setTimeout(() => this.musicPlayer?.beginLoading(), delay);
 
     if (ctx.state === 'suspended') void ctx.resume();
   }
@@ -301,30 +379,20 @@ export class AmbientAudio {
     oscB.detune.value = PAD_DETUNE_CENTS;
     oscB.connect(gain);
 
-    // Sub voice gets its own inner gain scaled down (PAD_SUB_GAIN_MULT) so it reinforces the
-    // fundamental as warmth rather than reading as a separate drone layer.
-    const subGain = ctx.createGain();
-    subGain.gain.value = PAD_SUB_GAIN_MULT;
-    subGain.connect(gain);
-
-    const sub = ctx.createOscillator();
-    sub.type = 'sine';
-    sub.connect(subGain);
-
     const root = PAD_ROOTS_HZ[0];
     oscA.frequency.value = root;
     oscB.frequency.value = root;
-    sub.frequency.value = root * PAD_SUB_RATIO;
 
     oscA.start();
     oscB.start();
-    sub.start();
 
-    return { gain, oscA, oscB, sub, subGain };
+    return { gain, oscA, oscB };
   }
 
-  private buildPad(ctx: AudioContext, musicBus: AudioNode): void {
-    // Lowpass filter shared by both voice pairs, tremolo, then the music bus.
+  private buildPad(ctx: AudioContext, trackBus: AudioNode): void {
+    // Lowpass filter shared by both voice pairs, tremolo, then a fallback gate, then the track bus
+    // (Task 39: the pad now lives on the same bus as real tracks — it's a fallback for when none
+    // loaded, not a permanent background layer — see `padFallbackGain` / `updatePadFallbackGate`).
     const filter = ctx.createBiquadFilter();
     filter.type = 'lowpass';
     filter.frequency.value = PAD_FILTER_DAY;
@@ -335,7 +403,15 @@ export class AmbientAudio {
     const tremoloGain = ctx.createGain();
     tremoloGain.gain.value = 1;
     filter.connect(tremoloGain);
-    tremoloGain.connect(musicBus);
+
+    // Starts silent — `updatePadFallbackGate` (called every frame from `update()`) eases this open
+    // only while MusicPlayer reports zero successfully-loaded tracks, and eases it shut again the
+    // instant a real track becomes available.
+    const padFallbackGain = ctx.createGain();
+    padFallbackGain.gain.value = 0;
+    tremoloGain.connect(padFallbackGain);
+    padFallbackGain.connect(trackBus);
+    this.padFallbackGain = padFallbackGain;
 
     const lfo = ctx.createOscillator();
     lfo.type = 'sine';
@@ -519,12 +595,32 @@ export class AmbientAudio {
 
     this.updatePadFilter(dt, night);
     this.updatePadChords(dt);
+    this.updatePadFallbackGate(dt);
     this.updatePluck(dt, night);
     this.updateShimmer(dt, night);
     this.updateBirdsAndCrickets(dt, night);
     this.updateConstruction(dt, cameraX);
     this.updateRadioChatter(dt, cameraX);
     this.drainGraderScrapes(cameraX);
+    this.musicPlayer?.update();
+  }
+
+  /** Task 39: eases `padFallbackGain` toward 1 only while `musicPlayer` reports zero successfully
+   * loaded tracks (offline, dev with no network, or every track failed to load) — otherwise eases
+   * it toward 0, so the synthesized pad only ever fills in as a fallback rather than layering under
+   * real music. A short ease (not an instant snap) either way, matching this file's other gates. */
+  private updatePadFallbackGate(dt: number): void {
+    if (!this.padFallbackGain || !this.ctx) return;
+    const target = this.musicPlayer?.hasLoadedTrack() ? 0 : 1;
+    const rate = dt / 2; // ~2s ease
+    if (this.padFallbackCurrent < target) {
+      this.padFallbackCurrent = Math.min(target, this.padFallbackCurrent + rate);
+    } else if (this.padFallbackCurrent > target) {
+      this.padFallbackCurrent = Math.max(target, this.padFallbackCurrent - rate);
+    }
+    const now = this.ctx.currentTime;
+    this.padFallbackGain.gain.cancelScheduledValues(now);
+    this.padFallbackGain.gain.setValueAtTime(this.padFallbackCurrent, now);
   }
 
   private isNightFromTimeOfDay(timeOfDay: number): boolean {
@@ -577,7 +673,6 @@ export class AmbientAudio {
 
     incoming.oscA.frequency.setValueAtTime(nextRoot, now);
     incoming.oscB.frequency.setValueAtTime(nextRoot, now);
-    incoming.sub.frequency.setValueAtTime(nextRoot * PAD_SUB_RATIO, now);
 
     const steps = 24;
     outgoing.gain.gain.cancelScheduledValues(now);
@@ -1138,5 +1233,240 @@ export class AmbientAudio {
       g.disconnect();
       panner.disconnect();
     };
+  }
+}
+
+/** One of two reusable playback slots `MusicPlayer` crossfades between: a real `<audio>` element
+ * (so the browser handles network fetch/decode/buffering itself, rather than us downloading whole
+ * files via fetch()+decodeAudioData up front) wrapped in a `MediaElementAudioSourceNode`, feeding a
+ * per-slot gain node used purely for the crossfade envelope. A `MediaElementAudioSourceNode` is
+ * permanently bound to the element it was created from, but the element's `src` can be swapped
+ * freely — so each slot's element/source/gain trio is built once and reused for every track that
+ * plays in that slot for the life of the page. */
+interface TrackSlot {
+  el: HTMLAudioElement;
+  source: MediaElementAudioSourceNode;
+  gain: GainNode;
+}
+
+type MusicPlayerPhase = 'idle' | 'loading' | 'playing' | 'crossfading';
+
+/**
+ * Task 39: slow rotation of a handful of real, pre-recorded ambient tracks (see
+ * public/music/LICENSE.txt), one at a time, with a long equal-power crossfade between tracks and a
+ * generous silence gap after each one — deliberately not wall-to-wall music, since silence is part
+ * of this game's design. Lazy: does nothing until `beginLoading()` is called (by `AmbientAudio`,
+ * itself delayed a few seconds past the first user gesture). Any track that fails to load or play
+ * is simply skipped — never surfaced, never retried in a tight loop.
+ *
+ * Playback order is shuffled once at construction (Fisher-Yates) rather than looping the source
+ * array in place, so repeat sessions don't always open on the same track; the rotation still cycles
+ * indefinitely once it reaches the end.
+ */
+class MusicPlayer {
+  private slots: [TrackSlot, TrackSlot];
+  private activeSlot = 0;
+  private phase: MusicPlayerPhase = 'idle';
+  private order: number[];
+  private orderIdx = 0;
+  private loadedAny = false;
+  private started = false;
+  private gapTimer: ReturnType<typeof window.setTimeout> | null = null;
+  /** Wall-clock deadline (`performance.now()`-style ms) at which the currently-playing track should
+   * start crossfading to the next one — set once metadata/duration is known, so we can start the
+   * crossfade `TRACK_CROSSFADE` seconds before the track actually ends rather than waiting for an
+   * `ended` event (which would clip the outgoing tail with no gap for the fade). */
+  private crossfadeAt: number | null = null;
+  private endedFallbackAt: number | null = null; // safety net if duration never resolves
+
+  constructor(private ctx: AudioContext, private destination: AudioNode) {
+    this.slots = [this.makeSlot(), this.makeSlot()];
+    this.order = MusicPlayer.shuffledIndices(MUSIC_TRACKS.length);
+  }
+
+  private makeSlot(): TrackSlot {
+    const el = new Audio();
+    el.preload = 'none';
+    el.loop = false;
+    el.crossOrigin = 'anonymous';
+    const source = this.ctx.createMediaElementSource(el);
+    const gain = this.ctx.createGain();
+    gain.gain.value = 0;
+    source.connect(gain);
+    gain.connect(this.destination);
+    return { el, source, gain };
+  }
+
+  private static shuffledIndices(n: number): number[] {
+    const arr = Array.from({ length: n }, (_, i) => i);
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  /** True once at least one track has successfully started playing at any point this session —
+   * sticky (never reverts to false once true), so the pad fallback doesn't flicker back on during
+   * this player's own deliberate silence gaps between tracks. */
+  hasLoadedTrack(): boolean {
+    return this.loadedAny;
+  }
+
+  /** Kicks off the rotation. Safe to call only once — `AmbientAudio` guards this via its own
+   * setTimeout, but guard here too since `beginLoading` isn't otherwise idempotent-safe (it would
+   * restart the rotation from the top). */
+  beginLoading(): void {
+    if (this.started) return;
+    this.started = true;
+    this.playNext();
+  }
+
+  private currentTrack(): { file: string; title: string } {
+    return MUSIC_TRACKS[this.order[this.orderIdx]];
+  }
+
+  private advanceOrder(): void {
+    this.orderIdx = (this.orderIdx + 1) % this.order.length;
+  }
+
+  /** Loads and plays the next track in `order` into the inactive slot, then swaps `activeSlot` and
+   * fades it in. On any load/playback failure, skips straight to the track after that (still
+   * respecting the gap) rather than surfacing an error or retrying the same file in a hot loop.
+   * "Inactive slot" on the very first call (before anything has ever played) is just `slots[1]` —
+   * both slots start silent, so either would do, but staying consistent with the later
+   * always-the-other-one rule keeps this simple. */
+  private playNext(): void {
+    if (MUSIC_TRACKS.length === 0) return;
+    const nextSlotIdx = this.activeSlot === 0 ? 1 : 0;
+    const slot = this.slots[nextSlotIdx];
+    const track = this.currentTrack();
+    this.advanceOrder();
+
+    this.phase = 'loading';
+    const el = slot.el;
+
+    const onFailure = () => {
+      cleanup();
+      // Skip this track; try the next one after a short beat rather than hammering the network in
+      // a tight loop if e.g. the whole music/ directory 404s.
+      this.phase = 'idle';
+      this.gapTimer = window.setTimeout(() => this.playNext(), 2000);
+    };
+    const onReady = () => {
+      cleanup();
+      this.fadeInSlot(nextSlotIdx);
+    };
+    const cleanup = () => {
+      el.removeEventListener('canplaythrough', onReady);
+      el.removeEventListener('error', onFailure);
+    };
+
+    el.addEventListener('canplaythrough', onReady, { once: true });
+    el.addEventListener('error', onFailure, { once: true });
+    el.preload = 'auto';
+    el.src = MUSIC_BASE_URL + track.file;
+    el.load();
+  }
+
+  /** Starts playback of the now-loaded slot and equal-power-crossfades it in over TRACK_CROSSFADE
+   * seconds (against whatever was previously active, if anything — the very first track just fades
+   * up from silence since the "outgoing" slot is already at 0 gain). */
+  private fadeInSlot(slotIdx: number): void {
+    const ctx = this.ctx;
+    const incoming = this.slots[slotIdx];
+    const outgoing = this.slots[slotIdx === 0 ? 1 : 0];
+
+    const playResult = incoming.el.play();
+    if (playResult && typeof playResult.catch === 'function') {
+      playResult.catch(() => {
+        // Autoplay/decoding rejection this late (post-gesture, post-delay) is rare but not
+        // impossible (e.g. a mid-session permission change) — treat exactly like a load failure.
+        this.phase = 'idle';
+        this.gapTimer = window.setTimeout(() => this.playNext(), 2000);
+      });
+    }
+
+    this.loadedAny = true;
+    this.activeSlot = slotIdx;
+    this.phase = 'crossfading';
+
+    // Equal-power crossfade: outgoing eases from its current level (TRACK_GAIN if a previous track
+    // was playing, 0 if this is the very first track) down to 0, while incoming eases from 0 up to
+    // TRACK_GAIN, over TRACK_CROSSFADE seconds.
+    const now = ctx.currentTime;
+    const steps = 30;
+    const outStart = outgoing.gain.gain.value;
+    outgoing.gain.gain.cancelScheduledValues(now);
+    incoming.gain.gain.cancelScheduledValues(now);
+    outgoing.gain.gain.setValueAtTime(outStart, now);
+    incoming.gain.gain.setValueAtTime(0, now);
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const at = now + t * TRACK_CROSSFADE;
+      outgoing.gain.gain.linearRampToValueAtTime(outStart * Math.cos(t * 0.5 * Math.PI), at);
+      incoming.gain.gain.linearRampToValueAtTime(TRACK_GAIN * Math.sin(t * 0.5 * Math.PI), at);
+    }
+
+    window.setTimeout(() => {
+      outgoing.el.pause();
+      outgoing.el.removeAttribute('src');
+      outgoing.el.load();
+      if (this.phase === 'crossfading') this.phase = 'playing';
+    }, TRACK_CROSSFADE * 1000 + 50);
+
+    // Schedule the next crossfade to start TRACK_CROSSFADE seconds before this track's own natural
+    // end (once duration is known), so the outgoing fade completes right as playback would end
+    // rather than clipping the tail. Duration is sometimes available immediately (cached/preloaded
+    // metadata) and sometimes only after `loadedmetadata`.
+    const scheduleFromDuration = () => {
+      const dur = incoming.el.duration;
+      if (!isFinite(dur) || dur <= 0) return;
+      const msUntilCrossfade = Math.max(1000, (dur - TRACK_CROSSFADE) * 1000);
+      this.crossfadeAt = performance.now() + msUntilCrossfade;
+      this.endedFallbackAt = performance.now() + dur * 1000 + 500;
+    };
+    if (isFinite(incoming.el.duration) && incoming.el.duration > 0) {
+      scheduleFromDuration();
+    } else {
+      incoming.el.addEventListener('loadedmetadata', scheduleFromDuration, { once: true });
+    }
+  }
+
+  /** Per-frame poll (called from AmbientAudio.update()) — cheap wall-clock deadline checks only, no
+   * per-sample work. Starts the gap once the active track's scheduled crossfade point passes, or —
+   * as a safety net, via `endedFallbackAt` — once the track's estimated natural end passes with no
+   * crossfade ever having been scheduled (duration never resolved, e.g. a `loadedmetadata` that
+   * never fired), so a track can't loop forever silently rather than rotating. */
+  update(): void {
+    if (this.phase !== 'playing') return;
+    const now = performance.now();
+    if (this.crossfadeAt !== null && now >= this.crossfadeAt) {
+      this.crossfadeAt = null;
+      this.endedFallbackAt = null;
+      this.beginGap();
+    } else if (this.crossfadeAt === null && this.endedFallbackAt !== null && now >= this.endedFallbackAt) {
+      this.endedFallbackAt = null;
+      this.beginGap();
+    }
+  }
+
+  /** Silence gap (TRACK_GAP_MIN..MAX seconds) between one track ending and the next one starting —
+   * this pause is deliberate: a zen game doesn't need wall-to-wall music. */
+  private beginGap(): void {
+    this.phase = 'idle';
+    const gap = (TRACK_GAP_MIN + Math.random() * (TRACK_GAP_MAX - TRACK_GAP_MIN)) * 1000;
+    this.gapTimer = window.setTimeout(() => this.playNext(), gap);
+  }
+
+  /** Cancels any pending gap/retry timer and pauses both slots — mirrors AmbientAudio's own
+   * dispose() pattern. Called from AmbientAudio.dispose() when tearing down the whole audio system. */
+  dispose(): void {
+    if (this.gapTimer !== null) window.clearTimeout(this.gapTimer);
+    this.gapTimer = null;
+    for (const slot of this.slots) {
+      slot.el.pause();
+      slot.el.removeAttribute('src');
+    }
   }
 }

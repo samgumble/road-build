@@ -1,0 +1,58 @@
+Ambient music tracks (Task 39 "Groundwork" — real ambient music + de-drone)
+============================================================================
+
+All three tracks below are sourced from OpenGameArt.org (opengameart.org) and
+are released under CC0 1.0 Universal (Public Domain Dedication):
+https://creativecommons.org/publicdomain/zero/1.0/
+
+CC0 means: no attribution required, free for personal/educational/commercial
+use, modification and redistribution permitted. Attribution is included below
+anyway as a courtesy to the authors.
+
+Downloaded verbatim (no re-encoding — files were already small enough to fit
+the ≤8MB budget without needing ffmpeg) on 2026-07-04.
+
+--------------------------------------------------------------------------
+
+1. contemplation.mp3
+   Title: "Contemplation"
+   Author: Joth
+   Source page: https://opengameart.org/content/contemplation-0
+   Direct file: https://opengameart.org/sites/default/files/Contemplation.mp3
+   License: CC0 1.0 Universal (page lists a single license: CC0)
+   Format: MP3, 160kbps, 44.1kHz joint-stereo
+   Size: ~2.4 MB
+   Notes: Quiet, form-free ambient bed — "just ambience" per the author's own
+   description. No melody to loop-clash against.
+
+2. ice-shine-bells.ogg
+   Title: "Ice Shine Bells"
+   Author: hc
+   Source page: https://opengameart.org/content/ice-shine-bells
+   Direct file: https://opengameart.org/sites/default/files/Ice-Shine-Bells_0.ogg
+   License: dual-licensed CC-BY 3.0 / CC0 1.0 — used here under the CC0 grant.
+   https://creativecommons.org/publicdomain/zero/1.0/
+   Format: Ogg Vorbis, mono, ~96kbps, 44.1kHz
+   Size: ~1.6 MB
+   Notes: Calm bell/keyboard improvisation, described by the author as "Calm
+   ambient music for an icy or crystal cave."
+
+3. the-fade.mp3
+   Title: "The Fade"
+   Author: Breadman
+   Source page: https://opengameart.org/content/the-fade
+   Direct file: https://opengameart.org/sites/default/files/the_fade_0.mp3
+   License: CC0 1.0 Universal (page lists a single license: CC0)
+   Format: MP3, 128kbps, 44.1kHz joint-stereo
+   Size: ~1.9 MB
+   Notes: Ambient choir with a gentle, natural bass rhythm — described by the
+   author as suited to "an intro sequence, a dream sequence, a flashback, or
+   other slow moving scenes."
+
+--------------------------------------------------------------------------
+
+Total: ~5.97 MB (budget was ≤8 MB).
+
+None of these files were modified from the versions downloaded above (no
+trimming, re-encoding, or normalization) — bitrates/sizes were already small
+enough to fit the budget directly.
