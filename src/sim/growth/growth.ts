@@ -74,6 +74,27 @@ const TREE_SPAWN_CHANCE = 0.4;
 const TREE_COUNT_MIN = 1;
 const TREE_COUNT_MAX = 2; // inclusive-exclusive count is TREE_COUNT_MIN + floor(rng * (MAX - MIN + 1))
 
+// Task 35: a cell "upgrades" its house record to a building once its own dev accumulator reaches
+// this level AND at least HOUSE_UPGRADE_MIN_NEIGHBORS of its 4 orthogonal neighbor cells are
+// themselves "developed" (dev >= the house threshold, i.e. 0.75 — see THRESHOLDS below). Upgrading
+// mutates the record's `kind` in place (same id, same x/z/rot) rather than removing+respawning, so
+// it reads as "this house became a building" rather than a demolish+rebuild. A cell can upgrade at
+// most once because after upgrading its only house record is no longer kind 'house' — nothing left
+// to match a second time.
+const HOUSE_UPGRADE_DEV = 1.35;
+const HOUSE_UPGRADE_MIN_NEIGHBORS = 2;
+
+// Task 35: stranded decay. A record is "stranded" once its cell's road-distance field reads -1
+// (i.e. farther than MAX_ROAD_DIST_CELLS cells — exactly the ~24u figure from Addendum D's spec —
+// from any painted road after the BFS last recomputed). It then sits in a grace period; if still
+// stranded once the grace elapses, it fades out over STRANDED_FADE_S and is finally removed.
+const STRANDED_GRACE_S = 60; // sim-seconds before a stranded record starts fading
+const STRANDED_FADE_S = 30; // sim-seconds fade duration (renderer-side animation; sim just times it)
+// Dev is decayed back toward this floor (not all the way to 0) when a record over its cell is
+// removed, so the cell doesn't need to fully re-climb from scratch to regrow — matching the user
+// decision that regrowth should be "possible... but not instant".
+const STRANDED_DEV_DECAY_TARGET = 0.4;
+
 export type GrowthKind = 'tree' | 'field' | 'house' | 'building';
 
 interface Threshold {
@@ -103,11 +124,20 @@ const THRESHOLDS: Threshold[] = [
   { value: 1.05, bit: 1 << 3, kind: 'building' },
 ];
 
+// Task 35: a neighbor cell counts as "developed" for upgrade-eligibility purposes once its dev
+// accumulator has crossed the same threshold a cell needs to spawn its own house — i.e. the
+// 'house' entry above. Read once as a plain number rather than re-finding it in THRESHOLDS on
+// every neighbor check.
+const NEIGHBOR_DEVELOPED_DEV = THRESHOLDS[2].value;
+
 export interface SpawnRecord {
   kind: GrowthKind;
   x: number;
   z: number;
   rot: number;
+  // Task 35: stable id, monotonic within a GrowthSim instance, persisted in saves (SaveV3). Older
+  // saves (v1/v2, no ids) get sequential ids assigned during migration — see save.ts.
+  id: number;
 }
 
 function cellIndex(i: number, j: number): number {
@@ -116,6 +146,15 @@ function cellIndex(i: number, j: number): number {
 
 function cellCenter(i: number, j: number): P2 {
   return { x: i * CELL - HALF, z: j * CELL - HALF };
+}
+
+/** Maps a world position back to its nearest grid cell (i, j), clamped to the grid — inverse of
+ * `cellCenter`, used to look up a spawn record's own cell (e.g. for road-distance/spawnMask
+ * checks) even though records are jittered off their cell's exact center. */
+function cellOf(x: number, z: number): { i: number; j: number } {
+  const i = Math.min(GRID_SIZE - 1, Math.max(0, Math.round((x + HALF) / CELL)));
+  const j = Math.min(GRID_SIZE - 1, Math.max(0, Math.round((z + HALF) / CELL)));
+  return { i, j };
 }
 
 /**
@@ -145,6 +184,16 @@ export class GrowthSim {
 
   private houses = 0;
   private records: SpawnRecord[] = [];
+  private nextRecordId = 1;
+
+  // Task 35: upgrade bookkeeping — a bit per cell (separate from spawnMask's threshold bits) so an
+  // already-upgraded cell is never rescanned. Task 35: stranded-decay bookkeeping, keyed by record
+  // id (not array index, which shifts on removal) — `strandedSince` marks when a record first read
+  // as stranded (cleared if it stops being stranded before the grace elapses, e.g. re-roading);
+  // `fading` marks the sim-time a record's fade animation started, once the grace period elapses.
+  private upgradedCell = new Uint8Array(GRID_SIZE * GRID_SIZE);
+  private strandedSince = new Map<number, number>(); // id -> simTime first observed stranded
+  private fadingSince = new Map<number, number>(); // id -> simTime fade began (post-grace)
 
   constructor(
     private graph: RoadGraph,
@@ -181,7 +230,19 @@ export class GrowthSim {
   restore(dev: ArrayLike<number>, spawned: ReadonlyArray<SpawnRecord>): void {
     this.dev.set(dev);
     this.spawnMask.fill(0);
-    this.records = spawned.slice();
+    this.upgradedCell.fill(0);
+    this.strandedSince.clear();
+    this.fadingSince.clear();
+    // Task 35: a pre-Task-35 save's records have no `id` (migration in save.ts assigns one, but
+    // defend here too in case a caller passes raw records some other way) — assign sequential ids
+    // to any record missing one, deterministically in array order.
+    let maxId = 0;
+    this.records = spawned.map((r) => {
+      const id = typeof r.id === 'number' && Number.isFinite(r.id) ? r.id : this.nextRecordId++;
+      if (id > maxId) maxId = id;
+      return { ...r, id };
+    });
+    this.nextRecordId = Math.max(this.nextRecordId, maxId + 1);
     this.houses = this.records.filter((r) => r.kind === 'house').length;
 
     for (let j = 0; j < GRID_SIZE; j++) {
@@ -191,6 +252,15 @@ export class GrowthSim {
         for (const th of THRESHOLDS) {
           if (level >= th.value) this.spawnMask[idx] |= th.bit;
         }
+        // Deliberately NOT marking `upgradedCell` here just because `level >= HOUSE_UPGRADE_DEV`:
+        // unlike spawnMask's thresholds (which must never re-fire a spawn for a cell that already
+        // has one), a restored cell whose record is STILL kind 'house' at this dev level hasn't
+        // actually upgraded yet — it should get exactly one more chance to do so on the next
+        // `update()`, the same as any other cell reaching this dev level live. `tryUpgrade` itself
+        // sets `upgradedCell[idx] = 1` unconditionally once it runs (whether or not a house was
+        // found to upgrade), so the "once per record" guarantee still holds without this needing to
+        // pre-empt it — a restored 'building' record simply has no house left for `tryUpgrade` to
+        // find, so its (single, harmless) next check is a no-op.
       }
     }
 
@@ -396,8 +466,9 @@ export class GrowthSim {
       rot = this.rng() * Math.PI * 2;
     }
 
-    this.records.push({ kind, x, z, rot });
-    this.bus.emit('growth:spawn', { kind, x, z, rot });
+    const id = this.nextRecordId++;
+    this.records.push({ kind, x, z, rot, id });
+    this.bus.emit('growth:spawn', { kind, x, z, rot, id });
     if (kind === 'house') this.houses++;
   }
 
@@ -446,7 +517,114 @@ export class GrowthSim {
             this.spawn(th.kind, x, z);
           }
         }
+
+        if (level >= HOUSE_UPGRADE_DEV && !this.upgradedCell[idx]) {
+          this.tryUpgrade(i, j, idx);
+        }
       }
+    }
+
+    this.updateStrandedDecay();
+  }
+
+  /**
+   * Task 35: upgrades an existing house record in cell (i, j) to a building once the cell's own
+   * dev has reached HOUSE_UPGRADE_DEV and at least HOUSE_UPGRADE_MIN_NEIGHBORS of its 4 orthogonal
+   * neighbor cells are themselves developed (dev >= NEIGHBOR_DEVELOPED_DEV). Marks the cell
+   * upgraded either way once the dev condition is met, so a cell that qualifies on dev but lacks
+   * neighbors yet is re-checked next tick rather than every frame forever — actually: only marked
+   * once an upgrade actually happens, or once no house record exists in the cell to upgrade at all
+   * (nothing to upgrade — mirrors a spawnMask bit meaning "handled", not "eligible").
+   */
+  private tryUpgrade(i: number, j: number, idx: number): void {
+    const neighbors: Array<[number, number]> = [
+      [i - 1, j], [i + 1, j], [i, j - 1], [i, j + 1],
+    ];
+    let developedNeighbors = 0;
+    for (const [ni, nj] of neighbors) {
+      if (ni < 0 || nj < 0 || ni >= GRID_SIZE || nj >= GRID_SIZE) continue;
+      if (this.dev[cellIndex(ni, nj)] >= NEIGHBOR_DEVELOPED_DEV) developedNeighbors++;
+    }
+    if (developedNeighbors < HOUSE_UPGRADE_MIN_NEIGHBORS) return; // not yet — recheck next tick
+
+    let target: SpawnRecord | null = null;
+    for (const r of this.records) {
+      if (r.kind !== 'house') continue;
+      const c = cellOf(r.x, r.z);
+      if (c.i === i && c.j === j) {
+        target = r;
+        break;
+      }
+    }
+
+    this.upgradedCell[idx] = 1; // handled either way — no house here means nothing to upgrade, ever
+    if (!target) return;
+
+    target.kind = 'building';
+    this.houses--;
+    this.bus.emit('growth:upgrade', { id: target.id });
+  }
+
+  /**
+   * Task 35: stranded decay. A record is "stranded" once its own cell reads -1 in `roadDist` (more
+   * than MAX_ROAD_DIST_CELLS cells — ~24u — from any painted road as of the last BFS recompute).
+   * Runs every `update()` (not just on recompute) so grace/fade timers advance smoothly, but the
+   * underlying roadDist field itself only changes when `recomputeRoadDist` runs.
+   *
+   * Timeline per record: not stranded -> (becomes stranded) start grace clock -> if still stranded
+   * after STRANDED_GRACE_S, start fade clock + emit `growth:stranded` once -> if still stranded
+   * after STRANDED_FADE_S more, remove the record, clear the cell's spawnMask bits (regrowth
+   * possible), decay that cell's dev toward STRANDED_DEV_DECAY_TARGET, decrement houseCount for a
+   * house, and emit `growth:remove`. Re-roading (the cell's roadDist becomes >= 0 again) at any
+   * point before removal cancels both timers — the record is safe again.
+   */
+  private updateStrandedDecay(): void {
+    if (!this.records.length) return;
+
+    const toRemove: number[] = []; // indices into this.records, descending order for safe splice
+    for (let ri = this.records.length - 1; ri >= 0; ri--) {
+      const r = this.records[ri];
+      const { i, j } = cellOf(r.x, r.z);
+      const idx = cellIndex(i, j);
+      const stranded = this.roadDist[idx] === -1;
+
+      if (!stranded) {
+        // Safe again — cancel any in-flight timers for this record.
+        if (this.strandedSince.has(r.id)) this.strandedSince.delete(r.id);
+        if (this.fadingSince.has(r.id)) this.fadingSince.delete(r.id);
+        continue;
+      }
+
+      if (!this.fadingSince.has(r.id)) {
+        let since = this.strandedSince.get(r.id);
+        if (since === undefined) {
+          since = this.simTime;
+          this.strandedSince.set(r.id, since);
+        }
+        if (this.simTime - since >= STRANDED_GRACE_S) {
+          this.strandedSince.delete(r.id);
+          this.fadingSince.set(r.id, this.simTime);
+          this.bus.emit('growth:stranded', { id: r.id });
+        }
+        continue;
+      }
+
+      const fadeStart = this.fadingSince.get(r.id)!;
+      if (this.simTime - fadeStart >= STRANDED_FADE_S) {
+        this.fadingSince.delete(r.id);
+        toRemove.push(ri);
+      }
+    }
+
+    for (const ri of toRemove) {
+      const [removed] = this.records.splice(ri, 1);
+      if (removed.kind === 'house') this.houses--;
+      const { i, j } = cellOf(removed.x, removed.z);
+      const idx = cellIndex(i, j);
+      this.spawnMask[idx] = 0;
+      this.upgradedCell[idx] = 0;
+      this.dev[idx] = Math.min(this.dev[idx], STRANDED_DEV_DECAY_TARGET);
+      this.bus.emit('growth:remove', { id: removed.id });
     }
   }
 }

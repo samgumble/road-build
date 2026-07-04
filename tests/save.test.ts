@@ -36,7 +36,7 @@ describe('save/load', () => {
     w.graph.edges.get(id)!.stage = 'painted';
     const json = serialize({ seed: 'save-test', timeOfDay: 0.7, graph: w.graph, growth: w.growth, quarry: w.quarry });
     const save = deserialize(json)!;
-    expect(save.version).toBe(2);
+    expect(save.version).toBe(3);
     const w2 = freshWorld('save-test');
     restoreWorld(save, w2);
     expect(w2.graph.edges.size).toBe(1);
@@ -167,7 +167,7 @@ describe('save/load', () => {
 
       const save = deserialize(json);
       expect(save).not.toBeNull();
-      expect(save!.version).toBe(2);
+      expect(save!.version).toBe(3);
 
       const w2 = freshWorld('quarry-migration');
       expect(w2.quarry.placement).toBeNull();
@@ -194,6 +194,90 @@ describe('save/load', () => {
       const w = freshWorld('quarry-migration-empty');
       restoreWorld(save!, w);
       expect(w.quarry.placement).toBeNull();
+    });
+  });
+
+  describe('record ids (Task 35)', () => {
+    it('round-trips ids on growth records through serialize/deserialize', () => {
+      const w = freshWorld('ids-roundtrip');
+      const anchor = findAnchor(w.hf, 64);
+      w.graph.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+      for (const e of w.graph.edges.values()) e.stage = 'painted';
+      w.bus.emit('roads:changed', {});
+      for (let i = 0; i < 60 * 420; i++) w.growth.update(1 / 60);
+      expect(w.growth.spawned.length).toBeGreaterThan(0);
+      const ids = w.growth.spawned.map((r) => r.id);
+      expect(new Set(ids).size).toBe(ids.length); // all unique
+      expect(ids.every((id) => typeof id === 'number')).toBe(true);
+
+      const json = serialize({ seed: 'ids-roundtrip', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry });
+      const save = deserialize(json)!;
+      expect(save.growth.spawned.map((r) => r.id)).toEqual(ids);
+    });
+
+    it('a v2 save (no record ids) migrates forward: deserialize assigns sequential ids', () => {
+      const v2Save = {
+        version: 2,
+        seed: 'ids-migration',
+        timeOfDay: 0,
+        edges: [],
+        growth: {
+          dev: [],
+          spawned: [
+            { kind: 'tree', x: 1, z: 2, rot: 0 },
+            { kind: 'house', x: 3, z: 4, rot: 1 },
+            { kind: 'field', x: 5, z: 6, rot: 2 },
+          ],
+        },
+        quarry: null,
+      };
+      const save = deserialize(JSON.stringify(v2Save));
+      expect(save).not.toBeNull();
+      expect(save!.version).toBe(3);
+      const ids = save!.growth.spawned.map((r) => r.id);
+      expect(ids).toEqual([1, 2, 3]);
+      expect(new Set(ids).size).toBe(3);
+    });
+
+    it('a v1 save (no record ids, no quarry) migrates all the way to v3 with ids assigned', () => {
+      const v1Save = {
+        version: 1,
+        seed: 'ids-migration-v1',
+        timeOfDay: 0,
+        edges: [],
+        growth: {
+          dev: [],
+          spawned: [
+            { kind: 'tree', x: 1, z: 2, rot: 0 },
+            { kind: 'building', x: 3, z: 4, rot: 1 },
+          ],
+        },
+      };
+      const save = deserialize(JSON.stringify(v1Save));
+      expect(save).not.toBeNull();
+      expect(save!.version).toBe(3);
+      expect(save!.growth.spawned.map((r) => r.id)).toEqual([1, 2]);
+      expect(save!.quarry).toBeUndefined(); // still the v1-migration sentinel, unresolved (no edges)
+    });
+
+    it('restoring a migrated save into a live GrowthSim yields ids usable for upgrade/remove', () => {
+      const v2Save = {
+        version: 2,
+        seed: 'ids-restore',
+        timeOfDay: 0,
+        edges: [],
+        growth: {
+          dev: [],
+          spawned: [{ kind: 'house', x: 10, z: 10, rot: 0 }],
+        },
+        quarry: null,
+      };
+      const save = deserialize(JSON.stringify(v2Save))!;
+      const w = freshWorld('ids-restore');
+      restoreWorld(save, w);
+      expect(w.growth.spawned.length).toBe(1);
+      expect(typeof w.growth.spawned[0].id).toBe('number');
+      expect(w.growth.houseCount).toBe(1);
     });
   });
 });

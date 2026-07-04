@@ -15,7 +15,7 @@ import { sampleHeadingAt } from './roads/path';
 import { EventBus } from '../core/events';
 import { QuarrySim, placeQuarry, type QuarryPlacement } from './quarry';
 
-const SAVE_VERSION = 2 as const;
+const SAVE_VERSION = 3 as const;
 
 export interface SaveV1 {
   version: 1;
@@ -47,7 +47,25 @@ export interface SaveV2 {
   quarry: QuarryPlacement | null;
 }
 
-export type AnySave = SaveV2;
+/**
+ * v3 (Task 35): no shape change over v2 besides `growth.spawned` records now always carrying a
+ * stable `id` (SpawnRecord.id became non-optional once upgrades/stranded-decay needed a way to
+ * reference a specific record across events). v1/v2 saves predate ids entirely; migrating them
+ * forward assigns sequential ids in array order (deterministic given the same saved array), which
+ * is exactly what `GrowthSim.restore` would also do defensively if handed id-less records directly
+ * — this migration just does it explicitly and earlier, at the save layer, so `AnySave` callers can
+ * rely on every record having a real id straight out of `deserialize`.
+ */
+export interface SaveV3 {
+  version: 3;
+  seed: string;
+  timeOfDay: number;
+  edges: { ctrl: P2[]; stage: Stage }[];
+  growth: { dev: number[]; spawned: SpawnRecord[] };
+  quarry: QuarryPlacement | null;
+}
+
+export type AnySave = SaveV3;
 
 /** Minimal shape `serialize` needs from the live world. */
 interface SerializableWorld {
@@ -59,7 +77,7 @@ interface SerializableWorld {
 }
 
 export function serialize(world: SerializableWorld): string {
-  const save: SaveV2 = {
+  const save: SaveV3 = {
     version: SAVE_VERSION,
     seed: world.seed,
     timeOfDay: world.timeOfDay,
@@ -73,6 +91,20 @@ export function serialize(world: SerializableWorld): string {
     quarry: world.quarry.placement,
   };
   return JSON.stringify(save);
+}
+
+/** Assigns sequential ids (1-based, array order) to any records missing one — used by the v1/v2 ->
+ * v3 migration path. Deterministic given the same input array; already-present ids (shouldn't occur
+ * pre-v3, but handled defensively) are left untouched and never collided with. */
+function assignIds(spawned: SpawnRecord[]): SpawnRecord[] {
+  let next = 1;
+  for (const r of spawned) {
+    if (typeof r.id === 'number' && Number.isFinite(r.id) && r.id >= next) next = r.id + 1;
+  }
+  return spawned.map((r) => {
+    if (typeof r.id === 'number' && Number.isFinite(r.id)) return r;
+    return { ...r, id: next++ };
+  });
 }
 
 function validateEdges(edges: unknown): edges is { ctrl: P2[]; stage: Stage }[] {
@@ -110,8 +142,8 @@ function validQuarry(q: unknown): q is QuarryPlacement | null {
   );
 }
 
-/** Loosely-typed shape covering both v1 and v2 on-disk saves, used only inside `deserialize` before
- * the version-specific validation/migration below settles on a real `SaveV2`. */
+/** Loosely-typed shape covering v1/v2/v3 on-disk saves, used only inside `deserialize` before the
+ * version-specific validation/migration below settles on a real `SaveV3`. */
 interface RawSaveShape {
   version?: unknown;
   seed?: unknown;
@@ -121,12 +153,18 @@ interface RawSaveShape {
   quarry?: unknown;
 }
 
-/** Returns `null` on parse error or unrecognized version — caller should start a fresh world.
- * Migrates a v1 save forward to v2 shape (see SaveV2's doc comment) — the migration itself only
- * fills in `quarry: undefined` (deferred to `restoreWorld`, which has the Heightfield + first
- * edge's samples needed to actually compute a placement); this function's job is just to accept
- * the older shape rather than reject it outright. */
-export function deserialize(json: string): SaveV2 | null {
+/**
+ * Returns `null` on parse error or unrecognized version — caller should start a fresh world.
+ * Migrations chain forward one step at a time so each step only has to reason about its own
+ * predecessor's shape, mirroring the SaveV1 -> SaveV2 -> SaveV3 doc comments above:
+ *   v1 -> v2: fills in `quarry: undefined` (deferred to `restoreWorld`, which has the Heightfield +
+ *             first edge's samples needed to actually compute a placement) — this function's job
+ *             is just to accept the older shape rather than reject it outright.
+ *   v2 -> v3: assigns sequential ids (via `assignIds`) to every `growth.spawned` record, since v2
+ *             predates SpawnRecord.id entirely.
+ * A v1 save therefore falls through both steps to reach v3 in one `deserialize` call.
+ */
+export function deserialize(json: string): SaveV3 | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(json);
@@ -135,7 +173,7 @@ export function deserialize(json: string): SaveV2 | null {
   }
   if (typeof parsed !== 'object' || parsed === null) return null;
   const p = parsed as RawSaveShape;
-  if (p.version !== 1 && p.version !== 2) return null;
+  if (p.version !== 1 && p.version !== 2 && p.version !== 3) return null;
 
   if (
     typeof p.seed !== 'string' ||
@@ -149,32 +187,30 @@ export function deserialize(json: string): SaveV2 | null {
     return null;
   }
   const dev = p.growth.dev as number[];
-  const spawned = p.growth.spawned as SpawnRecord[];
+  const rawSpawned = p.growth.spawned as SpawnRecord[];
 
+  // Step 1: v1 -> v2 (quarry field). v2 and v3 both require a valid `quarry` key; v1 has none at
+  // all, which migrates to the `undefined` sentinel (see this function's doc comment above).
+  let quarry: QuarryPlacement | null | undefined;
   if (p.version === 1) {
-    // Migration: v1 has no `quarry` slot at all. Mark it `undefined` here (distinct from an
-    // explicit `null`, which v2 uses to mean "no road ever committed, no quarry yet") so
-    // `restoreWorld` knows to compute one from the restored graph's first edge rather than assume
-    // there's genuinely nothing to place.
-    return {
-      version: 2,
-      seed: p.seed,
-      timeOfDay: p.timeOfDay,
-      edges: p.edges,
-      growth: { dev, spawned },
-      quarry: undefined as unknown as QuarryPlacement | null,
-    };
+    quarry = undefined as unknown as QuarryPlacement | null;
+  } else {
+    if (!('quarry' in p) || !validQuarry(p.quarry)) return null;
+    quarry = p.quarry as QuarryPlacement | null;
   }
 
-  if (!('quarry' in p) || !validQuarry(p.quarry)) return null;
+  // Step 2: v2 -> v3 (record ids). v3 saves already have ids on every record (round-tripped via
+  // `serialize`); v1/v2 saves have none, so `assignIds` backfills them deterministically. Calling
+  // it unconditionally on an already-v3 save is a harmless no-op (every record already has an id).
+  const spawned = assignIds(rawSpawned);
 
   return {
-    version: 2,
+    version: 3,
     seed: p.seed,
     timeOfDay: p.timeOfDay,
     edges: p.edges,
     growth: { dev, spawned },
-    quarry: p.quarry,
+    quarry: quarry as QuarryPlacement | null,
   };
 }
 
@@ -213,7 +249,7 @@ interface RestoreDeps {
  * ungraded terrain under an already-built road. Finally restores growth state and emits
  * `roads:changed` once so downstream systems (lane markings, growth road-distance field) recompute.
  */
-export function restoreWorld(save: SaveV2, deps: RestoreDeps): void {
+export function restoreWorld(save: SaveV3, deps: RestoreDeps): void {
   const { bus, hf, graph, growth, queue, quarry } = deps;
   const gradeRadius = ROAD_WIDTH / 2;
   const offset = ROAD_WIDTH / 2 - 0.8;

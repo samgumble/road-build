@@ -1,10 +1,18 @@
 import { describe, it, expect } from 'vitest';
-import { GrowthSim } from '../src/sim/growth/growth';
+import { GrowthSim, type SpawnRecord } from '../src/sim/growth/growth';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { Heightfield } from '../src/sim/terrain/heightfield';
 import { makeSampler } from '../src/sim/roads/path';
 import { EventBus } from '../src/core/events';
 import { createRng } from '../src/core/rng';
+import { GRID_SIZE, CELL, WORLD_SIZE } from '../src/core/constants';
+
+const HALF = WORLD_SIZE / 2;
+/** Inverse of growth.ts's private `cellCenter` — maps a grid cell (i, j) back to its world-space
+ * center, matching `CELL`/`GRID_SIZE` exactly as growth.ts does internally. */
+function cellCenter(i: number, j: number): { x: number; z: number } {
+  return { x: i * CELL - HALF, z: j * CELL - HALF };
+}
 
 function world() {
   const bus = new EventBus();
@@ -123,5 +131,308 @@ describe('GrowthSim', () => {
     const a = run();
     const b = run();
     expect(a).toEqual(b);
+  });
+
+  // Task 35: stable ids on spawn records.
+  describe('record ids', () => {
+    it('assigns unique, monotonic ids to spawned records', () => {
+      const { bus, sim } = world();
+      const ids: number[] = [];
+      bus.on('growth:spawn', (e) => {
+        expect(typeof e.id).toBe('number');
+        ids.push(e.id!);
+      });
+      for (let i = 0; i < 60 * 420; i++) sim.update(1 / 60);
+      expect(ids.length).toBeGreaterThan(0);
+      expect(new Set(ids).size).toBe(ids.length);
+      for (let i = 1; i < ids.length; i++) expect(ids[i]).toBeGreaterThan(ids[i - 1]);
+      // sim.spawned's own ids match what was emitted, in the same order.
+      expect(sim.spawned.map((r) => r.id)).toEqual(ids);
+    });
+  });
+
+  // Task 35: upgrades — a developed cell's house record becomes a building once dev crosses
+  // HOUSE_UPGRADE_DEV (1.35) AND at least 2 of its 4 orthogonal neighbor cells are themselves
+  // "developed" (dev >= the house threshold, 0.75). Using `restore()` to seed dev/records directly
+  // is far faster than waiting out real accumulation and exercises the same code path `update()`
+  // uses to check thresholds each tick.
+  describe('upgrades', () => {
+    /**
+     * A world with an actual painted road running through a flat area, so the road-distance BFS
+     * (`roadDist`) covers the target cell — the upgrade check only runs inside `update()`'s main
+     * per-cell loop, which skips any cell `roadDist` doesn't mark as within MAX_ROAD_DIST_CELLS (a
+     * cell can only ever reach dev >= 1.35 near a road anyway, so this mirrors real play). Returns
+     * a flat land cell (and confirms its 4 neighbors are also land+flat) sitting on that road.
+     */
+    function seededWorld() {
+      const bus = new EventBus();
+      const hf = new Heightfield('upgrade-test', bus);
+      const g = new RoadGraph(bus, makeSampler(hf));
+      let anchor = { x: 0, z: 0 };
+      outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+        if (hf.isLand(x, z) && hf.isLand(x + 64, z)) { anchor = { x, z }; break outer; }
+      g.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+      for (const e of g.edges.values()) e.stage = 'painted';
+      const sim = new GrowthSim(g, hf, bus, createRng('upgrade'));
+      bus.emit('roads:changed', {});
+      sim.update(3); // apply the throttled road-distance recompute
+      const { i, j } = findFlatCell(hf, anchor);
+      return { bus, sim, hf, i, j };
+    }
+
+    /** Finds a flat, land cell (and its 4 neighbors) near `near`, suitable for seeding dev levels
+     * directly and guaranteed to sit within the road-distance BFS's reach of a road at `near`. */
+    function findFlatCell(hf: Heightfield, near: { x: number; z: number }): { i: number; j: number } {
+      const midI = Math.round((near.x + HALF) / CELL);
+      const midJ = Math.round((near.z + HALF) / CELL);
+      for (let dj = -3; dj <= 3; dj++) {
+        for (let di = -3; di <= 3; di++) {
+          const i = midI + di, j = midJ + dj;
+          const { x, z } = cellCenter(i, j);
+          if (hf.isLand(x, z) && hf.slopeAt(x, z) < 0.3) {
+            // also require its 4 neighbors land+flat so upgrade-eligibility tests have real cells
+            const ok = [[i - 1, j], [i + 1, j], [i, j - 1], [i, j + 1]].every(([ni, nj]) => {
+              const c = cellCenter(ni, nj);
+              return hf.isLand(c.x, c.z) && hf.slopeAt(c.x, c.z) < 0.3;
+            });
+            if (ok) return { i, j };
+          }
+        }
+      }
+      throw new Error('no flat cell found near the test road');
+    }
+
+    it('upgrades a house to a building once dev >= 1.35 with >= 2 developed neighbors', () => {
+      const { bus, sim, i, j } = seededWorld();
+      const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+      const idx = (ii: number, jj: number) => jj * GRID_SIZE + ii;
+      dev[idx(i, j)] = 1.35;
+      dev[idx(i - 1, j)] = 0.8; // developed neighbor 1
+      dev[idx(i + 1, j)] = 0.8; // developed neighbor 2
+      const { x, z } = cellCenter(i, j);
+      const house: SpawnRecord = { kind: 'house', x, z, rot: 0, id: 1 };
+      sim.restore(dev, [house]);
+
+      const upgrades: number[] = [];
+      bus.on('growth:upgrade', (e) => upgrades.push(e.id));
+      expect(sim.houseCount).toBe(1);
+      sim.update(1 / 60);
+
+      expect(upgrades).toEqual([1]);
+      expect(sim.spawned[0].kind).toBe('building');
+      expect(sim.spawned[0].id).toBe(1); // same record, same id — mutated in place
+      expect(sim.houseCount).toBe(0);
+    });
+
+    it('does not upgrade when dev is high but fewer than 2 neighbors are developed', () => {
+      const { bus, sim, i, j } = seededWorld();
+      const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+      const idx = (ii: number, jj: number) => jj * GRID_SIZE + ii;
+      dev[idx(i, j)] = 1.35;
+      dev[idx(i - 1, j)] = 0.8; // only ONE developed neighbor
+      const { x, z } = cellCenter(i, j);
+      const house: SpawnRecord = { kind: 'house', x, z, rot: 0, id: 1 };
+      sim.restore(dev, [house]);
+
+      let upgraded = false;
+      bus.on('growth:upgrade', () => { upgraded = true; });
+      sim.update(1 / 60);
+
+      expect(upgraded).toBe(false);
+      expect(sim.spawned[0].kind).toBe('house');
+      expect(sim.houseCount).toBe(1);
+    });
+
+    it('does not upgrade a cell with no house record even if dev/neighbors qualify', () => {
+      const { bus, sim, i, j } = seededWorld();
+      const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+      const idx = (ii: number, jj: number) => jj * GRID_SIZE + ii;
+      dev[idx(i, j)] = 1.35;
+      dev[idx(i - 1, j)] = 0.8;
+      dev[idx(i + 1, j)] = 0.8;
+      sim.restore(dev, []); // no records at all
+
+      let upgraded = false;
+      bus.on('growth:upgrade', () => { upgraded = true; });
+      expect(() => sim.update(1 / 60)).not.toThrow();
+      expect(upgraded).toBe(false);
+    });
+
+    it('upgrades a cell at most once (fires growth:upgrade exactly once across many updates)', () => {
+      const { bus, sim, i, j } = seededWorld();
+      const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+      const idx = (ii: number, jj: number) => jj * GRID_SIZE + ii;
+      dev[idx(i, j)] = 1.35;
+      dev[idx(i - 1, j)] = 0.8;
+      dev[idx(i + 1, j)] = 0.8;
+      const { x, z } = cellCenter(i, j);
+      const house: SpawnRecord = { kind: 'house', x, z, rot: 0, id: 1 };
+      sim.restore(dev, [house]);
+
+      let upgradeCount = 0;
+      bus.on('growth:upgrade', () => upgradeCount++);
+      for (let k = 0; k < 300; k++) sim.update(1 / 60);
+
+      expect(upgradeCount).toBe(1);
+    });
+  });
+
+  // Task 35: stranded decay — a record whose cell is unreachable from any painted road (roadDist
+  // reads -1, i.e. > MAX_ROAD_DIST_CELLS ~ 24u) enters a 60 sim-s grace period, then fades over 30
+  // more sim-s (growth:stranded fires at fade start), then is removed (growth:remove), clearing the
+  // cell's spawnMask (regrowth becomes possible) and decrementing houseCount for a house.
+  describe('stranded decay', () => {
+    /** Finds a land point at least `minDist` from `anchor` and >=32u of contiguous land beyond it
+     * (so a rescue road can later be drawn starting there), searching a coarse grid outward from
+     * the world center. Deterministic per Heightfield instance. */
+    function findFarLandSpot(hf: Heightfield, anchor: { x: number; z: number }, minDist: number): { x: number; z: number } {
+      for (let x = -220; x <= 220; x += 8) {
+        for (let z = -220; z <= 220; z += 8) {
+          if (Math.hypot(x - anchor.x, z - anchor.z) < minDist) continue;
+          if (hf.isLand(x, z) && hf.isLand(x + 32, z)) return { x, z };
+        }
+      }
+      throw new Error('no far land spot found');
+    }
+
+    function roadedWorld(seedName: string) {
+      const bus = new EventBus();
+      const hf = new Heightfield(seedName, bus);
+      const g = new RoadGraph(bus, makeSampler(hf));
+      let anchor = { x: 0, z: 0 };
+      outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+        if (hf.isLand(x, z) && hf.isLand(x + 32, z)) { anchor = { x, z }; break outer; }
+      const [edgeId] = g.commitChain([anchor, { x: anchor.x + 32, z: anchor.z }]);
+      for (const e of g.edges.values()) e.stage = 'painted';
+      const sim = new GrowthSim(g, hf, bus, createRng(seedName));
+      bus.emit('roads:changed', {});
+      // One throttled recompute so the road-distance field is populated before we seed a record.
+      sim.update(3);
+      const farSpot = findFarLandSpot(hf, anchor, 40); // > MAX_ROAD_DIST_CELLS's ~24u, comfortably
+      return { bus, sim, g, hf, edgeId, anchor, farSpot };
+    }
+
+    it('a record near a painted road is never marked stranded', () => {
+      const { bus, sim, anchor } = roadedWorld('stranded-near');
+      const house: SpawnRecord = { kind: 'house', x: anchor.x, z: anchor.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
+      sim.update(3); // apply the pending recompute triggered by restore()
+
+      let stranded = false;
+      bus.on('growth:stranded', (e) => { if (e.id === 1) stranded = true; });
+      for (let k = 0; k < 60 * 65; k++) sim.update(1 / 60); // well past the 60s grace
+      expect(stranded).toBe(false);
+      expect(sim.spawned.some((r) => r.id === 1)).toBe(true);
+    });
+
+    it('a record far from any road becomes stranded, fades, then is removed after grace+fade', () => {
+      const { bus, sim, farSpot } = roadedWorld('stranded-far');
+      // Place a record far outside MAX_ROAD_DIST_CELLS (~24u) from the only road, near the edge of
+      // the world so it's unambiguously stranded once the road-distance BFS runs.
+      const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
+      sim.update(3); // apply the pending recompute
+
+      const strandedIds: number[] = [];
+      const removedIds: number[] = [];
+      bus.on('growth:stranded', (e) => strandedIds.push(e.id));
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+      // The seeded road at `anchor` keeps naturally developing (ambient spawns) over these long
+      // loops — assertions below check for record id=1 specifically, not raw array length, so
+      // unrelated ambient spawns near the road don't make this test flaky.
+      const has1 = () => sim.spawned.some((r) => r.id === 1);
+
+      // Advance to just before the 60s grace elapses — should not yet be stranded-fired.
+      for (let k = 0; k < 60 * 59; k++) sim.update(1 / 60);
+      expect(strandedIds).toEqual([]);
+      expect(has1()).toBe(true);
+
+      // Cross the grace threshold.
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+      expect(strandedIds).toEqual([1]);
+      expect(removedIds).toEqual([]); // fade not yet complete
+      expect(has1()).toBe(true); // still present during the fade
+
+      // Just before fade completes (30s later) — not yet removed.
+      for (let k = 0; k < 60 * 29; k++) sim.update(1 / 60);
+      expect(removedIds).toEqual([]);
+
+      // Cross the fade-complete threshold.
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+      expect(removedIds).toEqual([1]);
+      expect(has1()).toBe(false);
+      expect(strandedIds).toEqual([1]); // still only fired once
+    });
+
+    it('decrements houseCount when a stranded house record is removed', () => {
+      const { bus, sim, farSpot } = roadedWorld('stranded-house-count');
+      const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
+      sim.update(3);
+      const housesBefore = sim.houseCount;
+      expect(housesBefore).toBeGreaterThanOrEqual(1);
+
+      let removed = false;
+      bus.on('growth:remove', (e) => { if (e.id === 1) removed = true; });
+      for (let k = 0; k < 60 * 91; k++) sim.update(1 / 60); // grace(60) + fade(30) + margin
+      expect(removed).toBe(true);
+      expect(sim.houseCount).toBe(housesBefore - 1);
+    });
+
+    it('cancels the grace/fade timers if the area is re-roaded before removal completes', () => {
+      const { bus, sim, g, farSpot } = roadedWorld('stranded-cancel');
+      const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
+      sim.update(3);
+
+      const strandedIds: number[] = [];
+      const removedIds: number[] = [];
+      bus.on('growth:stranded', (e) => strandedIds.push(e.id));
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+      const has1 = () => sim.spawned.some((r) => r.id === 1);
+
+      // Cross the grace period so it's mid-fade...
+      for (let k = 0; k < 60 * 65; k++) sim.update(1 / 60);
+      expect(strandedIds).toEqual([1]);
+      expect(has1()).toBe(true);
+
+      // ...then draw a road right next to the stranded record (farSpot was chosen so `farSpot` and
+      // `farSpot.x + 32` are both land) and let the recompute apply.
+      g.commitChain([farSpot, { x: farSpot.x + 32, z: farSpot.z }]);
+      for (const e of g.edges.values()) e.stage = 'painted';
+      bus.emit('roads:changed', {});
+      for (let k = 0; k < 60 * 30; k++) sim.update(1 / 60); // let the recompute throttle open + settle
+
+      // The record must still exist (never removed) since it was rescued before its fade completed.
+      expect(has1()).toBe(true);
+      expect(removedIds).toEqual([]);
+    });
+
+    it('clears the cell spawnMask on removal, allowing regrowth after re-roading', () => {
+      const { bus, sim, farSpot } = roadedWorld('stranded-regrowth');
+      const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      // Seed this cell's dev at the house threshold so its spawnMask already has tree/field/house
+      // bits set (matching a naturally-grown cell) — restore() derives spawnMask from dev.
+      const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+      const cellIdx = (() => {
+        const ci = Math.round((farSpot.x + HALF) / CELL);
+        const cj = Math.round((farSpot.z + HALF) / CELL);
+        return cj * GRID_SIZE + ci;
+      })();
+      dev[cellIdx] = 0.8;
+      sim.restore(dev, [house]);
+      sim.update(3);
+
+      let removed = false;
+      bus.on('growth:remove', (e) => { if (e.id === 1) removed = true; });
+      for (let k = 0; k < 60 * 91; k++) sim.update(1 / 60);
+      expect(removed).toBe(true);
+
+      // devLevels at that cell must now read at or below the decay target (0.4), well below the
+      // house threshold (0.75) it was seeded at — proving the level was actually decayed down, not
+      // just left in place with the record removed. A tiny epsilon absorbs Float32Array rounding
+      // (0.4 isn't exactly representable in float32).
+      expect(sim.devLevels[cellIdx]).toBeLessThanOrEqual(0.4 + 1e-6);
+    });
   });
 });
