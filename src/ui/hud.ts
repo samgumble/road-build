@@ -41,6 +41,61 @@ const ACCENT = '#e8641b';
 const TEXT = '#d8d5cd';
 const TEXT_DIM = '#8a8d90';
 
+/**
+ * Task 29 (mobile): responsive HUD rules for viewports <=480px — compacted button labels (each
+ * button holds a `.gw-label-full` and `.gw-label-compact` span, see `setResponsiveLabel`, and the
+ * media query below swaps which is visible), touch targets grown to >=44px (Apple/Google's
+ * minimum recommended hit target), toolbar wraps to two rows instead of overflowing, the
+ * seed/ticker panel's font shrinks, and the toolbar gets safe-area bottom padding for iOS's home
+ * indicator. A real `<style>` + media query (rather than a JS matchMedia toggle) so it responds
+ * live to viewport/orientation changes and DevTools responsive-mode resizes without any extra
+ * plumbing — same mechanism a plain CSS site would use, just injected since this app has no
+ * external stylesheet.
+ */
+const RESPONSIVE_CSS = `
+  #gw-toolbar {
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
+  }
+  #gw-toolbar .gw-label-compact {
+    display: none;
+  }
+  @media (max-width: 480px) {
+    #gw-toolbar {
+      flex-wrap: wrap;
+      max-width: calc(100vw - 16px);
+      justify-content: center;
+      padding-bottom: calc(8px + env(safe-area-inset-bottom));
+    }
+    #gw-toolbar button {
+      min-width: 44px;
+      min-height: 44px;
+      padding: 8px 10px !important;
+      font-size: 10px !important;
+    }
+    #gw-toolbar .gw-label-full {
+      display: none;
+    }
+    #gw-toolbar .gw-label-compact {
+      display: inline;
+    }
+    #gw-top-left {
+      padding: 6px 8px !important;
+    }
+    #gw-top-left .gw-seed,
+    #gw-top-left .gw-ticker-line {
+      font-size: 9px !important;
+    }
+  }
+`;
+
+function injectResponsiveStyles(): void {
+  if (document.getElementById('gw-responsive-style')) return;
+  const style = document.createElement('style');
+  style.id = 'gw-responsive-style';
+  style.textContent = RESPONSIVE_CSS;
+  document.head.appendChild(style);
+}
+
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
   props?: Partial<HTMLElementTagNameMap[K]>,
@@ -50,6 +105,20 @@ function el<K extends keyof HTMLElementTagNameMap>(
   if (props) Object.assign(node, props);
   if (style) Object.assign(node.style, style);
   return node;
+}
+
+/**
+ * Sets a button's visible label to two swappable spans: the full desktop label and a shorter
+ * compact one, toggled purely by the `RESPONSIVE_CSS` media query above (`.gw-label-full` /
+ * `.gw-label-compact`) — no JS breakpoint logic needed, and it responds live to resizes. If
+ * `compact` is omitted, the full label is reused for both (nothing to shorten, e.g. "1×").
+ */
+function setResponsiveLabel(btn: HTMLButtonElement, full: string, compact?: string): void {
+  btn.textContent = '';
+  const fullEl = el('span', { textContent: full, className: 'gw-label-full' });
+  const compactEl = el('span', { textContent: compact ?? full, className: 'gw-label-compact' });
+  btn.appendChild(fullEl);
+  btn.appendChild(compactEl);
 }
 
 function labelStyle(): Partial<CSSStyleDeclaration> {
@@ -125,19 +194,20 @@ export class Hud {
     if (!hud) throw new Error('#hud container not found');
     this.root = hud;
 
+    injectResponsiveStyles();
     this.buildTopLeft();
     this.buildToolbar();
     this.wireEvents();
   }
 
   private buildTopLeft(): void {
-    const panel = el('div', {}, {
+    const panel = el('div', { id: 'gw-top-left' }, {
       position: 'fixed', top: '16px', left: '16px',
       background: PANEL_BG, border: `1px solid ${BORDER}`, borderRadius: '3px',
       padding: '10px 14px', pointerEvents: 'none',
     });
 
-    const seedLine = el('div', { textContent: this.deps.seed }, {
+    const seedLine = el('div', { textContent: this.deps.seed, className: 'gw-seed' }, {
       ...labelStyle(), color: TEXT, marginBottom: '4px',
     });
     panel.appendChild(seedLine);
@@ -147,7 +217,7 @@ export class Hud {
     // the render layer uses for its per-crew rigs.
     this.tickerContainer = el('div', {}, { display: 'flex', flexDirection: 'column', gap: '2px' });
     for (let i = 0; i < MAX_CREW_LINES; i++) {
-      const line = el('div', { textContent: '' }, { ...labelStyle(), color: TEXT_DIM, display: 'none' });
+      const line = el('div', { textContent: '', className: 'gw-ticker-line' }, { ...labelStyle(), color: TEXT_DIM, display: 'none' });
       this.tickerLineEls.push(line);
       this.tickerContainer.appendChild(line);
     }
@@ -155,7 +225,7 @@ export class Hud {
       // Fallback single "CREW IDLE" line, shown only when every crew line is hidden (no crew has
       // ever done anything yet, or all crews have gone idle) — collapses away as soon as any crew
       // line appears.
-      (this.idleLineEl = el('div', { textContent: CREW_IDLE }, { ...labelStyle(), color: TEXT_DIM })),
+      (this.idleLineEl = el('div', { textContent: CREW_IDLE, className: 'gw-ticker-line' }, { ...labelStyle(), color: TEXT_DIM })),
     );
     panel.appendChild(this.tickerContainer);
 
@@ -171,7 +241,7 @@ export class Hud {
   }
 
   private buildToolbar(): void {
-    const bar = el('div', {}, {
+    const bar = el('div', { id: 'gw-toolbar' }, {
       position: 'fixed', bottom: '16px', left: '50%', transform: 'translateX(-50%)',
       display: 'flex', alignItems: 'stretch', gap: '8px',
       background: PANEL_BG, border: `1px solid ${BORDER}`, borderRadius: '3px',
@@ -193,12 +263,13 @@ export class Hud {
     return el('div', {}, { width: '1px', alignSelf: 'stretch', background: BORDER });
   }
 
-  private modeButton(label: string, mode: DrawToolMode): HTMLButtonElement {
-    const btn = el('button', { type: 'button', textContent: label }, {
+  private modeButton(label: string, compact: string, mode: DrawToolMode): HTMLButtonElement {
+    const btn = el('button', { type: 'button' }, {
       ...baseButtonStyle(),
       borderBottom: '2px solid transparent',
       borderRadius: '3px',
     });
+    setResponsiveLabel(btn, label, compact);
     btn.addEventListener('click', () => {
       this.deps.drawTool.mode = this.deps.drawTool.mode === mode ? 'none' : mode;
       this.refreshModeButtons();
@@ -208,8 +279,8 @@ export class Hud {
 
   private buildModeGroup(): HTMLElement {
     const group = el('div', {}, { display: 'flex', gap: '4px' });
-    this.drawBtn = this.modeButton('Draw', 'draw');
-    this.demolishBtn = this.modeButton('Demolish', 'demolish');
+    this.drawBtn = this.modeButton('Draw', 'DRAW', 'draw');
+    this.demolishBtn = this.modeButton('Demolish', 'DEMO', 'demolish');
     group.appendChild(this.drawBtn);
     group.appendChild(this.demolishBtn);
     this.refreshModeButtons();
@@ -229,10 +300,11 @@ export class Hud {
     const group = el('div', {}, { display: 'flex', gap: '4px' });
     const speeds: [string, number][] = [['1×', 1], ['4×', 4], ['16×', 16]];
     for (const [label, value] of speeds) {
-      const btn = el('button', { type: 'button', textContent: label }, {
+      const btn = el('button', { type: 'button' }, {
         ...baseButtonStyle(),
         borderBottom: '2px solid transparent',
       });
+      setResponsiveLabel(btn, label); // already compact — reuse as-is at every width
       btn.addEventListener('click', () => {
         this.deps.loop.timeScale = value;
         this.refreshSpeedButtons();
@@ -256,7 +328,8 @@ export class Hud {
   private buildNewWorldGroup(): HTMLElement {
     const wrap = el('div', {}, { position: 'relative', display: 'flex' });
 
-    this.newWorldBtn = el('button', { type: 'button', textContent: 'New World' }, baseButtonStyle());
+    this.newWorldBtn = el('button', { type: 'button' }, baseButtonStyle());
+    setResponsiveLabel(this.newWorldBtn, 'New World', 'NEW');
     this.newWorldPanel = el('div', {}, {
       display: 'none',
       position: 'absolute', bottom: 'calc(100% + 8px)', left: '50%', transform: 'translateX(-50%)',
@@ -304,13 +377,14 @@ export class Hud {
   }
 
   private buildPhotoButton(): HTMLElement {
-    const btn = el('button', { type: 'button', textContent: 'Photo' }, baseButtonStyle());
+    const btn = el('button', { type: 'button' }, baseButtonStyle());
+    setResponsiveLabel(btn, 'Photo', 'PHOTO');
     btn.addEventListener('click', () => this.takePhoto());
     return btn;
   }
 
   private buildMuteButton(): HTMLElement {
-    const btn = el('button', { type: 'button', textContent: 'Mute' }, {
+    const btn = el('button', { type: 'button' }, {
       ...baseButtonStyle(),
       borderBottom: '2px solid transparent',
     });
@@ -325,7 +399,7 @@ export class Hud {
 
   private refreshMuteButton(): void {
     const muted = this.deps.audio.muted;
-    this.muteBtn.textContent = muted ? 'Sound Off' : 'Mute';
+    setResponsiveLabel(this.muteBtn, muted ? 'Sound Off' : 'Mute', muted ? 'UNMUTE' : 'MUTE');
     this.muteBtn.style.borderBottomColor = muted ? ACCENT : 'transparent';
     this.muteBtn.style.color = muted ? ACCENT : TEXT;
   }
