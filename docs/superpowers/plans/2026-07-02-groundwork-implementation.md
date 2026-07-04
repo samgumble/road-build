@@ -1618,3 +1618,62 @@ Files: `src/input/*`, `src/ui/hud.ts`, `index.html`, `src/main.ts`.
 - HUD: responsive layout ≤480px (toolbar wraps/compacts, larger touch targets ≥44px, seed/ticker scale down); `viewport` meta (no user scaling); no hover-dependent affordances (hover ring appears under the finger during draw).
 - Perf: mobile auto-selects 'low' tier (Task 28); cap sim step count on weak devices unchanged (already capped); verify on this machine via responsive emulation (375×812) — touch drawing, pinch, HUD usability, and playable fps in the emulated profile (real-device numbers are a user follow-up).
 - iOS quirks: audio unlock on first touchend (not just pointerdown); prevent double-tap zoom on the canvas; safe-area insets for the toolbar.
+
+---
+
+# Addendum D — Living-world & construction-flow improvements (approved by Sam 2026-07-03, full audit list + fading demolished areas)
+
+Executes after Addendum C (T27-29). Zen + sim/render split + tiered perf targets binding. Save compatibility: any task that changes the save shape bumps the version with a migration (older saves must load).
+
+### Task 30: Settlement placement intelligence (growth)
+
+`src/sim/growth/growth.ts` (+tests), `src/render/sceneryRenderer.ts` (only if needed).
+- Houses/buildings spawn FACING the nearest road: rotation = heading perpendicular toward the road sample (±0.15 rad jitter), not random.
+- Setback band: houses/buildings place at a consistent 8-10u from the road centerline (project spawn point onto the clearance band along the perpendicular from the nearest sample), replacing the radial push. Keep the ≥6.5u hard clearance.
+- Fields align to the road direction (rot = road heading ±0.1) and prefer cells adjacent to an existing house (scan the records within ~14u; if none, current behavior) — farmsteads.
+- Trees keep random rotation (correct for trees).
+- TDD: rotation-faces-road assertion (angle between building forward and direction-to-road < 0.35 rad); setback distance within [6.5, 11]; field-near-house preference (deterministic seed).
+
+### Task 31: Ambient wilderness
+
+`src/sim/growth/growth.ts` or new `src/sim/growth/wilderness.ts`, `src/render/sceneryRenderer.ts`, `src/main.ts`.
+- At worldgen: sparse seeded trees across the island (Poisson-ish via seeded rng + spacing ≥10u, land-only, slope ≤ 0.5, density ~1 per 250 u² → several hundred), 1-3 per site, NOT saved (regenerated deterministically from seed on boot — document in save.ts that wilderness is derived state).
+- Rendered through the existing tree instancing (raise capacity if needed; report instance counts + draw calls). No pop-in at boot (instant), normal pop-in never applies.
+- Road construction may overlap wilderness trees: clear trees within the road corridor +2u when an edge reaches graded (fade-out) — the excavator "clears" them. Deterministic given same build order.
+
+### Task 32: Traffic between settlements
+
+`src/sim/traffic/traffic.ts` (+tests), reading `GrowthSim.spawned` (or an exposed settlement-node index).
+- Trip endpoints weighted toward nodes near houses/buildings: build a weight map (node weight = 1 + 3×houses-within-20u + 5×buildings-within-20u, recomputed on growth spawns throttled); pick origin/destination by weighted draw (fallback: uniform when no settlement yet).
+- Commute pulse: spawn-interval scales with timeOfDay — busiest at ~0.3 and ~0.75 (morning/evening), ~40% rate at deep night. Atmosphere's timeOfDay is render-side — pass timeOfDay into traffic.update from main (sim stays deterministic given inputs).
+- TDD: weighted-draw distribution sanity (seeded), night-rate reduction, no-settlement fallback.
+
+### Task 33: Crew assignment + work rhythm (construction)
+
+`src/sim/construction/queue.ts` (+tests), `src/render/constructionRenderer.ts` (break theater).
+- Nearest-crew assignment: when multiple crews are free, a new job goes to the free crew whose LAST job site (persisted per crew; map-center default) is nearest to the new edge's start. FIFO order among jobs preserved; only crew choice changes. TDD: nearest-free-crew chosen; ties → lowest index.
+- Work rhythm: every 3-5 sim-minutes per crew, a 6s break (job progress pauses, `construction:progress` keeps firing with stationary pos so renderers can react); workers huddle near the stockpile, vehicles idle (no dig cycle). Night: stage speeds ×0.85 (floodlit crews work a bit slower). TDD: break pauses t-advance then resumes; night multiplier applied.
+
+### Task 34: Quarry landmark
+
+`src/sim/` (placement + save), `src/render/constructionRenderer.ts` (shuttle routing + prop).
+- One quarry per island: placed when the FIRST road commits — nearest suitable flat coastal-adjacent cell ≥40u from that road (seeded deterministic search); saved in the save file (version bump if shape changes).
+- Prop: gravel pit + conveyor + silo (≤14 prims, instanced not needed — one instance).
+- All shuttle trips (spoil away, gravel fetch) route to the quarry instead of "toward map edge / fade at distance"; if the quarry is far, trucks still fade mid-route after ~12s but HEAD toward it (theater budget unchanged).
+
+### Task 35: Settlement dynamics — upgrades + stranded decay
+
+`src/sim/growth/growth.ts` (+tests), `src/render/sceneryRenderer.ts`, `src/sim/save.ts` (VERSION BUMP + migration), `src/core/events.ts` (additive `growth:remove` + `growth:upgrade` events).
+- Spawned records gain stable `id`s (migration assigns ids to old saves).
+- Upgrades: when a cell's dev ≥ 1.35 AND ≥2 developed neighbors, an existing house record upgrades to building (event `growth:upgrade {id}`; renderer swaps with pop animation; houseCount−1, buildings implicitly count via records).
+- **Stranded decay (user-decided)**: after roads:changed recompute, records >24u from any painted road enter a 60 sim-s grace period; if still stranded, fade out over ~30s (renderer eases scale down + slight sink), then `growth:remove {id}` deletes the record and CLEARS the cell's spawnMask bits (so re-roading the area regrows it). houseCount decrements on house removal. Traffic weight map reacts via its existing throttle.
+- TDD: upgrade conditions; decay grace + removal + mask clearing + houseCount; save round-trip v2 + v1-migration test.
+
+### Task 36: Pipelined stage train (construction — LAST, riskiest)
+
+`src/sim/construction/queue.ts` (+substantial tests), `src/render/roadRenderer.ts` (multi-band), `src/render/constructionRenderer.ts`.
+- A job runs up to all 4 work stages CONCURRENTLY as fronts along the edge: front(stage i) may advance only while ≥30u behind front(stage i−1) (or stage i−1 complete); survey remains a discrete first pass. Stage completion event fires when that stage's front reaches edge end (order preserved: graded completes before gravel completes, etc.). `construction:progress` fires per active front (multiple per tick per crew, distinct `vehicle`).
+- RoadRenderer: partial-progress rendering generalizes from one boundary to up to 4 bands (painted..paved..gravel..graded..surveyed along arclength) — reuse the existing from/to ribbon builder per band; throttling unchanged.
+- ConstructionRenderer: multiple vehicles per crew active simultaneously (state maps already keyed (crew,kind) — verify shuttle/roller interplay), convoy spacing reads naturally.
+- Grading terrain work unchanged (tied to the graded front). Demolition stays sequential (reverse train optional — out of scope).
+- TDD: spacing constraint enforced; completion order; resume mid-train from save (resume collapses to sequential from the saved stage — acceptable, document); demolish conversion mid-train.
