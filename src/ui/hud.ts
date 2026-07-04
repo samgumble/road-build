@@ -357,6 +357,17 @@ export class Hud {
       }
       this.updateTicker();
     });
+    // The survey phase (see queue.ts) never fires `construction:stage` — a fresh build job walks
+    // the surveyor the length of the edge purely via `construction:progress` events, and only
+    // starts emitting `construction:stage` once grading begins. Without this, a crew stays absent
+    // from the ticker for the entire (sometimes lengthy, on long edges) survey pass even though
+    // it's genuinely busy. Seed the crew's entry straight from the first 'surveyed' progress event
+    // instead; `construction:stage`'s own 'graded' event overwrites it as soon as surveying ends.
+    this.deps.bus.on('construction:progress', ({ crew, stage }) => {
+      if (crew < 0 || stage !== 'surveyed' || this.stageByCrew.has(crew)) return;
+      this.stageByCrew.set(crew, stage);
+      this.updateTicker();
+    });
     this.deps.bus.on('roads:edgeAdded', () => {
       this.dismissHint();
     });
