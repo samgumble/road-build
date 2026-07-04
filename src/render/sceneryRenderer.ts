@@ -5,6 +5,18 @@ import type { Heightfield } from '../sim/terrain/heightfield';
 import { EventBus } from '../core/events';
 import type { GrowthKind, SpawnRecord } from '../sim/growth/growth';
 import type { WildernessTree } from '../sim/growth/wilderness';
+
+/** Minimal shape `place()` actually needs — a `SpawnRecord` satisfies this, but so does a
+ * `growth:spawn` event payload (whose `id` is optional, Task 35: additive on that event) or a
+ * synthetic wilderness-tree placement with no id at all. Keeping `place()`'s own parameter this
+ * loose (rather than requiring a full `SpawnRecord`) avoids forcing every call site to fabricate
+ * an id it doesn't have. */
+interface PlaceableRecord {
+  kind: GrowthKind;
+  x: number;
+  z: number;
+  rot: number;
+}
 import { easeOutBack, clamp01 } from './easing';
 
 const POP_IN_DURATION = 0.8; // seconds, easeOutBack scale 0 -> 1
@@ -13,6 +25,13 @@ const WILDERNESS_FADE_DURATION = 1.5;
 // u — small jitter spreading multiple trees within one wilderness site (mirrors GrowthSim's own
 // JITTER constant for road-grown trees) so a 2-3 tree site doesn't read as perfectly stacked.
 const WILDERNESS_TREE_JITTER = 2.2;
+
+// Task 35: stranded-decay fade — matches GrowthSim's STRANDED_FADE_S (the sim owns the actual
+// removal timing via `growth:remove`; this is purely the renderer's animation duration, started by
+// `growth:stranded`). Fade eases scale down to ~0 AND sinks the instance by STRANDED_SINK_DISTANCE
+// u over the same window, per the user-decided "slowly fade... ease scale down + slight sink" look.
+const STRANDED_FADE_DURATION = 30;
+const STRANDED_SINK_DISTANCE = 0.6; // u, matches Task 35's "sink ~0.6u" spec
 
 // Task 31: raised from 4000 to make room for several hundred wilderness sites (1-3 trees each,
 // several hundred to ~1200 trees) on top of GrowthSim's own road-driven tree spawns sharing the
@@ -54,9 +73,15 @@ interface VariantMesh {
 }
 
 /** One live instance slot: which variant + index within that variant's InstancedMesh, plus the
- * spawn-time transform (used both for pop-in animation and for rebuild-without-animation). */
+ * spawn-time transform (used both for pop-in animation and for rebuild-without-animation).
+ *
+ * `id` (Task 35): the owning GrowthSim record's stable id, or `null` for instances with no growth
+ * record backing them (ambient wilderness trees — see `setWilderness`). Lets `growth:upgrade` /
+ * `growth:stranded` / `growth:remove` find the right instance without relying on array position,
+ * which shifts under slot-compaction removal (see `freeSlot`). */
 interface Instance {
   kind: GrowthKind;
+  id: number | null;
   variant: VariantMesh;
   slot: number;
   x: number;
@@ -73,11 +98,16 @@ interface Animating {
 }
 
 /** An instance currently fading out scale 1 -> 0 (Task 31: wilderness trees cleared by road
- * construction). Once elapsed reaches WILDERNESS_FADE_DURATION the instance is parked off-screen
- * (InstancedMesh has no per-slot removal, so "deleting" a middle slot just means hiding it). */
+ * construction; Task 35: stranded settlement decay). Once elapsed reaches its target duration the
+ * instance's slot is either parked off-screen (wilderness — no sim-side record to reconcile with)
+ * or actually freed via `freeSlot` (Task 35 stranded decay, triggered by `growth:remove`). `sink`
+ * (Task 35 only, 0 for wilderness fades) additionally eases the instance downward as it shrinks,
+ * per the user-decided "fade + slight sink" decay look. */
 interface Fading {
   instance: Instance;
   elapsed: number;
+  duration: number;
+  sink: number;
 }
 
 function fallbackTreeVariant(color: number, scene: THREE.Scene, capacity: number): VariantMesh {
@@ -171,12 +201,28 @@ export class SceneryRenderer {
   private animating: Animating[] = [];
   private fading: Fading[] = [];
 
+  // Task 35: id -> live Instance lookup (excludes wilderness trees, which have no growth record
+  // and thus id === null) so growth:upgrade/stranded/remove can find their target in O(1) instead
+  // of scanning `instances`.
+  private byId = new Map<number, Instance>();
+
+  // Task 35: per-mesh slot ownership — `slotOwners.get(mesh)[slot]` is the Instance currently
+  // occupying that slot. Maintained alongside each mesh's own `count` so `freeSlot` can compact a
+  // removed slot by swapping in the last live instance (see `freeSlot`'s doc comment) without a
+  // linear scan of the global `instances` array. Field stripes are tracked separately (3 slots per
+  // field instance, see `fieldStripeOwners`) since they share no 1:1 slot correspondence with the
+  // field mesh's own slots.
+  private slotOwners = new Map<THREE.InstancedMesh, (Instance | null)[]>();
+  // fieldStripeOwners[fieldSlot] = the 3 fieldStripe mesh slot indices belonging to that field
+  // instance's slot, so freeing/compacting a field slot can find and compact its stripes too.
+  private fieldStripeOwners: number[][] = [];
+
   // spawn events that arrive before their category's variants have finished loading are queued
   // and flushed once that category becomes ready. Minor 7: `animate` is carried alongside each
   // record (not hardcoded true at flush time) so a `rebuild()`-sourced record whose category
   // wasn't ready yet still gets placed with no pop-in once its variants load — matching every
   // other already-ready category in that same restore.
-  private pendingSpawns: { rec: SpawnRecord; animate: boolean }[] = [];
+  private pendingSpawns: { rec: PlaceableRecord; animate: boolean; id: number | null }[] = [];
 
   // Task 31: wilderness sites queued if `setWilderness` is called before tree variants finish
   // loading (mirrors pendingSpawns above). Each site's placed instances are recorded by site
@@ -219,6 +265,10 @@ export class SceneryRenderer {
     this.bus.on('growth:spawn', (e) => this.onSpawn(e));
     this.bus.on('atmosphere:phase', ({ night }) => this.onPhase(night));
     this.bus.on('wilderness:cleared', (e) => this.onWildernessCleared(e.indices));
+    // Task 35: upgrade (house -> building swap) and stranded-decay fade/removal.
+    this.bus.on('growth:upgrade', (e) => this.onUpgrade(e.id));
+    this.bus.on('growth:stranded', (e) => this.onStranded(e.id));
+    this.bus.on('growth:remove', (e) => this.onRemove(e.id));
 
     this.loadGltfVariants('tree', TREE_FILES, TARGET_TREE_HEIGHT, TREE_CAPACITY, 2)
       .then((v) => {
@@ -280,6 +330,38 @@ export class SceneryRenderer {
   get treeStats(): { perVariant: number[]; total: number; drawCalls: number } {
     const perVariant = this.treeVariants.map((v) => v.mesh.count);
     return { perVariant, total: perVariant.reduce((a, b) => a + b, 0), drawCalls: this.treeVariants.length };
+  }
+
+  /**
+   * Task 35 diagnostics: live instance-tracking counts, exposed so tests can assert no ghost
+   * instances / index corruption survive many spawn+upgrade+remove cycles (instanced meshes have
+   * no per-slot removal API — `freeSlot`'s swap-with-last compaction is the only thing keeping
+   * each mesh's `[0, count)` range gap-free). `trackedInstances` is `this.instances.length` (every
+   * live Instance object, across every kind); `meshCounts` sums each InstancedMesh's own `.count`
+   * the same way (house/building meshes may have several GLTF variants, hence an array per kind);
+   * these two totals must always agree, or a slot leaked/duplicated somewhere.
+   */
+  get instanceStats(): {
+    trackedInstances: number;
+    byIdSize: number;
+    treeMeshTotal: number;
+    houseMeshTotal: number;
+    buildingMeshTotal: number;
+    fieldMeshCount: number;
+    fieldStripeMeshCount: number;
+    windowMeshCount: number;
+  } {
+    const sumCounts = (variants: VariantMesh[]) => variants.reduce((a, v) => a + v.mesh.count, 0);
+    return {
+      trackedInstances: this.instances.length,
+      byIdSize: this.byId.size,
+      treeMeshTotal: sumCounts(this.treeVariants),
+      houseMeshTotal: sumCounts(this.houseVariants),
+      buildingMeshTotal: sumCounts(this.buildingVariants),
+      fieldMeshCount: this.field.count,
+      fieldStripeMeshCount: this.fieldStripe.count,
+      windowMeshCount: this.windows.count,
+    };
   }
 
   private async loadGltfVariants(
@@ -386,9 +468,9 @@ export class SceneryRenderer {
 
   private flushPending(): void {
     if (!this.pendingSpawns.length) return;
-    const remaining: { rec: SpawnRecord; animate: boolean }[] = [];
+    const remaining: { rec: PlaceableRecord; animate: boolean; id: number | null }[] = [];
     for (const entry of this.pendingSpawns) {
-      if (this.categoryReady(entry.rec.kind)) this.place(entry.rec, entry.animate);
+      if (this.categoryReady(entry.rec.kind)) this.place(entry.rec, entry.animate, entry.id);
       else remaining.push(entry);
     }
     this.pendingSpawns = remaining;
@@ -401,12 +483,13 @@ export class SceneryRenderer {
     return true; // fields are always ready (procedural, built in constructor)
   }
 
-  private onSpawn(e: SpawnRecord): void {
+  private onSpawn(e: PlaceableRecord & { id?: number }): void {
+    const id = e.id ?? null;
     if (!this.categoryReady(e.kind)) {
-      this.pendingSpawns.push({ rec: e, animate: true }); // live gameplay spawn — always pops in
+      this.pendingSpawns.push({ rec: e, animate: true, id }); // live gameplay spawn — always pops in
       return;
     }
-    this.place(e, true);
+    this.place(e, true, id);
   }
 
   private variantIndex(x: number, z: number, count: number): number {
@@ -420,10 +503,24 @@ export class SceneryRenderer {
     return list[this.variantIndex(x, z, list.length)];
   }
 
+  /** Returns (creating if needed) the slot-ownership array for `mesh`, sized/truncated to at least
+   * `count` entries so `slotOwners.get(mesh)![slot]` is always safe to read/write for any live
+   * slot (Task 35: instance removal/compaction bookkeeping — see `freeSlot`). */
+  private ownersFor(mesh: THREE.InstancedMesh): (Instance | null)[] {
+    let arr = this.slotOwners.get(mesh);
+    if (!arr) {
+      arr = [];
+      this.slotOwners.set(mesh, arr);
+    }
+    return arr;
+  }
+
   /** Places one spawn record's instance(s) into the appropriate InstancedMesh(es). Returns the
    * primary placed `Instance` (Task 31: needed so `setWilderness` can track per-site instances for
-   * later fade-out), or `null` if placement was skipped (over capacity / category not ready). */
-  private place(rec: SpawnRecord, animate: boolean): Instance | null {
+   * later fade-out), or `null` if placement was skipped (over capacity / category not ready).
+   * `id` (Task 35) is the owning GrowthSim record's stable id, or `null` for records with no
+   * backing id (ambient wilderness trees). */
+  private place(rec: PlaceableRecord, animate: boolean, id: number | null = null): Instance | null {
     const y = this.hf.heightAt(rec.x, rec.z);
 
     if (rec.kind === 'field') {
@@ -448,6 +545,7 @@ export class SceneryRenderer {
       // correct fix is to always compose them at final scale (1) regardless of `animate` — worst
       // case they pop in a frame ahead of the field's own tween, which reads as fine in practice.
       dummyScale.set(1, 1, 1);
+      const stripeSlots: number[] = [];
       for (let s2 = 0; s2 < 3 && this.stripeCount < this.fieldStripe.instanceMatrix.count; s2++) {
         const localZ = (s2 - 1) * (FIELD_SIZE / 3);
         // rotate the local (0, localZ) offset by rec.rot into world space
@@ -457,12 +555,16 @@ export class SceneryRenderer {
         dummyPos.set(rec.x + rx, y + 0.02, rec.z + rz);
         dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
         this.fieldStripe.setMatrixAt(idx, dummyMatrix);
+        stripeSlots.push(idx);
       }
       this.fieldStripe.count = this.stripeCount;
       this.fieldStripe.instanceMatrix.needsUpdate = true;
+      this.fieldStripeOwners[slot] = stripeSlots;
 
-      const instance: Instance = { kind: rec.kind, variant: { mesh: this.field, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlot: null };
+      const instance: Instance = { kind: rec.kind, id, variant: { mesh: this.field, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlot: null };
       this.instances.push(instance);
+      this.ownersFor(this.field)[slot] = instance;
+      if (id !== null) this.byId.set(id, instance);
       if (animate) this.animating.push({ instance, elapsed: 0 });
       return instance;
     }
@@ -508,8 +610,11 @@ export class SceneryRenderer {
       }
     }
 
-    const instance: Instance = { kind: rec.kind, variant, slot, x: rec.x, y: finalY, z: rec.z, rot: rec.rot, windowSlot };
+    const instance: Instance = { kind: rec.kind, id, variant, slot, x: rec.x, y: finalY, z: rec.z, rot: rec.rot, windowSlot };
     this.instances.push(instance);
+    this.ownersFor(variant.mesh)[slot] = instance;
+    if (windowSlot !== null) this.ownersFor(this.windows)[windowSlot] = instance;
+    if (id !== null) this.byId.set(id, instance);
     if (animate) this.animating.push({ instance, elapsed: 0 });
     return instance;
   }
@@ -562,13 +667,145 @@ export class SceneryRenderer {
     for (const siteIdx of indices) {
       const placed = this.wildernessInstancesBySite[siteIdx];
       if (!placed) continue;
-      for (const instance of placed) this.fading.push({ instance, elapsed: 0 });
+      for (const instance of placed) {
+        this.fading.push({ instance, elapsed: 0, duration: WILDERNESS_FADE_DURATION, sink: 0 });
+      }
     }
   }
 
   /** Number of instances currently placed into `variant`'s InstancedMesh. */
   private countFor(variant: VariantMesh): number {
     return variant.mesh.count;
+  }
+
+  /**
+   * Task 35: a house record upgraded to a building (same id, `GrowthSim` mutates the record's
+   * `kind` in place). The renderer's job is purely visual: remove the house instance (freeing its
+   * slot immediately — no fade, this isn't a decay) and place a fresh building instance at the same
+   * id/position/rotation with the normal pop-in animation, so it reads as "the house became a
+   * building" via a satisfying pop rather than an instant swap.
+   */
+  private onUpgrade(id: number): void {
+    const instance = this.byId.get(id);
+    if (!instance) return; // instance not placed yet (category still loading) — nothing to swap
+    const { x, z, rot } = instance;
+    this.freeSlot(instance);
+    this.place({ kind: 'building', x, z, rot }, true, id);
+  }
+
+  /** Task 35: a record entered its post-grace fade window — start the scale-down + sink animation.
+   * The instance is NOT removed here (see `onRemove`, fired when the sim's own fade timer
+   * completes); this only starts the visual. Cancels any pop-in still in flight for the same
+   * instance so the two animations don't fight over the same matrix slot. */
+  private onStranded(id: number): void {
+    const instance = this.byId.get(id);
+    if (!instance) return;
+    this.animating = this.animating.filter((a) => a.instance !== instance);
+    this.fading.push({ instance, elapsed: 0, duration: STRANDED_FADE_DURATION, sink: STRANDED_SINK_DISTANCE });
+  }
+
+  /** Task 35: the sim has deleted the record — free its instance slot(s) for real (unlike
+   * wilderness fades, which just park a slot off-screen forever since there's no sim-side removal
+   * to reconcile with). Also drops any still-running fade entry for this instance so `update()`
+   * doesn't keep animating a matrix slot that's just been reassigned to a different instance by
+   * `freeSlot`'s compaction. */
+  private onRemove(id: number): void {
+    const instance = this.byId.get(id);
+    if (!instance) return;
+    this.fading = this.fading.filter((f) => f.instance !== instance);
+    this.animating = this.animating.filter((a) => a.instance !== instance);
+    this.freeSlot(instance);
+  }
+
+  /**
+   * Frees `instance`'s slot(s) in its owning InstancedMesh(es) via swap-with-last compaction: the
+   * mesh's live range is always `[0, mesh.count)`, so removing a middle slot means copying the
+   * LAST live slot's matrix into the freed one, updating that swapped instance's own `.slot` (and
+   * its `slotOwners` bookkeeping) to match, then shrinking `mesh.count` by one. This keeps every
+   * mesh's instance range gap-free with no ghost/stale instances, at O(1) cost per removal (no scan
+   * over the full instance list) — the design called for by Task 35's "verify no ghost instances or
+   * index corruption after many removals" requirement (see the stress test in
+   * tests/sceneryDecay.test.ts).
+   *
+   * A house/building's window quad (separate InstancedMesh, own slot) and a field's 3 stripe quads
+   * (also separate, tracked via `fieldStripeOwners`) are freed the same way, keyed off the same
+   * swap-with-last logic applied to their own mesh/slot-array pair.
+   */
+  private freeSlot(instance: Instance): void {
+    const mesh = instance.variant.mesh;
+    if (mesh === this.field) {
+      this.fieldCount = this.compactMeshSlot(mesh, instance.slot, this.fieldCount);
+    } else {
+      this.compactMeshSlot(mesh, instance.slot, mesh.count);
+    }
+
+    if (instance.windowSlot !== null) {
+      this.windowCount = this.compactMeshSlot(this.windows, instance.windowSlot, this.windowCount, (moved) => {
+        // The window mesh's swapped-in owner is a house/building Instance — its own `windowSlot`
+        // must follow the swap.
+        moved.windowSlot = instance.windowSlot;
+      });
+      instance.windowSlot = null;
+    }
+
+    if (instance.kind === 'field') {
+      const stripeSlots = this.fieldStripeOwners[instance.slot];
+      // Compact each of this field's 3 stripe slots. Stripe slots have no per-slot `Instance`
+      // owner (they're pure decoration, never independently referenced), so there's nothing to
+      // update besides the raw matrix data + count.
+      if (stripeSlots) {
+        for (const s of stripeSlots) {
+          this.stripeCount = this.compactMeshSlot(this.fieldStripe, s, this.stripeCount);
+        }
+      }
+      // The freed field's stripe-slot bookkeeping is gone; the field that got swapped into this
+      // slot (if any) keeps its OWN stripe slots (fieldStripeOwners is indexed by field slot, and
+      // swapping field A's matrix into field B's old slot doesn't change which raw stripe slots
+      // belong to field A — only the field slot index moved). So: move the swapped field's stripe
+      // entry to the freed index, matching the field mesh's own swap-with-last above.
+      const lastFieldSlot = this.fieldCount; // fieldCount already decremented above
+      if (instance.slot < lastFieldSlot) {
+        this.fieldStripeOwners[instance.slot] = this.fieldStripeOwners[lastFieldSlot];
+      }
+      this.fieldStripeOwners.length = lastFieldSlot;
+    }
+
+    // Drop from bookkeeping AFTER compaction (compaction may need to read instance.slot above).
+    if (instance.id !== null) this.byId.delete(instance.id);
+    this.instances = this.instances.filter((inst) => inst !== instance);
+  }
+
+  /**
+   * Swaps the last live slot (at index `count - 1`) of `mesh` into `slot` (no-op if `slot` IS
+   * already the last live slot), updates `slotOwners` bookkeeping so the swapped-in instance's
+   * `.slot` matches its new position, sets `mesh.count` to the shrunk count, and returns that new
+   * count (callers with their own separate counter mirroring `mesh.count` — `fieldCount`,
+   * `windowCount` — must assign the return value back, since this method can't assign an outer
+   * `this.foo` by reference). `onMoved` (optional) lets a caller react to the swapped-in owner
+   * (Task 35: used to fix up a house/building's `windowSlot` after its window mesh compacts).
+   */
+  private compactMeshSlot(
+    mesh: THREE.InstancedMesh,
+    slot: number,
+    count: number,
+    onMoved?: (moved: Instance) => void,
+  ): number {
+    const owners = this.slotOwners.get(mesh);
+    const lastSlot = count - 1;
+    if (slot < lastSlot) {
+      mesh.getMatrixAt(lastSlot, dummyMatrix);
+      mesh.setMatrixAt(slot, dummyMatrix);
+      const moved = owners?.[lastSlot] ?? null;
+      if (moved) {
+        moved.slot = slot;
+        onMoved?.(moved);
+      }
+      if (owners) owners[slot] = moved;
+    }
+    if (owners) owners.length = Math.max(0, lastSlot);
+    mesh.count = Math.max(0, lastSlot);
+    mesh.instanceMatrix.needsUpdate = true;
+    return mesh.count;
   }
 
   private onPhase(night: boolean): void {
@@ -579,7 +816,11 @@ export class SceneryRenderer {
   rebuild(spawned: ReadonlyArray<SpawnRecord>): void {
     this.instances = [];
     this.animating = [];
+    this.fading = [];
     this.pendingSpawns = [];
+    this.byId.clear();
+    this.slotOwners.clear();
+    this.fieldStripeOwners = [];
     this.fieldCount = 0;
     this.stripeCount = 0;
     this.windowCount = 0;
@@ -589,8 +830,8 @@ export class SceneryRenderer {
     for (const v of [...this.treeVariants, ...this.houseVariants, ...this.buildingVariants]) v.mesh.count = 0;
 
     for (const rec of spawned) {
-      if (this.categoryReady(rec.kind)) this.place(rec, false);
-      else this.pendingSpawns.push({ rec, animate: false }); // restored — no pop-in once ready
+      if (this.categoryReady(rec.kind)) this.place(rec, false, rec.id);
+      else this.pendingSpawns.push({ rec, animate: false, id: rec.id }); // restored — no pop-in once ready
     }
   }
 
@@ -616,15 +857,28 @@ export class SceneryRenderer {
       const stillFading: Fading[] = [];
       for (const f of this.fading) {
         f.elapsed += dt;
-        const t = clamp01(f.elapsed / WILDERNESS_FADE_DURATION);
+        const t = clamp01(f.elapsed / f.duration);
         const s = Math.max(0.0001, 1 - t);
-        dummyPos.set(f.instance.x, f.instance.y, f.instance.z);
+        dummyPos.set(f.instance.x, f.instance.y - f.sink * t, f.instance.z);
         dummyQuat.setFromAxisAngle(upAxis, f.instance.rot);
         dummyScale.set(s, s, s);
         dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
         f.instance.variant.mesh.setMatrixAt(f.instance.slot, dummyMatrix);
         f.instance.variant.mesh.instanceMatrix.needsUpdate = true;
+        if (f.instance.windowSlot !== null) {
+          // Task 35: a stranded house/building fades its window quad out too (scale to ~0) rather
+          // than leaving a lit window floating over a sunk, near-invisible husk.
+          dummyScale.set(s, s, s);
+          dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
+          this.windows.setMatrixAt(f.instance.windowSlot, dummyMatrix);
+          this.windows.instanceMatrix.needsUpdate = true;
+        }
         if (t < 1) stillFading.push(f);
+        // t >= 1: the sim's own `growth:remove` (Task 35) or `wilderness:cleared`'s fade (Task 31,
+        // never actually removed from the scene) governs whether the slot is freed — see
+        // `onRemove`, which calls `freeSlot` directly rather than relying on this loop noticing
+        // completion, since the sim's `growth:remove` may arrive slightly before or after this
+        // local timer reaches 1 (they're independently-timed but should coincide in practice).
       }
       this.fading = stillFading;
     }
