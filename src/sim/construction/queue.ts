@@ -193,7 +193,30 @@ export class BuildQueue {
       const edge = this.graph.edges.get(edgeId);
       if (!edge) return;
       if (edge.stage === 'surveyed') this.enqueueBuild(edgeId);
-      else this.enqueueResume(edgeId);
+      else {
+        this.enqueueResume(edgeId);
+        // Task 43 ("grass on top of the road", third occurrence): a split-off half born already
+        // at 'graded' or beyond (see the comment above — `splitEdge` inherits stage, and
+        // `enqueueResume` is a no-op for an already-'painted' edge, so grading never re-runs and
+        // `finalizeGrading` never fires again for this NEW edge id) still needs its own easement
+        // registered under ITS OWN id — the old edge id's registration was just dropped by the
+        // `roads:edgeRemoved` handler below, and without this, a split-off stretch of a hillside
+        // road would silently lose corridor protection forever, right where a new junction/house
+        // is most likely to appear next.
+        if (STAGES.indexOf(edge.stage) >= STAGES.indexOf('graded')) {
+          this.hf.registerRoadEasement(
+            edgeId, edge.samples, (i) => sampleHeadingAt(edge.samples, i),
+            CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS,
+          );
+        }
+      }
+    });
+    // Task 43: the ONE place every edge-removal path (full demolition down to 'removed', the
+    // instant-drop shortcut for a still-'surveyed' pending edge, and `splitEdge` replacing an edge
+    // with two new ones) converges — `RoadGraph` emits this from all three. Unregistering here
+    // rather than at each removal call site means a future new removal path can't forget this step.
+    this.bus.on('roads:edgeRemoved', ({ edgeId }) => {
+      this.hf.unregisterRoadEasement(edgeId);
     });
   }
 
@@ -558,7 +581,7 @@ export class BuildQueue {
     if (!job.demolish && job.t >= edge.length) {
       edge.stage = stage;
       if (stage === 'graded') {
-        this.finalizeGrading(edge);
+        this.finalizeGrading(edge, job.edgeId);
       }
       this.bus.emit('construction:stage', { edgeId: job.edgeId, stage, crew });
       if (stage === 'painted') {
@@ -682,7 +705,7 @@ export class BuildQueue {
       if (front.t >= edge.length) {
         front.done = true;
         edge.stage = stage;
-        if (stage === 'graded') this.finalizeGrading(edge);
+        if (stage === 'graded') this.finalizeGrading(edge, job.edgeId);
         this.bus.emit('construction:stage', { edgeId: job.edgeId, stage, crew });
         if (stage === 'painted') {
           this.bus.emit('roads:changed', {});
@@ -783,7 +806,7 @@ export class BuildQueue {
   /** Hard finalization clamp sweep run once grading is fully complete — shared by both the
    * sequential graded pass and the train's graded front (Task 36 extraction; behavior byte-for-byte
    * unchanged from the pre-Task-36 inline version). */
-  private finalizeGrading(edge: RoadEdge): void {
+  private finalizeGrading(edge: RoadEdge, edgeId: number): void {
     // Finalization pass (playtest fix: "the land is still rendering above the cleared road
     // in some areas"): the per-update 3-track `flattenCircle` blend above tracks the vehicle
     // as it moves, but its smoothstep falloff can still leave terrain vertices above the
@@ -800,6 +823,18 @@ export class BuildQueue {
       const sHeading = sampleHeadingAt(edge.samples, i);
       this.hf.clampBelow(s.x, s.z, s.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, sHeading, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
     }
+    // Task 43 ("grass on top of the road", third occurrence): the clamp above only holds AT this
+    // moment — terrain keeps deforming after grading finishes (growth's house/building pads,
+    // the quarry pad, anything else that calls `flattenCircle` later against the shared
+    // Heightfield). Register this edge's clamp constraints as a standing easement so ANY future
+    // `flattenCircle` call that deforms overlapping terrain automatically re-enforces this same
+    // ceiling — one authority (Heightfield itself), safe by default for every present and future
+    // deformer, rather than each new deformer needing to remember to re-clamp roads itself (the
+    // point-fix approach that already failed to hold twice).
+    this.hf.registerRoadEasement(
+      edgeId, edge.samples, (i) => sampleHeadingAt(edge.samples, i),
+      CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS,
+    );
   }
 }
 

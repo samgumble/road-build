@@ -3,7 +3,10 @@ import { BuildQueue } from '../src/sim/construction/queue';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { Heightfield } from '../src/sim/terrain/heightfield';
 import { makeSampler, sampleAt } from '../src/sim/roads/path';
+import { GrowthSim } from '../src/sim/growth/growth';
+import { restoreWorld, type SaveV3 } from '../src/sim/save';
 import { EventBus } from '../src/core/events';
+import { createRng } from '../src/core/rng';
 import { GRID_SIZE, CELL, WORLD_SIZE, ROAD_WIDTH } from '../src/core/constants';
 
 /**
@@ -284,5 +287,338 @@ describe('road/terrain clamp — steep cross-slope regression (Task 24)', () => 
     queue.enqueueDemolish(edgeId);
     run(queue, 120); // full demolish
     expect(graph.edges.has(edgeId)).toBe(false);
+  });
+});
+
+/**
+ * Third occurrence ("I was still seeing grass on top of the road", post-T24/v2). T24's
+ * anisotropic clampBelow enforcement runs at grading completion + a mid-build trailing window +
+ * save.ts's restore path — but only ever at THOSE call sites. Terrain deforms again AFTER a road
+ * finishes: growth spawns houses/buildings along the corridor (Task 30 setback band, 8-10u from
+ * the centerline sample), and `SceneryRenderer.onSpawn` -> `place()` (src/render/sceneryRenderer.ts
+ * line ~689) calls `hf.flattenCircle(rec.x, rec.z, y, FLATTEN_RADIUS=5)` to carve the house's own
+ * pad — a *render-side* call directly against the shared sim Heightfield, completely outside
+ * BuildQueue/save.ts's clamp-aware machinery. `flattenCircle` blends terrain TOWARD the pad's own
+ * ground height; on a hillside where the house sits uphill of a cut road, that target is above
+ * road grade, so the blend RAISES corridor-adjacent terrain that clampBelow already flattened.
+ * Nothing re-clamped afterward — UNTIL this fix.
+ *
+ * BEFORE the fix (measured against this exact suite, see task-43-report.md for full numbers):
+ *   - single house at minimum (8u) setback, axis-aligned slope 0.6: 3 violations, worst excess 0.026u
+ *   - full T30 band [8,10] both sides, 3 points along a 64u road: 24 violations, worst excess 0.072u
+ *   - dense "developed street" (both sides, every 4u), axis-aligned slope 0.6/1.0/1.5:
+ *     104 / 131 / 133 violations, worst excess 0.079u / 0.107u / 0.141u (grows with slope)
+ *   - dense band on the gentle (0.3) diagonal (T24's own worst-case geometry): 0 violations (this
+ *     particular slope/geometry combination didn't trip the bug — real negative evidence, kept
+ *     below as a probe, not a claim the bug never manifests on a diagonal road)
+ *
+ * AFTER the fix (`Heightfield.registerRoadEasement` + re-enforcement from `flattenCircle` — see
+ * heightfield.ts): every scenario above is asserted at 0 violations.
+ *
+ * This reproduces/proves it exactly the way the renderer does: build a road on the same steep
+ * hillside ramp T24 used, run it to `painted` completion (so the corridor is provably clean
+ * beforehand — see the baseline assertion below, plus `finalizeGrading` now also registers the
+ * standing easement), then place a house at a realistic T30 setback and call the SAME
+ * `flattenCircle(x, z, heightAt(x, z), FLATTEN_RADIUS)` the renderer calls, then re-scan the
+ * corridor lattice.
+ */
+describe('road/terrain clamp — house-pad flatten vs. corridor (third occurrence, Task 43)', () => {
+  const FLATTEN_RADIUS = 5; // must match sceneryRenderer.ts's own constant
+  const SETBACK_MIN = 8; // must match growth.ts's own SETBACK_MIN/SETBACK_MAX (band is [8, 10])
+
+  it('BASELINE: corridor is clean immediately after grading completes (T24 still holds)', () => {
+    const { queue, hf, graph, edgeId } = setupAxisAligned(0.6, 64);
+    run(queue, 120);
+    const edge = graph.edges.get(edgeId)!;
+    expect(edge.stage).toBe('painted');
+    const violations = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+    expect(violations.length).toBe(0);
+  });
+
+  it('PROVE: a house pad flattened at T30 setback no longer re-raises terrain above the road', () => {
+    const { queue, hf, graph, edgeId } = setupAxisAligned(0.6, 64);
+    run(queue, 120); // full build, corridor clean per baseline above
+    const edge = graph.edges.get(edgeId)!;
+
+    // Place a house at the uphill side (+Z, where the ramp is higher), at the T30 minimum
+    // setback (worst case: closest legal distance to the corridor), abreast of the road's
+    // midpoint sample — exactly what GrowthSim.placeFacingRoad + SceneryRenderer.place do between
+    // them, reproduced directly against the real Heightfield/RoadGraph rather than mocked.
+    const midT = edge.length / 2;
+    const { pos, heading } = sampleAt(edge.samples, midT);
+    const perpX = -Math.sin(heading);
+    const perpZ = Math.cos(heading);
+    const setback = SETBACK_MIN; // worst case: closest legal distance
+    const houseX = pos.x + perpX * setback;
+    const houseZ = pos.z + perpZ * setback;
+
+    const groundY = hf.heightAt(houseX, houseZ);
+    // This is the exact call sceneryRenderer.ts makes on spawn/restore for a house or building.
+    hf.flattenCircle(houseX, houseZ, groundY, FLATTEN_RADIUS);
+
+    const violations = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+    // eslint-disable-next-line no-console
+    console.log(
+      `[house-pad] setback=${setback} groundY=${groundY.toFixed(2)} ` +
+      `violations=${violations.length} worstExcess=${violations.length ? Math.max(...violations.map(v => v.excess)).toFixed(3) : 0}`,
+    );
+    expect(violations.length).toBe(0); // was 3 (worst excess 0.026u) before the easement fix
+  });
+
+  it('PROVE: sweeping the full T30 setback band [8,10] against every corridor side stays clean', () => {
+    const { queue, hf, graph, edgeId } = setupAxisAligned(0.6, 64);
+    run(queue, 120);
+    const edge = graph.edges.get(edgeId)!;
+
+    for (const setback of [8, 8.5, 9, 9.5, 10]) {
+      for (const side of [-1, 1] as const) {
+        for (const t of [16, 32, 48]) {
+          const { pos, heading } = sampleAt(edge.samples, t);
+          const perpX = -Math.sin(heading);
+          const perpZ = Math.cos(heading);
+          const houseX = pos.x + perpX * setback * side;
+          const houseZ = pos.z + perpZ * setback * side;
+          const groundY = hf.heightAt(houseX, houseZ);
+          hf.flattenCircle(houseX, houseZ, groundY, FLATTEN_RADIUS);
+        }
+      }
+    }
+    const violations = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+    const worstExcess = violations.length ? Math.max(...violations.map(v => v.excess)) : 0;
+    // eslint-disable-next-line no-console
+    console.log(`[house-pad, full band] violations=${violations.length} worstExcess=${worstExcess.toFixed(3)}`);
+    expect(violations.length).toBe(0); // was 24 (worst excess 0.072u) before the easement fix
+  });
+
+  it('PROVE(diagonal, gentle slope, no bridge): dense band stays clean (matches pre-fix negative finding)', () => {
+    // T24's own worst measured case (clean, non-bridged) was diagonal + gentle slope 0.3 (off-axis
+    // grid coverage) — baseline is 0 violations per the existing suite. This particular
+    // slope/geometry combination happened not to trip the bug even before the fix (real negative
+    // evidence, not proof the bug is geometry-proof) — kept as a probe/regression guard so a
+    // future change can't silently reintroduce violations here either.
+    const { queue, hf, graph, edgeId } = setupDiagonal(0.3, 64);
+    run(queue, 60);
+    const edge = graph.edges.get(edgeId)!;
+    expect(edge.samples.every((s) => !s.bridge)).toBe(true);
+    const baseline = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+    expect(baseline.length).toBe(0); // confirm clean baseline (matches existing suite's finding)
+
+    for (const setback of [8, 8.5, 9, 9.5, 10]) {
+      for (const side of [-1, 1] as const) {
+        for (let t = 8; t <= edge.length - 8; t += 4) {
+          const { pos, heading } = sampleAt(edge.samples, t);
+          const perpX = -Math.sin(heading);
+          const perpZ = Math.cos(heading);
+          const houseX = pos.x + perpX * setback * side;
+          const houseZ = pos.z + perpZ * setback * side;
+          const groundY = hf.heightAt(houseX, houseZ);
+          hf.flattenCircle(houseX, houseZ, groundY, FLATTEN_RADIUS);
+        }
+      }
+    }
+    const after = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+    // eslint-disable-next-line no-console
+    console.log(
+      `[diagonal dense] violations=${after.length} ` +
+      `worstExcess=${after.length ? Math.max(...after.map(v => v.excess)).toFixed(3) : 0}`,
+    );
+    expect(after.length).toBe(0);
+  });
+
+  it('PROVE(axis-aligned, steeper slopes): dense "developed street" (both sides) stays clean with margin', () => {
+    // Simulates a realistic developed street: houses lining BOTH sides of the road at the T30
+    // setback band, every 4u of arclength (dense — a fully "grown" street). Before the fix this
+    // was the clearest, largest-magnitude reproduction (104/131/133 violations at slope
+    // 0.6/1.0/1.5, worst excess up to 0.141u); now asserted clean at every slope.
+    const results: Record<number, { baseline: number; after: number; worstExcess: number }> = {};
+    for (const slope of [0.6, 1.0, 1.5]) {
+      const { queue, hf, graph, edgeId } = setupAxisAligned(slope, 64);
+      run(queue, 120);
+      const edge = graph.edges.get(edgeId)!;
+      const baseline = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+      expect(baseline.length).toBe(0); // T24 still holds immediately post-grading (confirms it's not stale)
+
+      for (const setback of [8, 8.5, 9, 9.5, 10]) {
+        for (const side of [-1, 1] as const) {
+          for (let t = 8; t <= edge.length - 8; t += 4) {
+            const { pos, heading } = sampleAt(edge.samples, t);
+            const perpX = -Math.sin(heading);
+            const perpZ = Math.cos(heading);
+            const houseX = pos.x + perpX * setback * side;
+            const houseZ = pos.z + perpZ * setback * side;
+            const groundY = hf.heightAt(houseX, houseZ);
+            // This is the exact call sceneryRenderer.ts's place() makes for every house/building.
+            hf.flattenCircle(houseX, houseZ, groundY, FLATTEN_RADIUS);
+          }
+        }
+      }
+      const after = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+      const worstExcess = after.length ? Math.max(...after.map(v => v.excess)) : 0;
+      results[slope] = { baseline: baseline.length, after: after.length, worstExcess };
+      // eslint-disable-next-line no-console
+      console.log(
+        `[developed street] slope=${slope} baseline=${baseline.length} afterHouses=${after.length} ` +
+        `worstExcess=${worstExcess.toFixed(3)}`,
+      );
+    }
+    expect(results[0.6].after).toBe(0);
+    expect(results[1.0].after).toBe(0);
+    expect(results[1.5].after).toBe(0);
+  });
+
+  it('PROVE: a demolished-then-rebuilt road is still protected under its NEW easement (no stale/orphaned clamp)', () => {
+    // Guards the unregister/re-register lifecycle: demolishing a graded+ road must drop its old
+    // easement (Heightfield.unregisterRoadEasement, wired to RoadGraph's `roads:edgeRemoved`), and
+    // rebuilding fresh across the same ground must register a new one — not silently leave the
+    // corridor unprotected because "this edgeId already had an easement once."
+    const { queue, hf, graph, edgeId } = setupAxisAligned(0.8, 64);
+    run(queue, 120);
+    expect(graph.edges.get(edgeId)!.stage).toBe('painted');
+
+    queue.enqueueDemolish(edgeId);
+    run(queue, 120);
+    expect(graph.edges.has(edgeId)).toBe(false);
+
+    const [newEdgeId] = graph.commitChain([{ x: -32, z: 0 }, { x: 32, z: 0 }]);
+    run(queue, 120);
+    const edge = graph.edges.get(newEdgeId)!;
+    expect(edge.stage).toBe('painted');
+
+    const midT = edge.length / 2;
+    const { pos, heading } = sampleAt(edge.samples, midT);
+    const perpX = -Math.sin(heading);
+    const perpZ = Math.cos(heading);
+    const houseX = pos.x + perpX * SETBACK_MIN;
+    const houseZ = pos.z + perpZ * SETBACK_MIN;
+    hf.flattenCircle(houseX, houseZ, hf.heightAt(houseX, houseZ), FLATTEN_RADIUS);
+
+    const violations = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+    expect(violations.length).toBe(0);
+  });
+
+  it('PROVE: the quarry pad (a second, independent post-grading deformer) is also covered by the same easement mechanism', () => {
+    // Per the brief's audit requirement: `ConstructionRenderer.placeQuarryProp` (Task 34) calls
+    // `hf.flattenCircle(placement.x, placement.z, y, QUARRY_PAD_FLATTEN_RADIUS=13)` — render-side,
+    // same structural risk as the house pad, just a larger radius. A quarry is placed >=40u from
+    // the FIRST edge that triggers it, but nothing stops a DIFFERENT road being built later close
+    // enough for the 13u pad to reach its corridor. This proves the registerRoadEasement mechanism
+    // added for houses protects this deformer too, with NO quarry-specific code — "safe by
+    // default," the whole point of putting the fix in Heightfield.flattenCircle's one chokepoint
+    // rather than teaching each deformer about roads individually.
+    const QUARRY_PAD_FLATTEN_RADIUS = 13; // must match constructionRenderer.ts's own constant
+    const { queue, hf, graph, edgeId } = setupAxisAligned(0.7, 64);
+    run(queue, 120);
+    const edge = graph.edges.get(edgeId)!;
+    expect(edge.stage).toBe('painted');
+    const baseline = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+    expect(baseline.length).toBe(0);
+
+    // Place the quarry pad close enough that its 13u flatten radius reaches into the corridor —
+    // e.g. a second road built near an already-sited quarry, or the quarry siting search landing
+    // nearer to this edge than the 40u rule applied only to the edge that originally triggered it.
+    const midT = edge.length / 2;
+    const { pos, heading } = sampleAt(edge.samples, midT);
+    const perpX = -Math.sin(heading);
+    const perpZ = Math.cos(heading);
+    const quarryDist = 12; // inside the 13u pad radius from the centerline — deliberately intrusive
+    const qx = pos.x + perpX * quarryDist;
+    const qz = pos.z + perpZ * quarryDist;
+    const qy = hf.heightAt(qx, qz);
+    hf.flattenCircle(qx, qz, qy, QUARRY_PAD_FLATTEN_RADIUS);
+
+    const violations = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+    // eslint-disable-next-line no-console
+    console.log(`[quarry pad] violations=${violations.length}`);
+    expect(violations.length).toBe(0);
+  });
+
+  it('PROVE: a road split by a later T-junction keeps easement protection under the NEW edge ids', () => {
+    // Gap found during root-cause analysis: `RoadGraph.splitEdge` replaces one edge with two new
+    // ones (new edge ids), inheriting the ORIGINAL edge's stage directly — so a split-off half of
+    // an already-`painted` road never re-runs grading and never re-fires `finalizeGrading` (which
+    // is where a fresh edge normally registers its easement). Without an explicit fix, splitting a
+    // hillside road at a T-junction would silently drop corridor protection for that stretch
+    // forever — right where a new junction/house is most likely to appear next. Fixed via
+    // `BuildQueue`'s `roads:edgeAdded` handler explicitly registering an easement for any
+    // split-off half born already at >= 'graded'.
+    const bus = new EventBus();
+    const hf = new Heightfield('split-test', bus);
+    setLinearRampZ(hf, 0.6, 10);
+    const graph = new RoadGraph(bus, makeSampler(hf));
+    const queue = new BuildQueue(graph, hf, bus);
+
+    // 3-point chain so there's a real interior control point (at x=0) to split at later.
+    const [edgeId] = graph.commitChain([{ x: -32, z: 0 }, { x: 0, z: 0 }, { x: 32, z: 0 }]);
+    run(queue, 120);
+    expect(graph.edges.get(edgeId)!.stage).toBe('painted');
+
+    // A second road touches the first's interior control point (x=0, z=0) — RoadGraph.addNode
+    // resolves that to `splitEdge`, replacing `edgeId` with two new edges.
+    graph.commitChain([{ x: 0, z: 0 }, { x: 0, z: 32 }]);
+    expect(graph.edges.has(edgeId)).toBe(false); // original id replaced, per graph.test.ts's own finding
+
+    // Find the split-off half lying along z=0 (the original road, not the new branch) — it should
+    // already be 'painted' (inherited stage) and it's the one whose easement matters here.
+    const halfOnOriginalRoad = [...graph.edges.values()]
+      .find((e) => e.id !== edgeId && e.samples.every((s) => Math.abs(s.z) < 0.5) && e.stage === 'painted');
+    expect(halfOnOriginalRoad).toBeDefined();
+    const half = halfOnOriginalRoad!;
+    run(queue, 5); // let BuildQueue's roads:edgeAdded handler + any resume no-op settle
+
+    // Place a house pad right against this split-off half, exactly like the other PROVE tests.
+    const midT = half.length / 2;
+    const { pos, heading } = sampleAt(half.samples, midT);
+    const perpX = -Math.sin(heading);
+    const perpZ = Math.cos(heading);
+    const houseX = pos.x + perpX * SETBACK_MIN;
+    const houseZ = pos.z + perpZ * SETBACK_MIN;
+    hf.flattenCircle(houseX, houseZ, hf.heightAt(houseX, houseZ), FLATTEN_RADIUS);
+
+    const violations = scanRibbonFootprint(hf, half.samples, half.length, 0.06 - 0.02);
+    expect(violations.length).toBe(0);
+  });
+
+  it('PROVE: a reloaded save stays clean even though SceneryRenderer.rebuild() re-flattens house pads AFTER restoreWorld', () => {
+    // This is the literal "third occurrence, after v2" scenario: main.ts calls restoreWorld(...)
+    // then sceneryRenderer.rebuild(growth.spawned, ...) right after (see main.ts's boot sequence) —
+    // rebuild() re-runs `place()` for every restored house/building record, which calls the same
+    // flattenCircle pad-carve a live spawn does. Before this fix, restoreWorld's own clampBelow
+    // sweep (which runs BEFORE rebuild) would already be undone by the time the player sees the
+    // reloaded world. Proves restoreWorld's new registerRoadEasement call protects against a
+    // deform that happens strictly AFTER restoreWorld returns.
+    const bus = new EventBus();
+    const hf = new Heightfield('restore-test', bus);
+    setLinearRampZ(hf, 0.6, 10);
+    const graph = new RoadGraph(bus, makeSampler(hf));
+    const growth = new GrowthSim(graph, hf, bus, createRng('restore-test'));
+
+    const half = 32;
+    const save: SaveV3 = {
+      version: 3,
+      seed: 'restore-test',
+      timeOfDay: 0.5,
+      edges: [{ ctrl: [{ x: -half, z: 0 }, { x: half, z: 0 }], stage: 'painted' }],
+      growth: { dev: new Array(GRID_SIZE * GRID_SIZE).fill(0), spawned: [], decay: [] },
+      quarry: null,
+    };
+    restoreWorld(save, { bus, hf, graph, growth });
+
+    const edge = [...graph.edges.values()][0];
+    expect(edge.stage).toBe('painted');
+    const baseline = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+    expect(baseline.length).toBe(0); // restoreWorld's own clampBelow sweep already holds here
+
+    // Simulate SceneryRenderer.rebuild() re-flattening a restored house's pad — the exact call
+    // sceneryRenderer.ts's place() makes, run AFTER restoreWorld returns (matching main.ts's order).
+    const midT = edge.length / 2;
+    const { pos, heading } = sampleAt(edge.samples, midT);
+    const perpX = -Math.sin(heading);
+    const perpZ = Math.cos(heading);
+    const houseX = pos.x + perpX * SETBACK_MIN;
+    const houseZ = pos.z + perpZ * SETBACK_MIN;
+    hf.flattenCircle(houseX, houseZ, hf.heightAt(houseX, houseZ), FLATTEN_RADIUS);
+
+    const violations = scanRibbonFootprint(hf, edge.samples, edge.length, 0.06 - 0.02);
+    expect(violations.length).toBe(0);
   });
 });

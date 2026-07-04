@@ -383,6 +383,18 @@ export function restoreWorld(save: SaveV3, deps: RestoreDeps): void {
         const heading = sampleHeadingAt(edge.samples, i);
         hf.clampBelow(s.x, s.z, s.y, CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, heading, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS);
       }
+      // Task 43 ("grass on top of the road", third occurrence): the clampBelow sweep above only
+      // holds terrain at the MOMENT restore runs — `sceneryRenderer.rebuild()` (called right after
+      // `restoreWorld` returns, from main.ts) re-flattens every restored house/building's terrain
+      // pad, which can re-raise corridor terrain the sweep above just fixed, exactly like a live
+      // spawn does. Register this edge's clamp as a standing easement (same mechanism
+      // `BuildQueue.finalizeGrading` registers for a live build) so THAT re-flatten — and any other
+      // deformer that runs after restore — automatically gets re-clamped rather than needing its
+      // own explicit fix.
+      hf.registerRoadEasement(
+        edgeId, edge.samples, (i) => sampleHeadingAt(edge.samples, i),
+        CLAMP_OUTER_RADIUS, CLAMP_FLAT_RADIUS, CLAMP_ALONG_RADIUS, CLAMP_ALONG_FLAT_RADIUS,
+      );
     }
   }
 

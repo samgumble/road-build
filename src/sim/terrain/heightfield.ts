@@ -3,8 +3,44 @@ import { createRng } from '../../core/rng';
 import { EventBus } from '../../core/events';
 import { GRID_SIZE, CELL, WORLD_SIZE, WATER_LEVEL } from '../../core/constants';
 
+/** One road sample's clamp constraint, as registered by `Heightfield.registerRoadEasement` — the
+ * exact same parameters `clampBelow` itself takes, captured so they can be REPLAYED after any
+ * later deformer (flattenCircle from a house pad, a quarry pad, or anything else) mutates
+ * overlapping terrain. See `registerRoadEasement`'s doc comment for the full rationale. */
+interface EasementSample {
+  x: number; z: number; y: number; heading: number;
+  radius: number; flatRadius: number; alongRadius: number; alongFlatRadius: number;
+}
+
+// Bucket size for the easement spatial index — matches the grid cell so a mutated bounding box
+// (already expressed in grid indices by every caller) maps directly onto bucket indices with no
+// extra rounding logic.
+const EASEMENT_BUCKET = CELL;
+
 export class Heightfield {
   readonly heights = new Float32Array(GRID_SIZE * GRID_SIZE);
+
+  // --- Road easements (Groundwork Task 43: "grass on top of the road", third occurrence) --------
+  // T24's clampBelow enforcement only ever ran at grading completion, a mid-build trailing window,
+  // and save.ts's restore path — all BEFORE construction finishes. But terrain keeps deforming
+  // AFTER a road is done: growth spawns a house/building pad (SceneryRenderer.place,
+  // flattenCircle radius 5) at a T30 setback of just 8-10u from the centerline, close enough that
+  // its blended pad — when the house sits uphill of a cut road — RAISES corridor terrain the
+  // road's own clampBelow had already flattened. The quarry pad (ConstructionRenderer,
+  // flattenCircle radius 13) has the same structural risk against any road built near it later.
+  // Point-fixing each caller (T24's own architecture, twice now) keeps missing the NEXT deformer.
+  //
+  // Root fix: every graded+ road sample registers its own clampBelow constraint HERE, in the one
+  // chokepoint every deformer (sim or render, present or future) already calls through —
+  // `flattenCircle`. After any `flattenCircle` mutates a region, it re-applies every registered
+  // easement whose footprint overlaps that region, restoring the invariant "no terrain above the
+  // roadbed inside a graded corridor" regardless of what just tried to violate it. New deformers
+  // are safe BY DEFAULT — they don't need to know easements exist at all.
+  private readonly easements = new Map<number, EasementSample[]>();
+  // Spatial index: bucket key -> list of (edgeId, sampleIndex) pairs, so re-applying easements
+  // after a small localized deform (a house pad) only visits nearby samples, not every registered
+  // sample on the map (which could be in the thousands on a fully built-out island).
+  private readonly easementBuckets = new Map<string, { edgeId: number; idx: number }[]>();
 
   constructor(public readonly seed: string, private bus?: EventBus) {
     const noise = createNoise2D(createRng(seed));
@@ -68,7 +104,114 @@ export class Heightfield {
         this.heights[idx] += (targetY - this.heights[idx]) * w;
       }
     }
+    // Road-easement re-enforcement (Task 43): this deform may have just raised terrain back above
+    // a graded road's ceiling (e.g. a house/quarry pad's blend reaching into the corridor) — replay
+    // any registered clampBelow constraints whose footprint overlaps the region we just touched so
+    // the "no terrain above the roadbed" invariant holds regardless of what deformed it.
+    this.reapplyEasementsNear(minI, minJ, maxI, maxJ);
     this.bus?.emit('terrain:deformed', { minI, minJ, maxI, maxJ });
+  }
+
+  /** World-space bucket coordinate for `w` (an x or z coordinate), used as one half of the
+   * easement spatial index's key. Bucketing in world units (rather than grid indices) keeps
+   * `registerRoadEasement` and `reapplyEasementsNear` — which work in different unit systems
+   * (sample world positions vs. mutated grid-index boxes) — trivially consistent with each other. */
+  private static bucketCoord(w: number): number {
+    return Math.floor(w / EASEMENT_BUCKET);
+  }
+
+  /**
+   * Registers `edgeId`'s graded+ road samples as standing terrain-clamp constraints, replayed by
+   * every future `flattenCircle` call that deforms overlapping terrain (see that method and the
+   * class-level doc comment above `easements` for the full rationale). Call with the same
+   * parameters `clampBelow` itself would use (mirrors `queue.ts`'s `finalizeGrading` /
+   * `save.ts`'s restore-path clamp sweep) — typically once, right when an edge reaches 'graded'.
+   * Replaces any previous registration for the same `edgeId` (idempotent — safe to call again if
+   * an edge's samples are re-sampled, e.g. after an upstream terrain edit).
+   */
+  registerRoadEasement(
+    edgeId: number,
+    samples: { x: number; y: number; z: number; bridge: boolean }[],
+    headingAt: (i: number) => number,
+    radius: number,
+    flatRadius: number,
+    alongRadius: number,
+    alongFlatRadius: number,
+  ): void {
+    this.unregisterRoadEasement(edgeId);
+    const list: EasementSample[] = [];
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      if (s.bridge) continue;
+      list.push({
+        x: s.x, z: s.z, y: s.y, heading: headingAt(i),
+        radius, flatRadius, alongRadius, alongFlatRadius,
+      });
+    }
+    this.easements.set(edgeId, list);
+    for (let k = 0; k < list.length; k++) {
+      const es = list[k];
+      const maxReach = Math.max(es.radius, es.alongRadius);
+      const bi0 = Heightfield.bucketCoord(es.x - maxReach);
+      const bi1 = Heightfield.bucketCoord(es.x + maxReach);
+      const bj0 = Heightfield.bucketCoord(es.z - maxReach);
+      const bj1 = Heightfield.bucketCoord(es.z + maxReach);
+      for (let bj = bj0; bj <= bj1; bj++) {
+        for (let bi = bi0; bi <= bi1; bi++) {
+          const key = `${bi},${bj}`;
+          let arr = this.easementBuckets.get(key);
+          if (!arr) { arr = []; this.easementBuckets.set(key, arr); }
+          arr.push({ edgeId, idx: k });
+        }
+      }
+    }
+  }
+
+  /** Removes `edgeId`'s registered easement (demolish reaching below 'graded', or the edge being
+   * removed from the graph entirely) so a torn-up road stops constraining terrain forever. */
+  unregisterRoadEasement(edgeId: number): void {
+    if (!this.easements.has(edgeId)) return;
+    this.easements.delete(edgeId);
+    for (const arr of this.easementBuckets.values()) {
+      for (let i = arr.length - 1; i >= 0; i--) {
+        if (arr[i].edgeId === edgeId) arr.splice(i, 1);
+      }
+    }
+  }
+
+  /** Re-applies every registered easement whose footprint could overlap the grid index box
+   * `[minI,maxI] x [minJ,maxJ]` (in the SAME grid-index units `flattenCircle`/`clampBelow` already
+   * compute their own mutated bounding box in) — called after any `flattenCircle` deform. Uses the
+   * bucket index to gather only nearby easement samples rather than scanning every registered
+   * sample on the map, so this stays cheap even with hundreds of graded edges. Safe/cheap no-op
+   * when nothing is registered yet (the common case for most of the game before any road exists).
+   */
+  private reapplyEasementsNear(minI: number, minJ: number, maxI: number, maxJ: number): void {
+    if (this.easements.size === 0) return;
+    const half = WORLD_SIZE / 2;
+    const minX = minI * CELL - half, maxX = maxI * CELL - half;
+    const minZ = minJ * CELL - half, maxZ = maxJ * CELL - half;
+    const bi0 = Heightfield.bucketCoord(minX);
+    const bi1 = Heightfield.bucketCoord(maxX);
+    const bj0 = Heightfield.bucketCoord(minZ);
+    const bj1 = Heightfield.bucketCoord(maxZ);
+    const seen = new Set<string>();
+    for (let bj = bj0; bj <= bj1; bj++) {
+      for (let bi = bi0; bi <= bi1; bi++) {
+        const key = `${bi},${bj}`;
+        const arr = this.easementBuckets.get(key);
+        if (!arr) continue;
+        for (const ref of arr) {
+          const dedupeKey = `${ref.edgeId}:${ref.idx}`;
+          if (seen.has(dedupeKey)) continue;
+          seen.add(dedupeKey);
+          const list = this.easements.get(ref.edgeId);
+          const es = list?.[ref.idx];
+          if (!es) continue;
+          this.applyClampBelow(es.x, es.z, es.y, es.radius, es.flatRadius, es.heading, es.alongRadius, es.alongFlatRadius);
+        }
+      }
+    }
   }
 
   /**
@@ -124,6 +267,28 @@ export class Heightfield {
     alongRadius: number = radius,
     alongFlatRadius: number = flatRadius,
   ): void {
+    const { minI, minJ, maxI, maxJ } = this.applyClampBelow(x, z, maxY, radius, flatRadius, heading, alongRadius, alongFlatRadius);
+    this.bus?.emit('terrain:deformed', { minI, minJ, maxI, maxJ });
+  }
+
+  /** Core clamp loop shared by the public `clampBelow` (emits `terrain:deformed`, for direct
+   * callers like `queue.ts`/`save.ts`) and `reapplyEasementsNear` (replays a registered easement
+   * after some OTHER deform touched overlapping terrain — deliberately no event emission there,
+   * since it's re-enforcing an already-known constraint (not a new deform of its own) and callers
+   * of the original deform already got their own `terrain:deformed` event for this region. A hard
+   * clamp-down also can never itself raise terrain above another easement's ceiling, so there's no
+   * cascade to worry about even though `flattenCircle`'s own reapply call isn't guarded against
+   * one — `applyClampBelow` never recurses into `reapplyEasementsNear` at all. */
+  private applyClampBelow(
+    x: number,
+    z: number,
+    maxY: number,
+    radius: number,
+    flatRadius: number,
+    heading: number | undefined,
+    alongRadius: number,
+    alongFlatRadius: number,
+  ): { minI: number; minJ: number; maxI: number; maxJ: number } {
     const half = WORLD_SIZE / 2;
     const maxReach = Math.max(radius, alongRadius);
     const minI = Math.max(0, Math.floor((x - maxReach + half) / CELL));
@@ -165,7 +330,7 @@ export class Heightfield {
         if (this.heights[idx] > ceiling) this.heights[idx] = ceiling;
       }
     }
-    this.bus?.emit('terrain:deformed', { minI, minJ, maxI, maxJ });
+    return { minI, minJ, maxI, maxJ };
   }
 }
 
