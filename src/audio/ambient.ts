@@ -84,6 +84,27 @@ const PAN_DIVISOR = 120;
 const CREW_SWITCH_MARGIN = 20; // units a competitor must beat the followed crew by before we switch
 const PAN_EASE_TAU = 0.15; // seconds, damped-lerp time constant for rumble/beeper pan (matches engineGain's gate ease style)
 
+// Radio chatter (Groundwork Task 26): occasional filtered-noise blips per active crew, panned to
+// that crew's own position (not the shared followed-crew pan the engine rumble/beeper use — each
+// crew chatters independently since this is meant to read as "a radio somewhere on that crew's
+// site", not a single shared voice).
+const RADIO_MIN_INTERVAL = 20; // seconds
+const RADIO_MAX_INTERVAL = 45;
+const RADIO_GAIN_DB = -30;
+const RADIO_FILTER_FREQ = 1800; // bandpass center, walkie-talkie-ish
+const RADIO_FILTER_Q = 2.5;
+const RADIO_BLIP_MIN = 2;
+const RADIO_BLIP_MAX = 4;
+const RADIO_BLIP_DUR_MIN = 0.08;
+const RADIO_BLIP_DUR_MAX = 0.16;
+
+// Grader scrape (Groundwork Task 26 deliverable 6): a soft one-shot tied to grader passes during
+// gravel-stage work, triggered by constructionRenderer.ts (which owns the actual grader rig/timing)
+// via a DOM CustomEvent rather than a new EventBus contract — see the listener in the constructor.
+const SCRAPE_GAIN_DB = -22;
+const SCRAPE_DUR = 0.5;
+const SCRAPE_FILTER_FREQ = 900;
+
 function dbToGain(db: number): number {
   return Math.pow(10, db / 20);
 }
@@ -179,9 +200,34 @@ export class AmbientAudio {
 
   private noiseBuffer: AudioBuffer | null = null;
 
+  // Radio chatter (Task 26): one timer/interval per crew index, independently scheduled while that
+  // crew is active (see `updateRadioChatter`) — deliberately separate from the shared rumble/beeper
+  // followed-crew bookkeeping above, since every active crew should be able to chatter on its own.
+  private radioTimer: Map<number, number> = new Map();
+  private radioNextInterval: Map<number, number> = new Map();
+
+  // Grader scrape (Task 26 deliverable 6): queued by the DOM CustomEvent listener below (fired from
+  // constructionRenderer.ts, which owns the actual grader rig/pass timing) and drained one-shot-style
+  // in `update()`, following the same "self-contained, disconnect onended" pattern as every other
+  // one-shot in this file.
+  private pendingScrapes: number[] = []; // queued pan positions (x, pre-divided) awaiting playback
+  private onGraderScrape = (ev: Event): void => {
+    const detail = (ev as CustomEvent<{ x: number }>).detail;
+    if (detail) this.pendingScrapes.push(detail.x);
+  };
+
   constructor(private bus: EventBus) {
     this.bus.on('construction:stage', (payload) => this.onConstructionStage(payload));
     this.bus.on('construction:progress', (payload) => this.onConstructionProgress(payload));
+    window.addEventListener('construction:graderScrape', this.onGraderScrape);
+  }
+
+  /** Detaches the DOM listener registered in the constructor — call once when tearing down the
+   * whole ambient audio system (mirrors the dispose pattern other renderers in this codebase use,
+   * though AmbientAudio itself has no other disposable resources: AudioContext nodes are meant to
+   * live for the page's lifetime). */
+  dispose(): void {
+    window.removeEventListener('construction:graderScrape', this.onGraderScrape);
   }
 
   get muted(): boolean {
@@ -477,6 +523,8 @@ export class AmbientAudio {
     this.updateShimmer(dt, night);
     this.updateBirdsAndCrickets(dt, night);
     this.updateConstruction(dt, cameraX);
+    this.updateRadioChatter(dt, cameraX);
+    this.drainGraderScrapes(cameraX);
   }
 
   private isNightFromTimeOfDay(timeOfDay: number): boolean {
@@ -960,5 +1008,135 @@ export class AmbientAudio {
       this.beeperGain.gain.setValueAtTime(this.beeperGain.gain.value, now);
       this.beeperGain.gain.linearRampToValueAtTime(0, now + 0.05);
     }
+  }
+
+  /**
+   * Radio chatter (Task 26): every RADIO_MIN..MAX_INTERVAL seconds (rolled independently per crew),
+   * schedules a short 2-4 blip burst of filtered noise through a bandpass — a walkie-talkie-ish
+   * texture rather than anything melodic — for each currently-active crew, panned to that crew's own
+   * position. Crews that go idle simply stop accumulating toward their next blip (their timer holds,
+   * doesn't reset) and resume rolling once they're active again, same idle-handling style as the
+   * pluck/bird schedulers elsewhere in this file.
+   */
+  private updateRadioChatter(dt: number, cameraX: number): void {
+    if (!this.ctx || !this.sfxBus) return;
+
+    for (const [crew, { at, x }] of this.crewProgress.entries()) {
+      const active = this.clockTime - at <= ENGINE_GATE_RELEASE;
+      if (!active) continue;
+
+      const timer = (this.radioTimer.get(crew) ?? 0) + dt;
+      const nextInterval = this.radioNextInterval.get(crew) ?? (RADIO_MIN_INTERVAL + Math.random() * (RADIO_MAX_INTERVAL - RADIO_MIN_INTERVAL));
+      if (timer < nextInterval) {
+        this.radioTimer.set(crew, timer);
+        continue;
+      }
+
+      this.radioTimer.set(crew, 0);
+      this.radioNextInterval.set(crew, RADIO_MIN_INTERVAL + Math.random() * (RADIO_MAX_INTERVAL - RADIO_MIN_INTERVAL));
+      this.playRadioBurst(x, cameraX);
+    }
+  }
+
+  /** One radio-chatter burst: 2-4 short filtered-noise blips through a bandpass, panned to the
+   * crew's world position relative to the camera. Self-contained one-shot, disconnects onended. */
+  private playRadioBurst(crewX: number, cameraX: number): void {
+    const ctx = this.ctx;
+    const sfxBus = this.sfxBus;
+    if (!ctx || !sfxBus || !this.noiseBuffer) return;
+
+    const pan = clamp((crewX - cameraX) / PAN_DIVISOR, -PAN_CLAMP, PAN_CLAMP);
+    const panner = ctx.createStereoPanner();
+    panner.pan.value = pan;
+    panner.connect(sfxBus);
+
+    const blipCount = RADIO_BLIP_MIN + Math.floor(Math.random() * (RADIO_BLIP_MAX - RADIO_BLIP_MIN + 1));
+    const gainLin = dbToGain(RADIO_GAIN_DB);
+    let t = ctx.currentTime;
+
+    for (let i = 0; i < blipCount; i++) {
+      const dur = RADIO_BLIP_DUR_MIN + Math.random() * (RADIO_BLIP_DUR_MAX - RADIO_BLIP_DUR_MIN);
+      const source = ctx.createBufferSource();
+      source.buffer = this.noiseBuffer;
+
+      const bandpass = ctx.createBiquadFilter();
+      bandpass.type = 'bandpass';
+      bandpass.frequency.value = RADIO_FILTER_FREQ * (0.85 + Math.random() * 0.3);
+      bandpass.Q.value = RADIO_FILTER_Q;
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(gainLin, t + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+      source.connect(bandpass);
+      bandpass.connect(g);
+      g.connect(panner);
+      source.start(t);
+      source.stop(t + dur + 0.01);
+      source.onended = () => {
+        source.disconnect();
+        bandpass.disconnect();
+        g.disconnect();
+      };
+
+      t += dur + 0.02 + Math.random() * 0.05;
+    }
+
+    const totalDur = t - ctx.currentTime + 0.05;
+    window.setTimeout(() => panner.disconnect(), Math.min(totalDur, 2) * 1000 + 50);
+  }
+
+  /** Drains any grader-scrape requests queued by the DOM CustomEvent listener (see constructor)
+   * since the last frame, playing one one-shot per queued request. Queueing (rather than playing
+   * directly in the event handler) keeps every audio node creation on the same per-frame `update()`
+   * cadence as the rest of this class, and lets `cameraX` (only available here) drive the pan. */
+  private drainGraderScrapes(cameraX: number): void {
+    if (this.pendingScrapes.length === 0) return;
+    const xs = this.pendingScrapes;
+    this.pendingScrapes = [];
+    for (const x of xs) this.playScrapeOneShot(x, cameraX);
+  }
+
+  /** Soft scrape one-shot tied to a grader pass (deliverable 6): filtered noise burst with a quick
+   * attack and a longer, softer decay than the radio blips — reads as a blade dragging rather than a
+   * chirp. Self-contained, disconnects onended (same lifecycle as every other one-shot here). */
+  private playScrapeOneShot(graderX: number, cameraX: number): void {
+    const ctx = this.ctx;
+    const sfxBus = this.sfxBus;
+    if (!ctx || !sfxBus || !this.noiseBuffer) return;
+
+    const now = ctx.currentTime;
+    const pan = clamp((graderX - cameraX) / PAN_DIVISOR, -PAN_CLAMP, PAN_CLAMP);
+
+    const source = ctx.createBufferSource();
+    source.buffer = this.noiseBuffer;
+
+    const bandpass = ctx.createBiquadFilter();
+    bandpass.type = 'bandpass';
+    bandpass.frequency.value = SCRAPE_FILTER_FREQ;
+    bandpass.Q.value = 0.8;
+
+    const panner = ctx.createStereoPanner();
+    panner.pan.value = pan;
+
+    const g = ctx.createGain();
+    const gainLin = dbToGain(SCRAPE_GAIN_DB);
+    g.gain.setValueAtTime(0, now);
+    g.gain.linearRampToValueAtTime(gainLin, now + 0.03);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + SCRAPE_DUR);
+
+    source.connect(bandpass);
+    bandpass.connect(g);
+    g.connect(panner);
+    panner.connect(sfxBus);
+    source.start(now);
+    source.stop(now + SCRAPE_DUR + 0.02);
+    source.onended = () => {
+      source.disconnect();
+      bandpass.disconnect();
+      g.disconnect();
+      panner.disconnect();
+    };
   }
 }
