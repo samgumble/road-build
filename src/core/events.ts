@@ -9,6 +9,9 @@ export interface GameEvents {
   'terrain:deformed': { minI: number; minJ: number; maxI: number; maxJ: number };
   'growth:spawn': { kind: 'tree' | 'field' | 'house' | 'building'; x: number; z: number; rot: number };
   'atmosphere:phase': { night: boolean };
+  // Task 31: ambient wilderness clearing. `indices` are positions into the WildernessTree[] array
+  // the renderer/sim were both constructed with (stable per tree for the life of the world).
+  'wilderness:cleared': { indices: number[] };
 }
 
 type Handler<T> = (payload: T) => void;
