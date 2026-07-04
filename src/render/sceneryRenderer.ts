@@ -33,6 +33,13 @@ const WILDERNESS_TREE_JITTER = 2.2;
 const STRANDED_FADE_DURATION = 30;
 const STRANDED_SINK_DISTANCE = 0.6; // u, matches Task 35's "sink ~0.6u" spec
 
+// Task 42 ("Groundwork"): corridor clearing — a road's build corridor demolishing GROWN scenery
+// (trees/fields/houses/buildings) in its path. Matches WILDERNESS_FADE_DURATION's quick feel (the
+// excavator is physically there right now — no 60s grace, no slow decay) rather than
+// STRANDED_FADE_DURATION's much slower settlement-abandonment animation. No sink: this is
+// demolition, not gradual abandonment, so the instance just shrinks away in place.
+const CLEAR_FADE_DURATION = 1.5;
+
 // Critical 3 (Groundwork round fix wave): a rescued (re-roaded) record eases back to full
 // scale/height over this window rather than snapping instantly — matches the "ease down" fade's own
 // spirit, just in reverse and much quicker (a rescue is a relieving correction, not a slow decay).
@@ -272,14 +279,18 @@ export class SceneryRenderer {
   private pendingWilderness: ReadonlyArray<{ tree: WildernessTree; originalIndex: number }> | null = null;
   private wildernessInstancesBySite = new Map<number, Instance[]>();
 
-  // Finding 2 (Task 35 follow-up "Groundwork"): id -> in-flight fade offset (seconds already
-  // elapsed into STRANDED_FADE_DURATION), set just before a `rebuild()` call and consulted by
-  // `place()` right after an instance is actually placed (whether immediately or later via
-  // `flushPending`, if that record's category was still loading at rebuild time) so a mid-fade
-  // record restores already partially faded — no pop-in, no fade restarting from scale 1. Cleared
-  // once consumed per-id; anything left unconsumed after a `rebuild()` call simply means no record
-  // with that id was actually placed (shouldn't happen for a well-formed save, but harmless).
-  private pendingFadeOffsets = new Map<number, number>();
+  // Finding 2 (Task 35 follow-up "Groundwork"), extended by Task 42: id -> in-flight fade spec, set
+  // just before a `rebuild()` call and consulted by `place()` right after an instance is actually
+  // placed (whether immediately or later via `flushPending`, if that record's category was still
+  // loading at rebuild time) so a mid-fade record restores already partially faded — no pop-in, no
+  // fade restarting from scale 1. Cleared once consumed per-id; anything left unconsumed after a
+  // `rebuild()` call simply means no record with that id was actually placed (shouldn't happen for
+  // a well-formed save, but harmless). `elapsed`/`duration`/`sink` generalize the original
+  // stranded-only "offset into STRANDED_FADE_DURATION" to also cover Task 42's corridor-clearing
+  // fade (always `elapsed: 0` — see `GrowthSim.clearingIds`'s doc comment on why there's no offset
+  // to resume there — `duration: CLEAR_FADE_DURATION`, `sink: 0`), so both fade kinds share one
+  // restore-time mechanism instead of duplicating `applyPendingFadeIfAny`.
+  private pendingFadeOffsets = new Map<number, { elapsed: number; duration: number; sink: number }>();
 
   constructor(private scene: THREE.Scene, private hf: Heightfield, private bus: EventBus) {
     const fieldGeo = new THREE.PlaneGeometry(FIELD_SIZE, FIELD_SIZE);
@@ -324,6 +335,9 @@ export class SceneryRenderer {
     // full scale rather than leaving it permanently stuck at scale~0 with no sim event ever telling
     // the renderer to recover it.
     this.bus.on('growth:rescued', (e) => this.onRescued(e.id));
+    // Task 42: road corridor clearing — quick fade, deliberately NOT rescuable (no `growth:rescued`
+    // path ever fires for a `growth:cleared` id — see GrowthSim's own doc comments on why).
+    this.bus.on('growth:cleared', (e) => this.onCleared(e.id));
 
     this.loadGltfVariants('tree', TREE_FILES, TARGET_TREE_HEIGHT, TREE_CAPACITY, 2)
       .then((v) => {
@@ -721,14 +735,14 @@ export class SceneryRenderer {
    * (deletes) the offset so a later re-placement of the same id (shouldn't happen, but harmless)
    * doesn't re-apply it. */
   private applyPendingFadeIfAny(instance: Instance, id: number): void {
-    const offset = this.pendingFadeOffsets.get(id);
-    if (offset === undefined) return;
+    const spec = this.pendingFadeOffsets.get(id);
+    if (spec === undefined) return;
     this.pendingFadeOffsets.delete(id);
     const f: Fading = {
       instance,
-      elapsed: offset,
-      duration: STRANDED_FADE_DURATION,
-      sink: STRANDED_SINK_DISTANCE,
+      elapsed: spec.elapsed,
+      duration: spec.duration,
+      sink: spec.sink,
       fromScale: 1,
       fromSink: 0,
     };
@@ -868,6 +882,29 @@ export class SceneryRenderer {
       sink: STRANDED_SINK_DISTANCE,
       fromScale,
       fromSink,
+    });
+  }
+
+  /** Task 42: a record just entered its road-corridor clearing fade — starts the same kind of
+   * `Fading` entry `onStranded` does, but with `CLEAR_FADE_DURATION` (quick, ~1.5s) instead of
+   * `STRANDED_FADE_DURATION` and no sink (demolition, not gradual abandonment) — `Fading.duration`
+   * is already per-instance (not a hardcoded constant read elsewhere), so no renderer machinery
+   * needs to change to support a second, shorter fade duration living alongside the slow one.
+   * Cancels any in-flight pop-in the same way `onStranded` does, and — unlike `onStranded` — never
+   * needs to consult an in-flight `Recovering` entry: a freshly-placed instance can't be mid-rescue
+   * recovery the moment its road corridor clears it (corridor clearing and stranded-decay are
+   * mutually exclusive per-record in the sim, see GrowthSim's own guard in `updateStrandedDecay`). */
+  private onCleared(id: number): void {
+    const instance = this.byId.get(id);
+    if (!instance) return;
+    this.animating = this.animating.filter((a) => a.instance !== instance);
+    this.fading.push({
+      instance,
+      elapsed: 0,
+      duration: CLEAR_FADE_DURATION,
+      sink: 0,
+      fromScale: 1,
+      fromSink: 0,
     });
   }
 
@@ -1047,8 +1084,15 @@ export class SceneryRenderer {
    * `update()` loop, rather than popping back in at full scale with a freshly-restarted fade. A
    * record that's merely mid-GRACE (not yet fading) needs no special rendering at all — it's
    * visually identical to any other fully-present instance until `growth:stranded` actually fires.
+   *
+   * Task 42 ("Groundwork"): `clearingIds` (optional — same reasoning as `decayState`) lists every
+   * record id `GrowthSim.restore()`'s own corridor re-scan just (re-)started a clearing fade for
+   * (see `GrowthSim.clearingIds`). Each such record is placed already mid-`CLEAR_FADE_DURATION` fade
+   * (always from `elapsed: 0` — a fresh fade, not a resumed offset, since corridor clearing doesn't
+   * persist/resume an offset at all, see `GrowthSim.restore()`'s doc comment) instead of popping in
+   * at full scale for ~1.5s before abruptly vanishing with no fade once `growth:remove` fires.
    */
-  rebuild(spawned: ReadonlyArray<SpawnRecord>, decayState: ReadonlyArray<DecayEntry> = []): void {
+  rebuild(spawned: ReadonlyArray<SpawnRecord>, decayState: ReadonlyArray<DecayEntry> = [], clearingIds: ReadonlyArray<number> = []): void {
     this.instances = [];
     this.animating = [];
     this.fading = [];
@@ -1077,7 +1121,20 @@ export class SceneryRenderer {
 
     this.pendingFadeOffsets.clear();
     for (const d of decayState) {
-      if (typeof d.fading === 'number') this.pendingFadeOffsets.set(d.id, d.fading);
+      if (typeof d.fading === 'number') {
+        this.pendingFadeOffsets.set(d.id, {
+          elapsed: d.fading,
+          duration: STRANDED_FADE_DURATION,
+          sink: STRANDED_SINK_DISTANCE,
+        });
+      }
+    }
+    // Task 42: corridor-clearing ids always start a FRESH fade (elapsed 0) — see this method's own
+    // doc comment above for why there's no offset to resume. A record can't appear in both
+    // `decayState` and `clearingIds` (GrowthSim's clearing/stranded-decay tracking is mutually
+    // exclusive per-record), so this never overwrites an entry the loop above just set.
+    for (const id of clearingIds) {
+      this.pendingFadeOffsets.set(id, { elapsed: 0, duration: CLEAR_FADE_DURATION, sink: 0 });
     }
 
     for (const rec of spawned) {

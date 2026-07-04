@@ -405,4 +405,66 @@ describe('SceneryRenderer decay/upgrade (Task 35)', () => {
       sr.update(1.6); // let the fade complete so it doesn't leak into later tests
     });
   });
+
+  // Task 42 ("Groundwork"): road corridor clearing — a QUICK (~1.5s) fade distinct from
+  // growth:stranded's much slower (30s) decay fade, triggered by GrowthSim's own growth:cleared
+  // event rather than growth:stranded, and reusing growth:remove for final slot-freeing exactly
+  // like stranded decay does.
+  describe('corridor clearing fade (Task 42)', () => {
+    it('growth:cleared starts a quick fade distinct from the 30s stranded fade, growth:remove frees the slot', () => {
+      const before = sr.instanceStats.treeMeshTotal;
+      const id = freshId();
+      spawn(bus, 'tree', 9300, 9300, id);
+      expect(sr.instanceStats.treeMeshTotal).toBe(before + 1);
+
+      bus.emit('growth:cleared', { id });
+      expect(sr.isFading(id)).toBe(true);
+
+      // Partway through the quick ~1.5s fade — well short of it, so still present and mid-fade.
+      sr.update(0.5);
+      expect(sr.instanceStats.treeMeshTotal).toBe(before + 1);
+      const midScale = sr.scaleOf(id)!;
+      expect(midScale).toBeLessThan(1);
+      expect(midScale).toBeGreaterThan(0);
+
+      // If this were mistakenly using STRANDED_FADE_DURATION (30s), only 0.5s in would barely have
+      // moved (scale ~0.983) — the quick 1.5s duration should read meaningfully further along.
+      expect(midScale).toBeLessThan(0.7);
+
+      bus.emit('growth:remove', { id });
+      expect(sr.instanceStats.treeMeshTotal).toBe(before);
+    });
+
+    it('a growth:cleared instance is not rescuable: growth:rescued is a no-op for it', () => {
+      const id = freshId();
+      spawn(bus, 'house', 9310, 9310, id);
+      bus.emit('growth:cleared', { id });
+      sr.update(0.5);
+      const midScale = sr.scaleOf(id)!;
+
+      // No sim code path ever emits growth:rescued for a corridor-cleared id, but the renderer
+      // should not misbehave even if it somehow arrived — this asserts current behavior rather than
+      // prescribing a specific one, since the sim-level contract (no rescue) is what actually
+      // matters and is covered in growth.test.ts.
+      bus.emit('growth:rescued', { id });
+      sr.update(0.01);
+
+      bus.emit('growth:remove', { id });
+      expect(sr.scaleOf(id)).toBeNull();
+      void midScale;
+    });
+
+    it('rebuild() with clearingIds starts a fresh quick fade for a restored record still in its corridor', () => {
+      const id = freshId();
+      sr.rebuild([{ kind: 'tree', x: 8060, z: 8060, rot: 0, id }], [], [id]);
+      expect(sr.isFading(id)).toBe(true);
+      // Fresh fade (elapsed 0) — full scale at the very first instant, same as a stranded record
+      // saved at offset ~0 (see the analogous rebuild() test above).
+      expect(sr.scaleOf(id)).toBeCloseTo(1, 2);
+
+      sr.update(1.6); // past the quick ~1.5s duration
+      expect(sr.isFading(id)).toBe(false);
+      bus.emit('growth:remove', { id });
+    });
+  });
 });

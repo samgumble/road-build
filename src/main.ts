@@ -251,7 +251,10 @@ function main(): void {
         // Finding 2 (Task 35 follow-up "Groundwork"): pass along any records that were mid-fade at
         // save time so `rebuild()` restores them at the correct partial-fade progress instead of
         // popping back in at full scale with a freshly-restarted fade animation.
-        sceneryRenderer.rebuild(growth.spawned, growth.decayState);
+        // Task 42: also pass along any ids `growth.restore()`'s own corridor re-scan (just run
+        // inside `restoreWorld` above) started a fresh clearing fade for, so those records render
+        // already mid-fade instead of popping in at full scale before abruptly vanishing.
+        sceneryRenderer.rebuild(growth.spawned, growth.decayState, growth.clearingIds);
         // Important 4 (Groundwork round fix wave): seed TrafficSim's settlement-weighting
         // houses/buildings arrays from the just-restored growth records — without this, those
         // arrays only ever grew via live `growth:spawn` events, so every reload of an established
