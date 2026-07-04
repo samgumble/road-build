@@ -5,7 +5,7 @@ import { Heightfield } from '../src/sim/terrain/heightfield';
 import { makeSampler } from '../src/sim/roads/path';
 import { EventBus } from '../src/core/events';
 import { createRng } from '../src/core/rng';
-import { GRID_SIZE, CELL, WORLD_SIZE } from '../src/core/constants';
+import { GRID_SIZE, CELL, WORLD_SIZE, ROAD_WIDTH } from '../src/core/constants';
 
 const HALF = WORLD_SIZE / 2;
 /** Inverse of growth.ts's private `cellCenter` — maps a grid cell (i, j) back to its world-space
@@ -314,7 +314,13 @@ describe('GrowthSim', () => {
 
     it('a record near a painted road is never marked stranded', () => {
       const { bus, sim, anchor } = roadedWorld('stranded-near');
-      const house: SpawnRecord = { kind: 'house', x: anchor.x, z: anchor.z, rot: 0, id: 1 };
+      // Task 42: offset 10u perpendicular (z) from the road's centerline — comfortably outside
+      // corridor-clearing's CLEAR_RADIUS (ROAD_WIDTH/2 + 2 = 5u, since the road runs along x here)
+      // so this fixture still tests stranded-decay proximity specifically, not the new
+      // corridor-clearing behavior (a record placed directly ON the road, e.g. at `anchor` itself,
+      // is now legitimately cleared as being IN the roadbed — see the "corridor clearing" describe
+      // block below — which is correct T42 behavior, not a regression of this test's own intent).
+      const house: SpawnRecord = { kind: 'house', x: anchor.x, z: anchor.z + 10, rot: 0, id: 1 };
       sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
       sim.update(3); // apply the pending recompute triggered by restore()
 
@@ -469,7 +475,9 @@ describe('GrowthSim', () => {
 
       it('does not emit growth:rescued for a record that was simply never stranded', () => {
         const { bus, sim, anchor } = roadedWorld('rescue-never-stranded');
-        const house: SpawnRecord = { kind: 'house', x: anchor.x, z: anchor.z, rot: 0, id: 1 };
+        // Task 42: offset off the road centerline (see the "near a painted road" test's comment
+        // above) so this stays a stranded-decay fixture, not a corridor-clearing one.
+        const house: SpawnRecord = { kind: 'house', x: anchor.x, z: anchor.z + 10, rot: 0, id: 1 };
         sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
         sim.update(3);
 
@@ -624,8 +632,11 @@ describe('GrowthSim', () => {
 
     it('decayState is empty with no in-flight timers', () => {
       const { sim, anchor } = roadedWorld('decay-empty');
-      // Near the road (never stranded), unlike `farSpot` used by the other tests below.
-      const house: SpawnRecord = { kind: 'house', x: anchor.x, z: anchor.z, rot: 0, id: 1 };
+      // Near the road (never stranded), unlike `farSpot` used by the other tests below. Task 42:
+      // offset off the road centerline so this isn't ALSO corridor-cleared (a separate, unrelated
+      // mechanism from decayState's stranded/fading tracking, but keeping the fixture clean of it
+      // avoids conflating the two).
+      const house: SpawnRecord = { kind: 'house', x: anchor.x, z: anchor.z + 10, rot: 0, id: 1 };
       sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
       sim.update(3);
       expect(sim.decayState).toEqual([]);
@@ -722,6 +733,254 @@ describe('GrowthSim', () => {
       const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
       sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]); // no 3rd arg
       expect(sim.decayState).toEqual([]);
+    });
+  });
+
+  // Task 42 ("Groundwork"): roads clear GROWN scenery in their corridor, mirroring T31's
+  // WildernessSim clearing but for GrowthSim's own road-driven records (trees/fields/houses/
+  // buildings). Unlike stranded-decay (60s grace + 30s fade, rescuable), corridor clearing is a
+  // QUICK fade (CLEAR_FADE_S, matching wilderness's 1.5s feel) with NO rescue: once a road's
+  // corridor clears a record, demolishing that road later does not bring it back.
+  describe('corridor clearing (Task 42)', () => {
+    function buildGraph(seedName: string) {
+      const bus = new EventBus();
+      const hf = new Heightfield(seedName, bus);
+      const g = new RoadGraph(bus, makeSampler(hf));
+      let anchor = { x: 0, z: 0 };
+      outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+        if (hf.isLand(x, z) && hf.isLand(x + 64, z)) { anchor = { x, z }; break outer; }
+      const [edgeId] = g.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+      return { bus, hf, g, edgeId, anchor };
+    }
+
+    it('a tree record within the corridor fades quickly and is removed once graded', () => {
+      const { bus, hf, g, edgeId } = buildGraph('clear-tree');
+      const sim = new GrowthSim(g, hf, bus, createRng('clear-tree'));
+      const edge = g.edges.get(edgeId)!;
+      const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+
+      const tree: SpawnRecord = { kind: 'tree', x: sample.x, z: sample.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [tree]);
+      expect(sim.spawned.some((r) => r.id === 1)).toBe(true);
+
+      const clearedIds: number[] = [];
+      const removedIds: number[] = [];
+      bus.on('growth:cleared', (e) => clearedIds.push(e.id));
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
+
+      expect(clearedIds).toEqual([1]);
+      expect(removedIds).toEqual([]); // fade not yet complete
+      expect(sim.spawned.some((r) => r.id === 1)).toBe(true); // still present mid-fade
+
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60); // well past the quick ~1.5s fade
+      expect(removedIds).toEqual([1]);
+      expect(sim.spawned.some((r) => r.id === 1)).toBe(false);
+    });
+
+    it('the quick clearing fade completes well before the 60s stranded grace window', () => {
+      const { bus, hf, g, edgeId } = buildGraph('clear-fast');
+      const sim = new GrowthSim(g, hf, bus, createRng('clear-fast'));
+      const edge = g.edges.get(edgeId)!;
+      const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+      const tree: SpawnRecord = { kind: 'tree', x: sample.x, z: sample.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [tree]);
+
+      const removedIds: number[] = [];
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
+
+      for (let k = 0; k < 60 * 3; k++) sim.update(1 / 60); // 3s — nowhere near the 60s grace
+      expect(removedIds).toEqual([1]);
+    });
+
+    it('all kinds (tree/field/house/building) clear, houseCount decrements for a house', () => {
+      const { bus, hf, g, edgeId } = buildGraph('clear-kinds');
+      const sim = new GrowthSim(g, hf, bus, createRng('clear-kinds'));
+      const edge = g.edges.get(edgeId)!;
+      const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+
+      const records: SpawnRecord[] = [
+        { kind: 'tree', x: sample.x, z: sample.z, rot: 0, id: 1 },
+        { kind: 'field', x: sample.x, z: sample.z, rot: 0, id: 2 },
+        { kind: 'house', x: sample.x, z: sample.z, rot: 0, id: 3 },
+        { kind: 'building', x: sample.x, z: sample.z, rot: 0, id: 4 },
+      ];
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), records);
+      expect(sim.houseCount).toBe(1);
+
+      const removedIds: number[] = [];
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+
+      expect(removedIds.sort()).toEqual([1, 2, 3, 4]);
+      expect(sim.spawned.length).toBe(0);
+      expect(sim.houseCount).toBe(0);
+    });
+
+    it('does not clear records outside the corridor', () => {
+      const { bus, hf, g, edgeId, anchor } = buildGraph('clear-outside');
+      const sim = new GrowthSim(g, hf, bus, createRng('clear-outside'));
+      const edge = g.edges.get(edgeId)!;
+      const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+      const corridorHalf = ROAD_WIDTH / 2 + 2;
+
+      const records: SpawnRecord[] = [
+        { kind: 'tree', x: sample.x, z: sample.z + corridorHalf + 20, rot: 0, id: 1 }, // well outside
+        { kind: 'tree', x: anchor.x - 100, z: anchor.z - 100, rot: 0, id: 2 }, // far outside
+      ];
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), records);
+
+      const clearedIds: number[] = [];
+      bus.on('growth:cleared', (e) => clearedIds.push(e.id));
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+
+      expect(clearedIds).toEqual([]);
+      expect(sim.spawned.length).toBe(2);
+    });
+
+    it('does not clear records near a bridge sample', () => {
+      const bus = new EventBus();
+      const hf = new Heightfield('clear-bridge', bus);
+      const bridgeSampler = (ctrl: { x: number; z: number }[]) => {
+        const base = makeSampler(hf)(ctrl);
+        return base.map((s) => ({ ...s, bridge: true }));
+      };
+      const g = new RoadGraph(bus, bridgeSampler);
+      let anchor = { x: 0, z: 0 };
+      outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+        if (hf.isLand(x, z) && hf.isLand(x + 64, z)) { anchor = { x, z }; break outer; }
+      const [edgeId] = g.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+      const edge = g.edges.get(edgeId)!;
+      const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+
+      const sim = new GrowthSim(g, hf, bus, createRng('clear-bridge'));
+      const tree: SpawnRecord = { kind: 'tree', x: sample.x, z: sample.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [tree]);
+
+      const clearedIds: number[] = [];
+      bus.on('growth:cleared', (e) => clearedIds.push(e.id));
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+
+      // All samples are bridge samples, so nothing should clear.
+      expect(clearedIds).toEqual([]);
+      expect(sim.spawned.length).toBe(1);
+    });
+
+    it('restore re-clears the corridor: a record saved past graded re-triggers a fresh clearing fade', () => {
+      // Mirrors WildernessSim's restore lesson: restoreWorld force-sets edge.stage directly and
+      // re-emits construction:stage with whatever stage was saved (often past a literal 'graded'
+      // event) BEFORE growth.restore() populates records — so restore() itself must re-derive
+      // clearing from the current graph state, not rely on catching a live construction:stage.
+      for (const restoredStage of ['gravel', 'paved', 'painted'] as const) {
+        const { bus, hf, g, edgeId } = buildGraph('clear-restore-' + restoredStage);
+        const edge = g.edges.get(edgeId)!;
+        const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+        edge.stage = restoredStage; // as restoreWorld force-sets it, before growth.restore() runs
+
+        const sim = new GrowthSim(g, hf, bus, createRng('clear-restore'));
+        const removedIds: number[] = [];
+        bus.on('growth:remove', (e) => removedIds.push(e.id));
+
+        const tree: SpawnRecord = { kind: 'tree', x: sample.x, z: sample.z, rot: 0, id: 1 };
+        sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [tree]);
+
+        for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+        expect(removedIds).toEqual([1]);
+      }
+    });
+
+    it('a mid-clearing-fade record that is saved (still in records) re-triggers clearing on restore', () => {
+      // Simulates: live clearing started (growth:cleared fired) but the save happened before the
+      // fade completed, so the record is still present in `spawned` at save time. On restore, the
+      // record is still within the corridor of a >= graded edge, so it must re-clear (a fresh
+      // CLEAR_FADE_S fade) rather than being silently stuck forever uncleared.
+      const { bus, hf, g, edgeId } = buildGraph('clear-midfade-restore');
+      const edge = g.edges.get(edgeId)!;
+      const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+      edge.stage = 'painted'; // as a real save's restoreWorld would force it before growth.restore()
+
+      const sim = new GrowthSim(g, hf, bus, createRng('clear-midfade'));
+      const clearedIds: number[] = [];
+      const removedIds: number[] = [];
+      bus.on('growth:cleared', (e) => clearedIds.push(e.id));
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+
+      const tree: SpawnRecord = { kind: 'tree', x: sample.x, z: sample.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [tree]);
+
+      expect(clearedIds).toEqual([1]); // re-triggered by restore()'s own corridor re-scan
+      expect(removedIds).toEqual([]); // not yet — fresh fade just started
+      expect(sim.spawned.some((r) => r.id === 1)).toBe(true);
+
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+      expect(removedIds).toEqual([1]);
+    });
+
+    it('rescue does NOT apply to corridor clearing: demolishing the road afterward does not restore the record', () => {
+      const { bus, hf, g, edgeId } = buildGraph('clear-no-rescue');
+      const sim = new GrowthSim(g, hf, bus, createRng('clear-no-rescue'));
+      const edge = g.edges.get(edgeId)!;
+      const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+      const tree: SpawnRecord = { kind: 'tree', x: sample.x, z: sample.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [tree]);
+
+      const rescuedIds: number[] = [];
+      const removedIds: number[] = [];
+      bus.on('growth:rescued', (e) => rescuedIds.push(e.id));
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+      expect(removedIds).toEqual([1]);
+
+      // Demolish the road (stage walked back to 'removed') — the cleared tree must not come back,
+      // and growth:rescued must never fire for this id.
+      edge.stage = 'surveyed';
+      bus.emit('construction:stage', { edgeId, stage: 'removed', crew: 0 });
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+
+      expect(rescuedIds).toEqual([]);
+      expect(sim.spawned.some((r) => r.id === 1)).toBe(false);
+    });
+
+    it('spawnMask kind-bits clear so regrowth beside (not inside) the road is possible', () => {
+      const { bus, hf, g, edgeId } = buildGraph('clear-mask');
+      const sim = new GrowthSim(g, hf, bus, createRng('clear-mask'));
+      const edge = g.edges.get(edgeId)!;
+      const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+
+      // Seed dev high enough that restore() sets the tree bit in this cell's spawnMask, matching a
+      // naturally-grown cell.
+      const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+      const ci = Math.round((sample.x + HALF) / CELL);
+      const cj = Math.round((sample.z + HALF) / CELL);
+      const cellIdx = cj * GRID_SIZE + ci;
+      dev[cellIdx] = 0.3; // past the tree threshold (0.22)
+
+      const tree: SpawnRecord = { kind: 'tree', x: sample.x, z: sample.z, rot: 0, id: 1 };
+      sim.restore(dev, [tree]);
+      const TREE_BIT = 1 << 0;
+      expect(sim.spawnMaskAt(ci, cj) & TREE_BIT).toBe(TREE_BIT);
+
+      const removedIds: number[] = [];
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+      expect(removedIds).toEqual([1]);
+
+      expect(sim.spawnMaskAt(ci, cj) & TREE_BIT).toBe(0);
     });
   });
 });

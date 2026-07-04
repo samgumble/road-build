@@ -1,9 +1,12 @@
 import type { P2 } from '../../core/types';
+import { STAGES } from '../../core/types';
 import { EventBus } from '../../core/events';
 import { RoadGraph } from '../roads/graph';
 import { Heightfield } from '../terrain/heightfield';
 import { sampleHeadingAt } from '../roads/path';
 import { GRID_SIZE, CELL, WORLD_SIZE, ROAD_WIDTH } from '../../core/constants';
+
+const GRADED_INDEX = STAGES.indexOf('graded');
 
 const HALF = WORLD_SIZE / 2;
 
@@ -94,6 +97,22 @@ const STRANDED_FADE_S = 30; // sim-seconds fade duration (renderer-side animatio
 // removed, so the cell doesn't need to fully re-climb from scratch to regrow — matching the user
 // decision that regrowth should be "possible... but not instant".
 const STRANDED_DEV_DECAY_TARGET = 0.4;
+
+// Task 42 ("Groundwork"): corridor clearing — roads clear GROWN scenery (trees/fields/houses/
+// buildings, ALL kinds, unlike stranded decay which applies uniformly regardless of kind too) that
+// sits in their own build corridor, mirroring wilderness.ts's WildernessSim clearing exactly (same
+// CLEAR_RADIUS formula, same "any stage >= graded counts, restores re-emit the saved stage not a
+// literal 'graded' event" lesson). Unlike stranded decay (60s grace + 30s fade, rescuable),
+// clearing is immediate + quick (no grace period at all — the excavator is physically there right
+// now) and NEVER rescuable: demolishing the road later does not un-clear a record it displaced.
+// Trees within this distance of any non-bridge road sample are cleared as the excavator's corridor
+// passes through: half the road width plus a small margin, identical reasoning to wilderness.ts.
+const CLEAR_RADIUS = ROAD_WIDTH / 2 + 2;
+// sim-seconds — quick fade matching wilderness.ts's WILDERNESS_FADE_DURATION feel (the renderer's
+// own constant is separate, see sceneryRenderer.ts), deliberately far shorter than
+// STRANDED_FADE_S/STRANDED_GRACE_S: a record physically in the roadbed doesn't get a grace period,
+// it's simply gone as the grading pass reaches it.
+const CLEAR_FADE_S = 1.5;
 
 export type GrowthKind = 'tree' | 'field' | 'house' | 'building';
 
@@ -230,6 +249,14 @@ export class GrowthSim {
   private strandedSince = new Map<number, number>(); // id -> simTime first observed stranded
   private fadingSince = new Map<number, number>(); // id -> simTime fade began (post-grace)
 
+  // Task 42: corridor-clearing bookkeeping, keyed by record id like strandedSince/fadingSince
+  // above — id -> simTime the quick clearing fade started. Deliberately separate from
+  // strandedSince/fadingSince: a record here is NEVER also tracked by those maps (clearing is
+  // immediate, no grace period, and mutually exclusive with the stranded-decay pipeline — see
+  // `updateStrandedDecay`'s guard against a record already clearing) and is never rescuable (no
+  // `growth:rescued` path touches this map at all).
+  private clearingSince = new Map<number, number>();
+
   constructor(
     private graph: RoadGraph,
     private hf: Heightfield,
@@ -238,6 +265,18 @@ export class GrowthSim {
   ) {
     this.bus.on('roads:changed', () => {
       this.recomputePending = true;
+    });
+    // Task 42: an edge's construction reaching (or being restored at/past) 'graded' clears any
+    // grown record sitting in its corridor. Mirrors WildernessSim's own listener in wilderness.ts
+    // exactly, including its critical restore lesson (see the doc comment there): a RESTORED edge
+    // re-emits construction:stage with whatever stage was SAVED (often past a literal 'graded'
+    // event, e.g. 'gravel'/'paved'/'painted'), never 'removed'/'surveyed'. Any stage at/past
+    // 'graded' implies the corridor was already cut, so it must clear regardless of which exact
+    // stage triggered this event.
+    this.bus.on('construction:stage', (e) => {
+      if (e.stage === 'removed') return;
+      if (STAGES.indexOf(e.stage) < GRADED_INDEX) return;
+      this.clearCorridor(e.edgeId);
     });
   }
 
@@ -275,6 +314,20 @@ export class GrowthSim {
   }
 
   /**
+   * Task 42: read-only snapshot of every record id currently mid-corridor-clearing-fade — used only
+   * by the renderer's `rebuild()` path (via main.ts, right after a `restoreWorld` call) so a record
+   * whose clearing fade was (re-)started by `restore()`'s own corridor re-scan renders already
+   * mid-fade instead of popping in at full scale for ~CLEAR_FADE_S before abruptly vanishing on
+   * `growth:remove` with no fade ever shown. Deliberately just a plain id list (no elapsed-offset,
+   * unlike `decayState`'s stranded/fading entries): `restore()` always starts a FRESH clearing fade
+   * (see its own doc comment for why there's nothing to resume), so the renderer only needs to know
+   * WHICH ids to start a fresh `CLEAR_FADE_DURATION` fade for, not how far into it they already are.
+   */
+  get clearingIds(): ReadonlyArray<number> {
+    return Array.from(this.clearingSince.keys());
+  }
+
+  /**
    * Restores sim state from a save (Task 15): replaces the `dev` accumulator and replays the
    * `spawned` list directly into `records`/`houses`/`spawnMask` without re-emitting `growth:spawn`
    * (the caller is responsible for restoring the renderer separately, e.g. via
@@ -291,6 +344,18 @@ export class GrowthSim {
    * `this.simTime - since >= THRESHOLD` checks land exactly `offset` seconds further along the
    * timeline than a record that just became stranded. A record with no matching `decay` entry (the
    * common case — not currently stranded) is simply left with no timer, same as before.
+   *
+   * Task 42: corridor clearing is deliberately NOT part of the persisted `decay` shape at all (no
+   * `clearingSince` offset is saved/restored) — see this task's spec: since clearing is re-derived
+   * from the current graph on every restore anyway (mirroring WildernessSim's own restore lesson in
+   * wilderness.ts), there is nothing to lose by always starting a FRESH CLEAR_FADE_S fade for any
+   * restored record still sitting in a >= graded edge's corridor, rather than trying to resume a
+   * saved offset for what's already an ~1.5s animation. `restoreWorld` (save.ts) force-sets each
+   * edge's `stage` and re-emits `construction:stage` with that (possibly-past-'graded') stage BEFORE
+   * calling this method — i.e. before `this.records` exists to match against — so this method's own
+   * scan at the end (mirroring `clearCorridor`, driven directly off `this.graph`'s current edges
+   * rather than waiting for another `construction:stage` event that will never re-fire) is the ONLY
+   * path that can re-clear those records post-restore.
    */
   restore(dev: ArrayLike<number>, spawned: ReadonlyArray<SpawnRecord>, decay: ReadonlyArray<DecayEntry> = []): void {
     this.dev.set(dev);
@@ -298,6 +363,7 @@ export class GrowthSim {
     this.upgradedCell.fill(0);
     this.strandedSince.clear();
     this.fadingSince.clear();
+    this.clearingSince.clear();
     // Task 35: a pre-Task-35 save's records have no `id` (migration in save.ts assigns one, but
     // defend here too in case a caller passes raw records some other way) — assign sequential ids
     // to any record missing one, deterministically in array order.
@@ -340,6 +406,15 @@ export class GrowthSim {
     }
 
     this.recomputePending = true;
+
+    // Task 42: re-derive corridor clearing against the graph's CURRENT edges — see this method's
+    // doc comment above for why this can't simply rely on catching a live `construction:stage`
+    // event. Every edge already at/past 'graded' by the time this runs (restoreWorld forces stages
+    // before calling restore()) clears any just-restored record still sitting in its corridor.
+    for (const edge of this.graph.edges.values()) {
+      if (STAGES.indexOf(edge.stage) < GRADED_INDEX) continue;
+      this.clearCorridor(edge.id);
+    }
   }
 
   private recomputeRoadDist(): void {
@@ -600,6 +675,7 @@ export class GrowthSim {
     }
 
     this.updateStrandedDecay();
+    this.updateClearing();
   }
 
   /**
@@ -659,6 +735,11 @@ export class GrowthSim {
     const toRemove: number[] = []; // indices into this.records, descending order for safe splice
     for (let ri = this.records.length - 1; ri >= 0; ri--) {
       const r = this.records[ri];
+      // Task 42: a record already mid-corridor-clearing is owned entirely by `updateClearing`
+      // below — it's never simultaneously "stranded" in any meaningful sense (a cell inside a
+      // road's own corridor is, by construction, within MAX_ROAD_DIST_CELLS of that very road), but
+      // guard explicitly anyway so the two pipelines can never race to remove/rescue the same id.
+      if (this.clearingSince.has(r.id)) continue;
       const { i, j } = cellOf(r.x, r.z);
       const idx = cellIndex(i, j);
       const stranded = this.roadDist[idx] === -1;
@@ -698,23 +779,91 @@ export class GrowthSim {
       }
     }
 
-    for (const ri of toRemove) {
-      const [removed] = this.records.splice(ri, 1);
-      if (removed.kind === 'house') this.houses--;
-      const { i, j } = cellOf(removed.x, removed.z);
-      const idx = cellIndex(i, j);
-      // Finding 1: clear only the removed record's OWN kind bit(s) — see `bitsForKind`'s doc
-      // comment — not the whole cell's spawnMask, so any other co-located record (e.g. a tree or
-      // field sharing this cell) keeps its "already spawned" bit set and doesn't silently re-spawn
-      // just because an unrelated record here decayed away.
-      this.spawnMask[idx] &= ~bitsForKind(removed.kind);
-      // `upgradedCell` still resets unconditionally: it's cell-scoped bookkeeping for "has THIS
-      // cell already attempted its one upgrade check", not a per-record kind bit, and removing the
-      // (possibly-upgraded) record here means the cell is eligible to attempt an upgrade again from
-      // scratch once/if a new house record grows back.
-      this.upgradedCell[idx] = 0;
-      this.dev[idx] = Math.min(this.dev[idx], STRANDED_DEV_DECAY_TARGET);
-      this.bus.emit('growth:remove', { id: removed.id });
+    for (const ri of toRemove) this.removeRecordAt(ri);
+  }
+
+  /**
+   * Shared removal bookkeeping for a record leaving `this.records` for good — used by both
+   * stranded-decay's fade-complete path and Task 42's corridor-clearing fade-complete path (see
+   * `updateClearing` below), since both ultimately do the exact same thing to the sim's state: drop
+   * the record, decrement `houses` for a house, clear only that record's own spawnMask kind bit(s)
+   * (Finding 1 — see `bitsForKind`'s doc comment), reset the cell's upgrade-attempted flag so a
+   * future record here gets its own upgrade check, decay the cell's dev toward
+   * STRANDED_DEV_DECAY_TARGET (harmless/consistent to apply here too — a corridor-cleared cell is
+   * about to be permanently covered by road anyway, but keeping this uniform means a strip of
+   * un-roaded ground beside the corridor that happened to share this exact cell center still regrows
+   * at the same reduced pace as any other decayed cell, rather than needing a separate rule), and
+   * emit `growth:remove` — the one event every consumer (SceneryRenderer's slot-freeing, TrafficSim's
+   * settlement-weight eviction) already listens for, so corridor-cleared records need zero additive
+   * wiring anywhere outside this file.
+   */
+  private removeRecordAt(ri: number): void {
+    const [removed] = this.records.splice(ri, 1);
+    if (removed.kind === 'house') this.houses--;
+    const { i, j } = cellOf(removed.x, removed.z);
+    const idx = cellIndex(i, j);
+    this.spawnMask[idx] &= ~bitsForKind(removed.kind);
+    this.upgradedCell[idx] = 0;
+    this.dev[idx] = Math.min(this.dev[idx], STRANDED_DEV_DECAY_TARGET);
+    this.bus.emit('growth:remove', { id: removed.id });
+  }
+
+  /**
+   * Task 42: an edge just reached (or was restored at/past) 'graded' — find every grown record
+   * within CLEAR_RADIUS of one of that edge's non-bridge samples and begin its quick clearing fade
+   * (unless already clearing). Mirrors `WildernessSim.clearCorridor` in wilderness.ts exactly (same
+   * radius, same non-bridge-sample-only matching), but operates on GrowthSim's own `records` (every
+   * kind — tree/field/house/building) instead of a separate wilderness tree list, and starts a
+   * timed fade (`clearingSince`) rather than an immediate boolean flip, so the renderer gets a
+   * chance to play the fade before the record actually disappears (see `updateClearing`).
+   */
+  private clearCorridor(edgeId: number): void {
+    const edge = this.graph.edges.get(edgeId);
+    if (!edge) return;
+
+    for (const r of this.records) {
+      if (this.clearingSince.has(r.id)) continue; // already clearing — don't restart its fade
+      for (const s of edge.samples) {
+        if (s.bridge) continue;
+        if (Math.hypot(s.x - r.x, s.z - r.z) <= CLEAR_RADIUS) {
+          // Task 42: corridor clearing pre-empts stranded-decay outright — a record that happened
+          // to already be mid-grace/mid-fade when the road's corridor reached it is simply
+          // reclassified as "clearing" (its stranded/fading timers are irrelevant now: the road is
+          // there, it's gone either way, just on the quick timeline instead of the slow one).
+          this.strandedSince.delete(r.id);
+          this.fadingSince.delete(r.id);
+          this.clearingSince.set(r.id, this.simTime);
+          this.bus.emit('growth:cleared', { id: r.id });
+          break;
+        }
+      }
     }
+  }
+
+  /**
+   * Task 42: advances every in-flight corridor-clearing fade and removes a record once
+   * CLEAR_FADE_S has elapsed since its `growth:cleared` — reuses `removeRecordAt` (same
+   * spawnMask/houses/dev bookkeeping and `growth:remove` emit as stranded-decay's own removal), so
+   * every existing consumer of `growth:remove` (SceneryRenderer, TrafficSim) needs no changes to
+   * handle corridor-cleared records. Deliberately NO rescue path exists for this map: unlike
+   * `updateStrandedDecay`'s roadDist-driven rescue (a record is only ever removed if its cell STAYS
+   * disconnected from roads for the full grace+fade), a corridor-cleared record's road is, by
+   * definition, the reason it's clearing — there is no "safe again" state to detect here, and even
+   * demolishing that same road afterward (walking its stage back to 'removed'/'surveyed') must NOT
+   * resurrect the record (see this task's spec: "a cleared tree is gone").
+   */
+  private updateClearing(): void {
+    if (!this.clearingSince.size) return;
+    const toRemove: number[] = [];
+    for (let ri = this.records.length - 1; ri >= 0; ri--) {
+      const r = this.records[ri];
+      const since = this.clearingSince.get(r.id);
+      if (since === undefined) continue;
+      if (this.simTime - since >= CLEAR_FADE_S) {
+        this.clearingSince.delete(r.id);
+        toRemove.push(ri);
+      }
+    }
+    for (const ri of toRemove) this.removeRecordAt(ri);
   }
 }

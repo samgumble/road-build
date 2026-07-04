@@ -38,6 +38,16 @@ export interface GameEvents {
   // fade — a harmless no-op there) and re-roaded mid-fade (renderer must ease the instance back to
   // full scale, not snap). See sceneryRenderer.ts's `onRescued`.
   'growth:rescued': { id: number };
+  // Task 42 ("Groundwork"): a road's build corridor reached (or was restored at/past) 'graded' and
+  // this record sits within it — begins a QUICK clearing fade (GrowthSim's CLEAR_FADE_S, ~1.5s,
+  // matching wilderness.ts's WILDERNESS_FADE_DURATION feel), distinct from `growth:stranded`'s much
+  // slower decay fade: the renderer must use its own short duration for this event rather than
+  // STRANDED_FADE_DURATION. Applies to every GrowthKind (tree/field/house/building) — the survey
+  // preview shows exactly where the road goes, so anything in that footprint is demolished, not
+  // just trees. `growth:remove` (already existing, additive to no consumer) still fires once the
+  // fade completes, same as stranded decay's own removal — NOT rescuable: `growth:rescued` is never
+  // emitted for a record cleared this way, even if the road that cleared it is later demolished.
+  'growth:cleared': { id: number };
   'atmosphere:phase': { night: boolean };
   // Task 31: ambient wilderness clearing. `indices` are positions into the WildernessTree[] array
   // the renderer/sim were both constructed with (stable per tree for the life of the world).
