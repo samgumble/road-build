@@ -164,4 +164,92 @@ describe('TrafficSim', () => {
     const b = run();
     expect(a).toEqual(b);
   });
+
+  // Task 35: growth:upgrade / growth:remove keep the settlement weight map in sync with the actual
+  // set of houses/buildings — previously `houses`/`buildings` only ever grew via growth:spawn, so a
+  // demolished/upgraded settlement would keep contributing weight forever.
+  describe('settlement weight sync (Task 35)', () => {
+    it('moves a house entry to buildings on growth:upgrade (weight-affecting, not just relabeled)', () => {
+      const { bus, sim } = multiNodeWorld();
+      bus.emit('growth:spawn', { kind: 'house', x: 100, z: 100, rot: 0, id: 42 });
+      expect((sim as any).houses).toEqual([{ x: 100, z: 100, id: 42 }]);
+      expect((sim as any).buildings).toEqual([]);
+
+      bus.emit('growth:upgrade', { id: 42 });
+
+      expect((sim as any).houses).toEqual([]);
+      expect((sim as any).buildings).toEqual([{ x: 100, z: 100, id: 42 }]);
+    });
+
+    it('growth:upgrade for an unknown id is a harmless no-op', () => {
+      const { bus, sim } = multiNodeWorld();
+      bus.emit('growth:spawn', { kind: 'house', x: 100, z: 100, rot: 0, id: 1 });
+      expect(() => bus.emit('growth:upgrade', { id: 999 })).not.toThrow();
+      expect((sim as any).houses).toEqual([{ x: 100, z: 100, id: 1 }]);
+    });
+
+    it('drops a house entry from the weight map on growth:remove', () => {
+      const { bus, sim } = multiNodeWorld();
+      bus.emit('growth:spawn', { kind: 'house', x: 100, z: 100, rot: 0, id: 7 });
+      expect((sim as any).houses).toEqual([{ x: 100, z: 100, id: 7 }]);
+
+      bus.emit('growth:remove', { id: 7 });
+
+      expect((sim as any).houses).toEqual([]);
+    });
+
+    it('drops a building entry from the weight map on growth:remove', () => {
+      const { bus, sim } = multiNodeWorld();
+      bus.emit('growth:spawn', { kind: 'building', x: 50, z: 50, rot: 0, id: 8 });
+      expect((sim as any).buildings).toEqual([{ x: 50, z: 50, id: 8 }]);
+
+      bus.emit('growth:remove', { id: 8 });
+
+      expect((sim as any).buildings).toEqual([]);
+    });
+
+    it('a removed settlement no longer inflates its node weight (statistical, seeded)', () => {
+      const { bus, g, sim } = multiNodeWorld();
+      const nodesBefore = [...g.nodes.values()];
+      const targetNode = nodesBefore.reduce((a, b) => (b.z > a.z ? b : a));
+      const houseIds: number[] = [];
+      for (let k = 0; k < 6; k++) {
+        const id = 100 + k;
+        houseIds.push(id);
+        bus.emit('growth:spawn', {
+          kind: 'house',
+          x: targetNode.x + k * 0.5,
+          z: targetNode.z - 2 + k * 0.5,
+          rot: 0,
+          id,
+        });
+      }
+      sim.update(2.1, 0.5); // apply the throttled recompute with all 6 houses present
+
+      const targetNodeId = targetNode.id;
+      const nodeCount = g.nodes.size;
+      const drawRateAtTarget = () => {
+        let hits = 0, total = 0;
+        for (let i = 0; i < 2000; i++) {
+          const picked = (sim as any).pickSpawnPair();
+          if (!picked) continue;
+          total++;
+          if (picked.from === targetNodeId || picked.to === targetNodeId) hits++;
+        }
+        return { hits, total };
+      };
+
+      const before = drawRateAtTarget();
+      const uniformRate = 2 / nodeCount;
+      expect(before.hits / before.total).toBeGreaterThan(uniformRate * 1.5);
+
+      // Remove every house at the target node and let the recompute apply.
+      for (const id of houseIds) bus.emit('growth:remove', { id });
+      sim.update(2.1, 0.5);
+
+      const after = drawRateAtTarget();
+      // Back down near the uniform baseline now that the target node has no settlement weight.
+      expect(after.hits / after.total).toBeLessThan(uniformRate * 1.5);
+    });
+  });
 });

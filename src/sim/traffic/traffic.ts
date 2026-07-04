@@ -159,8 +159,15 @@ export class TrafficSim {
   // Task 32: settlement positions accumulated from growth:spawn (houses/buildings only), used to
   // build a per-node weight map for trip-endpoint selection. Recompute is throttled the same way
   // GrowthSim throttles its own road-distance recompute.
-  private houses: Array<{ x: number; z: number }> = [];
-  private buildings: Array<{ x: number; z: number }> = [];
+  //
+  // Task 35 (additive): each entry now also carries the growth record's `id` (when the emitting
+  // GrowthSim provides one — see events.ts's doc comment on `growth:spawn`'s optional `id`) so a
+  // later `growth:upgrade`/`growth:remove` for that id can find and evict/move the right entry
+  // instead of these arrays only ever growing. Entries with no id (id undefined — an older/test
+  // caller emitting the event by hand) simply can never be evicted this way, matching prior
+  // behavior exactly for those callers.
+  private houses: Array<{ x: number; z: number; id?: number }> = [];
+  private buildings: Array<{ x: number; z: number; id?: number }> = [];
   private nodeWeights = new Map<number, number>();
   private totalWeight = 0;
   private simTime = 0;
@@ -175,10 +182,30 @@ export class TrafficSim {
     this.lg = buildLaneGraph(this.graph);
     bus.on('roads:changed', () => this.onRoadsChanged());
     bus.on('growth:spawn', (e) => {
-      if (e.kind === 'house') this.houses.push({ x: e.x, z: e.z });
-      else if (e.kind === 'building') this.buildings.push({ x: e.x, z: e.z });
+      if (e.kind === 'house') this.houses.push({ x: e.x, z: e.z, id: e.id });
+      else if (e.kind === 'building') this.buildings.push({ x: e.x, z: e.z, id: e.id });
       else return;
       this.weightRecomputePending = true;
+    });
+    // Task 35: a house upgraded to a building — move its entry from `houses` to `buildings` rather
+    // than leaving a stale house-weight entry at that position forever.
+    bus.on('growth:upgrade', (e) => {
+      const i = this.houses.findIndex((h) => h.id === e.id);
+      if (i === -1) return;
+      const [moved] = this.houses.splice(i, 1);
+      this.buildings.push(moved);
+      this.weightRecomputePending = true;
+    });
+    // Task 35: a stranded record was fully removed — drop it from whichever array holds its id so
+    // the weight map stops crediting a settlement that no longer exists.
+    bus.on('growth:remove', (e) => {
+      const beforeH = this.houses.length;
+      this.houses = this.houses.filter((h) => h.id !== e.id);
+      const beforeB = this.buildings.length;
+      this.buildings = this.buildings.filter((b) => b.id !== e.id);
+      if (this.houses.length !== beforeH || this.buildings.length !== beforeB) {
+        this.weightRecomputePending = true;
+      }
     });
   }
 
