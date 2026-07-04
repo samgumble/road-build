@@ -81,6 +81,8 @@ const BEEPER_DUTY = 0.5;
 
 const PAN_CLAMP = 0.7;
 const PAN_DIVISOR = 120;
+const CREW_SWITCH_MARGIN = 20; // units a competitor must beat the followed crew by before we switch
+const PAN_EASE_TAU = 0.15; // seconds, damped-lerp time constant for rumble/beeper pan (matches engineGain's gate ease style)
 
 function dbToGain(db: number): number {
   return Math.pow(10, db / 20);
@@ -160,6 +162,15 @@ export class AmbientAudio {
    * `construction:progress` feeds this map and that event is never emitted with crew -1. */
   private crewProgress: Map<number, { at: number; x: number; demolish: boolean }> = new Map();
   private clockTime = 0; // ctx.currentTime substitute tracked via update(dt), used for gating
+  /** Crew index the shared rumble voice is currently "locked onto" (see `nearestActiveCrew`'s
+   * hysteresis) — null when no crew has ever been picked or the followed crew went idle with no
+   * replacement chosen yet. Persisting this across frames stops a camera parked equidistant
+   * between two crews from flip-flopping crew identity (and the stereo image) every frame. */
+  private followedCrew: number | null = null;
+  /** Eased pan value shared by the rumble and beeper panners (both always mirror the same crew),
+   * damped per-frame the same way `engineGain` eases its gate in `updateConstruction` rather than
+   * snapping via a bare `setValueAtTime`. */
+  private panCurrent = 0;
 
   private beeperGain: GainNode | null = null;
   private beeperPanner: StereoPannerNode | null = null;
@@ -863,19 +874,42 @@ export class AmbientAudio {
    * follows that one crew, panning toward whichever is loudest/closest rather than trying to
    * layer multiple engine sounds (kept simple per the binding spec: "one rumble voice, pan to the
    * loudest/nearest active crew"). Returns null if no crew is currently active.
+   *
+   * T25 review fix: recomputing the nearest crew from scratch every frame with no hysteresis meant
+   * a camera parked equidistant between two crews would flip the followed crew (and its pan)
+   * frame-to-frame. Now we stick with `this.followedCrew` unless it's gone idle or a competitor is
+   * meaningfully closer (by more than `CREW_SWITCH_MARGIN`), so the choice only changes when it's
+   * clearly warranted.
    */
   private nearestActiveCrew(cameraX: number): { x: number; demolish: boolean } | null {
-    let best: { x: number; demolish: boolean } | null = null;
+    let bestCrew: number | null = null;
+    let bestEntry: { x: number; demolish: boolean } | null = null;
     let bestDist = Infinity;
-    for (const { at, x, demolish } of this.crewProgress.values()) {
+    let followedDist = Infinity;
+    let followedEntry: { x: number; demolish: boolean } | null = null;
+
+    for (const [crew, { at, x, demolish }] of this.crewProgress.entries()) {
       if (this.clockTime - at >= ENGINE_GATE_RELEASE) continue; // this crew's gone idle
       const dist = Math.abs(x - cameraX);
       if (dist < bestDist) {
         bestDist = dist;
-        best = { x, demolish };
+        bestCrew = crew;
+        bestEntry = { x, demolish };
+      }
+      if (crew === this.followedCrew) {
+        followedDist = dist;
+        followedEntry = { x, demolish };
       }
     }
-    return best;
+
+    if (followedEntry !== null && bestDist >= followedDist - CREW_SWITCH_MARGIN) {
+      // Currently-followed crew is still active and no competitor is meaningfully closer — keep it.
+      return followedEntry;
+    }
+
+    // Either the followed crew went idle, or a competitor beat it by more than the margin: switch.
+    this.followedCrew = bestCrew;
+    return bestEntry;
   }
 
   private updateConstruction(dt: number, cameraX: number): void {
@@ -894,11 +928,15 @@ export class AmbientAudio {
     this.engineGain.gain.setValueAtTime(nextGain, now);
 
     if (active) {
-      const pan = clamp((nearest.x - cameraX) / PAN_DIVISOR, -PAN_CLAMP, PAN_CLAMP);
+      // Damped per-frame ease toward the target pan (same style as engineGain's gate ease above)
+      // rather than a bare setValueAtTime snap — otherwise a followed-crew switch (or even normal
+      // camera motion) causes an audible stereo-image jump.
+      const targetPan = clamp((nearest.x - cameraX) / PAN_DIVISOR, -PAN_CLAMP, PAN_CLAMP);
+      this.panCurrent += (targetPan - this.panCurrent) * Math.min(1, dt / PAN_EASE_TAU);
       this.enginePanner.pan.cancelScheduledValues(now);
-      this.enginePanner.pan.setValueAtTime(pan, now);
+      this.enginePanner.pan.setValueAtTime(this.panCurrent, now);
       this.beeperPanner.pan.cancelScheduledValues(now);
-      this.beeperPanner.pan.setValueAtTime(pan, now);
+      this.beeperPanner.pan.setValueAtTime(this.panCurrent, now);
     }
 
     // Reverse beeper: square-wave duty-cycle gate, only while the nearest active crew's job is a
