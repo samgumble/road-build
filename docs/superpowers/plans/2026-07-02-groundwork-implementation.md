@@ -1590,3 +1590,31 @@ Zen constraints and sim/render split remain binding. Perf: ≥55 fps, draw calls
 - Material logistics dressing: stockpile visibly depletes as stages consume it; paint stencil frame around the liner's nozzle; wet-sheen on fresh center dashes (mirror the fresh-asphalt roughness lerp).
 - Audio: soft radio-chatter blips (filtered noise bursts, −30dB) occasionally from the active crew; shovel/scrape one-shot tied to grader passes. Keep all of it subtle.
 - Everything eases; crew fade rules apply to workers/props.
+
+---
+
+# Addendum C — Cones, graphics 10x, mobile (approved by Sam 2026-07-03)
+
+Zen constraints + sim/render split binding. Perf targets now TIERED: desktop ≥55fps with full effects; mobile ≥30fps at reduced tier.
+
+### Task 27: Static work-zone cones
+
+`src/render/constructionRenderer.ts` only. Cones no longer track the moving work front. New behavior: when a crew's job starts, cones fade in at FIXED positions along the job's road segment — pairs flanking the roadway (offset ±(ROAD_WIDTH/2 + 0.8)) every ~14u along the full edge, plus one pair at each end — and remain exactly where placed for the whole job. They fade out with the crew's dressing at completion/removal. Instanced pool sized for the longest edge (cap ~48/crew; if an edge needs more, space them wider). Demolition jobs get the same treatment.
+
+### Task 28: Graphics 10x (tiered)
+
+Files: `src/render/scene.ts`, new `src/render/postfx.ts`, `src/render/terrainRenderer.ts` (water), `src/render/atmosphere.ts`, touched materials.
+- **Post pipeline (desktop tier)**: EffectComposer — subtle bloom (UnrealBloomPass, threshold ~0.85, strength ~0.35 — night lights/beacons/windows bloom, day stays clean) + gentle vignette. SSAO optional: include ONLY if frame budget holds on this machine (report numbers); otherwise document skip.
+- **Sky**: gradient sky dome (custom shader: horizon→zenith blend driven by the atmosphere's keyframe colors) with a visible sun disc + glow; STARS at night (point sprites fading in below sun elevation −0.05); moon optional.
+- **Water**: animated — gentle normal-perturbation ripples (time-based shader noise on the water material via onBeforeCompile or a ShaderMaterial), subtle shore foam band where depth ≈ 0 (distance-to-shore approximation via terrain height lookup baked to a texture or vertex attribute), slightly deeper color gradient by depth.
+- **Shadows**: PCFSoftShadowMap, tuned bias/normalBias (no acne, no peter-panning), shadow camera tightened to the island.
+- **Terrain**: subtle macro-variation (low-frequency shader noise multiplying vertex colors ±6%) to break up flat fields; keep the low-poly look — this is seasoning, not texturing.
+- **Quality tiers**: `RenderQuality = 'high' | 'low'` module — high: all of the above, devicePixelRatio ≤2, 2048 shadows; low: no composer (direct render), 1024 shadows, pixelRatio ≤1.5, water ripples simplified, stars capped. Auto-detect (mobile UA/GPU heuristic) + `?quality=` override. Atmosphere/day-night must look correct in BOTH tiers.
+
+### Task 29: Mobile support
+
+Files: `src/input/*`, `src/ui/hud.ts`, `index.html`, `src/main.ts`.
+- Touch input: one-finger drag = draw (in DRAW mode) / tap = demolish (in DEMOLISH mode); two-finger = pan (drag) + pinch (zoom) + twist (orbit); inertia damped like mouse. Pointer events already used — extend to multi-touch gesture recognition in cameraRig; DrawTool ignores multi-touch.
+- HUD: responsive layout ≤480px (toolbar wraps/compacts, larger touch targets ≥44px, seed/ticker scale down); `viewport` meta (no user scaling); no hover-dependent affordances (hover ring appears under the finger during draw).
+- Perf: mobile auto-selects 'low' tier (Task 28); cap sim step count on weak devices unchanged (already capped); verify on this machine via responsive emulation (375×812) — touch drawing, pinch, HUD usability, and playable fps in the emulated profile (real-device numbers are a user follow-up).
+- iOS quirks: audio unlock on first touchend (not just pointerdown); prevent double-tap zoom on the canvas; safe-area insets for the toolbar.
