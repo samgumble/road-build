@@ -1548,6 +1548,15 @@ interface CrewSlot {
 
   // --- Task 26: exhaust puffs ----------------------------------------------------------------
   exhaustTimer: Map<string, number>;
+
+  // --- Task 33: break theater ----------------------------------------------------------------
+  /** True while this crew's active job most recently reported `onBreak: true` (same idle-timeout
+   * liveness pattern as every other per-crew "active" signal here — see `lastBreakSeenAt`). While
+   * true: the excavator/roller/grader's cyclic animation is suppressed (they simply ease to a
+   * neutral/idle pose, same code path as "not active"), and the flagger+spotter walk toward the
+   * stockpile and idle-huddle there instead of their normal road-facing positions. */
+  onBreak: boolean;
+  lastBreakSeenAt: number;
 }
 
 /**
@@ -1722,6 +1731,8 @@ export class ConstructionRenderer {
       graderScrapeTimer: 0,
       graderScrapeGap: 6 + Math.random() * (10 - 6),
       exhaustTimer: new Map(),
+      onBreak: false,
+      lastBreakSeenAt: -Infinity,
     };
   }
 
@@ -1859,12 +1870,19 @@ export class ConstructionRenderer {
     vehicle: VehicleKind;
     demolish: boolean;
     crew: number;
+    onBreak: boolean;
   }): void {
     // crew: -1 is the sim's "no live crew" sentinel (synchronous instant-remove / save-restore
     // sync emits — see queue.ts) and never carries a real `construction:progress` event (only
     // `construction:stage` uses it), but guard anyway rather than indexing crews[-1].
     if (e.crew < 0 || e.crew >= this.crews.length) return;
     const slot = this.crews[e.crew];
+
+    // Task 33: break theater liveness — same idle-timeout pattern as every other per-crew signal
+    // here (see `updateCrew`'s `active` checks): a break "reads" as ongoing for IDLE_TIMEOUT past
+    // the last onBreak:true event, so a single dropped/late frame can't cause a visible flicker
+    // back to normal work pose mid-break.
+    if (e.onBreak) slot.lastBreakSeenAt = this.clock;
 
     const state = this.stateFor(e.crew, e.vehicle as Exclude<VehicleKind, 'crane'>);
     this.applyProgressTarget(state, e.edgeId, new THREE.Vector3(e.pos.x, e.pos.y, e.pos.z), e.heading);
@@ -2283,6 +2301,13 @@ export class ConstructionRenderer {
   private updateCrew(crew: number, dt: number, night: boolean): void {
     const slot = this.crews[crew];
 
+    // Task 33: break theater — same idle-timeout liveness pattern as every other per-crew signal
+    // (see `lastSeenAt`/IDLE_TIMEOUT above). While on break, cyclic vehicle animation (dig cycle,
+    // roller oscillation) is suppressed by simply never reporting those vehicles as "working" to
+    // their per-kind updaters below — `active` there already eases them to a neutral/idle pose,
+    // exactly the same code path as a vehicle between jobs.
+    slot.onBreak = this.clock - slot.lastBreakSeenAt <= this.IDLE_TIMEOUT;
+
     // determine which vehicle kinds are "active" this frame: they received a progress event
     // within IDLE_TIMEOUT seconds (guards against a single stray frame gap causing a pop).
     for (const [kind, state] of slot.states) {
@@ -2290,10 +2315,10 @@ export class ConstructionRenderer {
       const active = this.clock - lastSeen <= this.IDLE_TIMEOUT;
       this.stepVehicle(state, dt, active);
     }
-    const rollerActive = this.clock - slot.lastRollerSeenAt <= this.IDLE_TIMEOUT;
+    const rollerActive = this.clock - slot.lastRollerSeenAt <= this.IDLE_TIMEOUT && !slot.onBreak;
     this.stepVehicle(slot.roller, dt, rollerActive);
 
-    const graderActive = this.clock - slot.lastGraderSeenAt <= this.IDLE_TIMEOUT;
+    const graderActive = this.clock - slot.lastGraderSeenAt <= this.IDLE_TIMEOUT && !slot.onBreak;
     this.stepVehicle(slot.grader, dt, graderActive);
 
     const beaconIntensity = this.beaconIntensity(night);
@@ -2304,7 +2329,7 @@ export class ConstructionRenderer {
 
     const excavatorState = slot.states.get('excavator');
     const excavatorActive =
-      this.clock - (slot.lastSeenAt.get('excavator') ?? -Infinity) <= this.IDLE_TIMEOUT;
+      this.clock - (slot.lastSeenAt.get('excavator') ?? -Infinity) <= this.IDLE_TIMEOUT && !slot.onBreak;
     this.updateExcavator(slot, excavatorState, excavatorActive, dt);
 
     const truckState = slot.states.get('truck');
@@ -2751,10 +2776,30 @@ export class ConstructionRenderer {
     const scale = easeOutCubic(clamp01(slot.workerVisibility));
     const visible = scale > 0.001;
 
-    // --- Flagger: stationed just behind the cone bracket, facing the road, slow wave cycle ---
+    // Task 33: break huddle spot — a fixed point just beside the stockpile (reusing the same prop
+    // the stockpile worker already idles next to), offset so the flagger/spotter don't overlap
+    // them or each other. Computed fresh each frame from the stockpile's own (already-placed)
+    // position rather than cached, since the stockpile itself doesn't move during a job.
+    const huddleBase = slot.stockpile.group.position;
+    const flaggerHuddleX = huddleBase.x + 1.6;
+    const flaggerHuddleZ = huddleBase.z - 1.2;
+    const spotterHuddleX = huddleBase.x + 2.4;
+    const spotterHuddleZ = huddleBase.z + 0.4;
+
+    // --- Flagger: stationed just behind the cone bracket, facing the road, slow wave cycle —
+    // EXCEPT on break, when it instead walks to (and idles at) the huddle spot beside the
+    // stockpile, arm relaxed (light touch: same damped position, no wave animation). ---
     slot.flagger.group.visible = visible;
     slot.flagger.group.scale.setScalar(Math.max(0.001, scale));
-    if (active) {
+    if (active && slot.onBreak) {
+      const fy = this.hf.heightAt(flaggerHuddleX, flaggerHuddleZ);
+      const cur = slot.flagger.group.position;
+      const dampedX = damp(cur.x, flaggerHuddleX, SPOTTER_LAMBDA, dt);
+      const dampedZ = damp(cur.z, flaggerHuddleZ, SPOTTER_LAMBDA, dt);
+      slot.flagger.group.position.set(dampedX, fy, dampedZ);
+      slot.flagger.group.rotation.y = Math.atan2(huddleBase.x - dampedX, huddleBase.z - dampedZ);
+      slot.flagger.arm.rotation.z = damp(slot.flagger.arm.rotation.z, -0.2, 6, dt);
+    } else if (active) {
       const perpX = -Math.sin(slot.dressingHeading);
       const perpZ = Math.cos(slot.dressingHeading);
       const fx = slot.dressingPos.x + perpX * (ROAD_WIDTH_HALF + 3) - Math.cos(slot.dressingHeading) * 4;
@@ -2769,10 +2814,32 @@ export class ConstructionRenderer {
 
     // --- Spotter: stands ~SPOTTER_STANDOFF from the active vehicle, facing it, damped walk-steps
     // as the work front advances (slower lambda than the vehicle itself so it visibly "keeps up"
-    // rather than teleporting alongside it). ---
+    // rather than teleporting alongside it) — EXCEPT on break, when it walks to the huddle spot
+    // beside the stockpile instead (same damped-walk machinery, different target/no vehicle-facing). ---
     slot.spotter.group.visible = visible;
     slot.spotter.group.scale.setScalar(Math.max(0.001, scale));
-    if (active && anyVehicleActive) {
+    if (active && slot.onBreak) {
+      const prevX = slot.spotterPos.x;
+      const prevZ = slot.spotterPos.z;
+      slot.spotterPos.x = damp(prevX, spotterHuddleX, SPOTTER_LAMBDA, dt);
+      slot.spotterPos.z = damp(prevZ, spotterHuddleZ, SPOTTER_LAMBDA, dt);
+      const spotterY = this.hf.heightAt(slot.spotterPos.x, slot.spotterPos.z);
+
+      const moveDist = Math.hypot(slot.spotterPos.x - prevX, slot.spotterPos.z - prevZ);
+      const moveSpeed = dt > 0 ? moveDist / dt : 0;
+      let bobY = 0;
+      if (moveSpeed > SPOTTER_MOVE_EPS) {
+        slot.spotterStepPhase += dt * SPOTTER_STEP_HZ;
+        bobY = Math.abs(Math.sin(2 * Math.PI * slot.spotterStepPhase)) * SPOTTER_BOB_AMOUNT;
+      }
+      // Face the flagger/stockpile huddle center rather than any vehicle while on break.
+      const toHuddle = Math.atan2(huddleBase.z - slot.spotterPos.z, huddleBase.x - slot.spotterPos.x);
+      slot.spotterHeading = slot.spotterHeading + Math.atan2(Math.sin(toHuddle - slot.spotterHeading), Math.cos(toHuddle - slot.spotterHeading)) * (1 - Math.exp(-ROT_LAMBDA * dt));
+
+      slot.spotter.group.position.set(slot.spotterPos.x, spotterY + bobY, slot.spotterPos.z);
+      slot.spotter.group.rotation.y = -slot.spotterHeading;
+      slot.spotter.arm.rotation.z = damp(slot.spotter.arm.rotation.z, 0, 6, dt);
+    } else if (active && anyVehicleActive) {
       const anchor = slot.dressingPos;
       const perpX = -Math.sin(slot.dressingHeading);
       const perpZ = Math.cos(slot.dressingHeading);
@@ -2820,7 +2887,9 @@ export class ConstructionRenderer {
       slot.stockpileWorker.group.position.set(wx, wy, wz);
       slot.stockpileWorker.group.rotation.y = slot.dressingHeading;
 
-      if (slot.shovelActive) {
+      // Task 33: on break the stockpile worker just stands down (no new shovel-lean cycles roll)
+      // rather than mid-swing — reads as a genuine pause rather than a frozen shovel.
+      if (slot.shovelActive && !slot.onBreak) {
         slot.shovelPhase += dt;
         const u = clamp01(slot.shovelPhase / SHOVEL_CYCLE_DURATION);
         // lean forward-and-back: 0 -> lean(1) -> back(0), a single easeOutCubic-in/out hump
@@ -2835,13 +2904,18 @@ export class ConstructionRenderer {
       } else {
         slot.stockpileWorker.arm.rotation.z = damp(slot.stockpileWorker.arm.rotation.z, -0.2, 6, dt);
         slot.stockpileWorker.group.rotation.x = damp(slot.stockpileWorker.group.rotation.x, 0, 6, dt);
-        slot.shovelPhase += dt;
-        if (slot.shovelPhase >= slot.shovelIdleGap) {
+        if (slot.onBreak) {
+          // Frozen at "idle stance" for the whole break — don't roll for a new cycle.
           slot.shovelPhase = 0;
-          if (Math.random() < SHOVEL_CYCLE_CHANCE) {
-            slot.shovelActive = true;
-          } else {
-            slot.shovelIdleGap = SHOVEL_IDLE_GAP_MIN + Math.random() * (SHOVEL_IDLE_GAP_MAX - SHOVEL_IDLE_GAP_MIN);
+        } else {
+          slot.shovelPhase += dt;
+          if (slot.shovelPhase >= slot.shovelIdleGap) {
+            slot.shovelPhase = 0;
+            if (Math.random() < SHOVEL_CYCLE_CHANCE) {
+              slot.shovelActive = true;
+            } else {
+              slot.shovelIdleGap = SHOVEL_IDLE_GAP_MIN + Math.random() * (SHOVEL_IDLE_GAP_MAX - SHOVEL_IDLE_GAP_MIN);
+            }
           }
         }
       }
