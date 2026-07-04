@@ -19,12 +19,14 @@ const FADE_DURATION = 0.3; // seconds
 // cursor that's a bit off an existing junction/mid-edge point (grid cells are 8u) without pulling
 // in unrelated nodes across a normal street spacing.
 const MAGNET_RADIUS = 6;
-// Close-the-loop snap radius (Task 41: "can't create a road in a complete loop") — same radius as
-// MAGNET_RADIUS, but this one snaps onto the ACTIVE chain's own first point, which `graph.
-// magnetSnap` has no way to see (it only knows about already-committed nodes/edges). Without this,
-// closing a loop by eye relies on landing exactly on the same 8u grid cell as the start stake;
-// this makes it forgiving the same way snapping onto an existing junction is.
-const LOOP_CLOSE_RADIUS = 6;
+// Close-the-loop snap radius (Task 41: "can't create a road in a complete loop") — derived from
+// MAGNET_RADIUS rather than an independent literal (T41 review Finding 3): this one snaps onto the
+// ACTIVE chain's own first point, which `graph.magnetSnap` has no way to see (it only knows about
+// already-committed nodes/edges). Without this, closing a loop by eye relies on landing exactly on
+// the same 8u grid cell as the start stake; this makes it forgiving the same way snapping onto an
+// existing junction is. Kept equal to MAGNET_RADIUS today, but expressed as a derivation so the two
+// can never silently drift apart if one is tuned later.
+const LOOP_CLOSE_RADIUS = MAGNET_RADIUS;
 // A chain needs at least this many points before "closing the loop" is meaningful (matches
 // RoadGraph.commitClosedLoop's own minimum of 3 distinct points for a non-degenerate loop).
 const LOOP_CLOSE_MIN_POINTS = 3;
@@ -115,6 +117,42 @@ class StakeDustPool {
 }
 
 export type DrawToolMode = 'draw' | 'demolish' | 'none';
+
+/**
+ * Pure decision function behind the close-the-loop cursor magnetism (Task 41; extracted for T41
+ * review Finding 1 + Finding 2). `magnetResolved` is the point `graph.magnetSnap` already produced
+ * for the raw cursor position `raw`; `chainStart`/`chainLen` describe the in-progress chain (`null`
+ * / `0` when nothing is being drawn).
+ *
+ * T41 review Finding 1: the original implementation measured distance from `magnetResolved` (i.e.
+ * ALREADY snapped onto whatever existing node/edge point was nearest the raw cursor) to the chain's
+ * start, and overrode onto the chain start unconditionally whenever that was within
+ * LOOP_CLOSE_RADIUS. That silently clobbers a legitimate junction snap: if some unrelated existing
+ * node K happens to sit within LOOP_CLOSE_RADIUS of the chain's start point, hovering directly over
+ * K would get magnet-resolved to K correctly, then overridden to the chain start anyway — because
+ * the override only looked at how close the (already-resolved) result was to the start, not how
+ * close the cursor itself was to each candidate.
+ *
+ * Fixed by deciding from the RAW cursor position instead: compute the distance from `raw` to
+ * `chainStart` and from `raw` to `magnetResolved`, and let the loop-close win only when it's no
+ * farther away (`dStart <= dMagnet`, tie going to the chain start so that closing a loop by
+ * snapping exactly onto its own start point — the common case, where `chainStart` IS what
+ * `magnetSnap` would have resolved to anyway — keeps working exactly as before). When the chain's
+ * start was itself magnet-snapped onto an existing node when the stroke began, both candidates
+ * coincide and behavior is unchanged.
+ */
+export function resolveDrawSnap(
+  raw: P2,
+  magnetResolved: P2,
+  chainStart: P2 | null,
+  chainLen: number,
+): P2 {
+  if (chainLen < LOOP_CLOSE_MIN_POINTS || !chainStart) return magnetResolved;
+  const dStart = Math.hypot(chainStart.x - raw.x, chainStart.z - raw.z);
+  if (dStart > LOOP_CLOSE_RADIUS) return magnetResolved;
+  const dMagnet = Math.hypot(magnetResolved.x - raw.x, magnetResolved.z - raw.z);
+  return dStart <= dMagnet ? { x: chainStart.x, z: chainStart.z } : magnetResolved;
+}
 
 /**
  * Owns freehand road drawing (survey preview + stakes + commit) and demolish-click.
@@ -267,7 +305,7 @@ export class DrawTool {
 
       const hit = this.groundPointAt(e.clientX, e.clientY);
       if (!hit) return;
-      const p = this.applyLoopCloseSnap(this.graph.magnetSnap(hit.x, hit.z, MAGNET_RADIUS));
+      const p = this.applyLoopCloseSnap({ x: hit.x, z: hit.z }, this.graph.magnetSnap(hit.x, hit.z, MAGNET_RADIUS));
       const last = this.chain[this.chain.length - 1];
       if (last && last.x === p.x && last.z === p.z) return;
       this.chain.push(p);
@@ -349,7 +387,7 @@ export class DrawTool {
       this.hoverRing.visible = false;
       return;
     }
-    const p = this.applyLoopCloseSnap(this.graph.magnetSnap(hit.x, hit.z, MAGNET_RADIUS));
+    const p = this.applyLoopCloseSnap({ x: hit.x, z: hit.z }, this.graph.magnetSnap(hit.x, hit.z, MAGNET_RADIUS));
     const y = this.hf.heightAt(p.x, p.z) + HOVER_YLIFT;
     this.hoverBase.set(p.x, y, p.z);
     this.hoverRing.material = this.hoverRingMat;
@@ -357,20 +395,16 @@ export class DrawTool {
   }
 
   /**
-   * Close-the-loop magnetism (Task 41): while a chain with >= LOOP_CLOSE_MIN_POINTS points is
-   * active, if `p` (already resolved through `graph.magnetSnap`) lands within LOOP_CLOSE_RADIUS of
-   * the chain's OWN first point, snap onto that exact first point instead. `RoadGraph.magnetSnap`
-   * can't see this — the chain isn't committed yet, so the first point isn't a node/edge-interior
-   * point the graph knows about. Without this, closing a loop requires landing on the exact same
-   * 8u grid cell as the start stake; this makes it as forgiving as snapping onto an existing
-   * junction. No-op (returns `p` unchanged) when there's no active chain or it's too short — this
-   * is deliberately only relevant while `dragging` is true, since `this.chain` is empty otherwise.
+   * Close-the-loop magnetism (Task 41), decision delegated to the pure `resolveDrawSnap` above
+   * (T41 review Finding 1 + Finding 2: extracted so the "loop-close vs. nearer junction" tie-break
+   * is unit-testable and driven by the RAW cursor position, not the already-magnet-resolved one).
+   * `raw` is the un-snapped ground point under the cursor this frame; `magnetResolved` is what
+   * `graph.magnetSnap` already resolved it to. No-op (returns `magnetResolved` unchanged) when
+   * there's no active chain or it's too short — deliberately only relevant while `dragging` is
+   * true, since `this.chain` is empty otherwise.
    */
-  private applyLoopCloseSnap(p: P2): P2 {
-    if (this.chain.length < LOOP_CLOSE_MIN_POINTS) return p;
-    const start = this.chain[0];
-    const d = Math.hypot(start.x - p.x, start.z - p.z);
-    return d <= LOOP_CLOSE_RADIUS ? { x: start.x, z: start.z } : p;
+  private applyLoopCloseSnap(raw: P2, magnetResolved: P2): P2 {
+    return resolveDrawSnap(raw, magnetResolved, this.chain[0] ?? null, this.chain.length);
   }
 
   /** Raycasts road groups (tagged `userData.edgeId`) under the pointer, walking up `.parent`. */

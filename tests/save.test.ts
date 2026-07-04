@@ -454,4 +454,84 @@ describe('save/load', () => {
       ).toBeNull();
     });
   });
+
+  // T41 review (also/Minor from review): a closed loop commits as two half-loop edges sharing a
+  // midpoint node (see graph.ts's commitClosedLoop / tests/graph.test.ts's "closed loops (Task 41)"
+  // describe block). `restoreWorld` replays each saved edge's `ctrl` chain through
+  // `graph.commitChain` independently and in save order — the regression this guards against is
+  // node duplication: if replaying the second half's ctrl (mid -> start) didn't recognize the
+  // start/mid points as the SAME already-restored nodes from the first half, restore would mint
+  // fresh duplicate nodes instead of reconnecting the ring.
+  describe('closed loop save/restore (T41 follow-up)', () => {
+    /** Finds an 8u-grid-aligned square of land big enough to draw a simple closed-loop stroke:
+     * corners (x,z), (x+side,z), (x+side,z+side), (x,z+side), back to (x,z). */
+    function findLoopSquare(hf: Heightfield, side: number): { x: number; z: number } {
+      for (let x = -160; x <= 160; x += 8) {
+        for (let z = -160; z <= 160; z += 8) {
+          if (
+            hf.isLand(x, z) &&
+            hf.isLand(x + side, z) &&
+            hf.isLand(x + side, z + side) &&
+            hf.isLand(x, z + side)
+          ) {
+            return { x, z };
+          }
+        }
+      }
+      throw new Error('no land square found');
+    }
+
+    it('committing a closed loop, saving, and restoring into a fresh world yields 2 edges, 2 nodes, and both halves sharing the same two node ids (no duplication)', () => {
+      const w = freshWorld('loop-save-test');
+      const c = findLoopSquare(w.hf, 16);
+      const ids = w.graph.commitChain([
+        { x: c.x, z: c.z },
+        { x: c.x + 16, z: c.z },
+        { x: c.x + 16, z: c.z + 16 },
+        { x: c.x, z: c.z + 16 },
+        { x: c.x, z: c.z },
+      ]);
+      expect(ids).toHaveLength(2);
+      expect(w.graph.nodes.size).toBe(2);
+      const originalNodeIds = new Set<number>();
+      for (const id of ids) {
+        const e = w.graph.edges.get(id)!;
+        originalNodeIds.add(e.a);
+        originalNodeIds.add(e.b);
+      }
+      expect(originalNodeIds.size).toBe(2);
+
+      const json = serialize({
+        seed: 'loop-save-test',
+        timeOfDay: 0.4,
+        graph: w.graph,
+        growth: w.growth,
+        quarry: w.quarry,
+      });
+      const save = deserialize(json)!;
+      expect(save.edges).toHaveLength(2);
+
+      const w2 = freshWorld('loop-save-test');
+      restoreWorld(save, w2);
+
+      expect(w2.graph.edges.size).toBe(2);
+      expect(w2.graph.nodes.size).toBe(2);
+
+      const restoredNodeIds = new Set<number>();
+      const restoredNodePairs: Array<[number, number]> = [];
+      for (const e of w2.graph.edges.values()) {
+        restoredNodeIds.add(e.a);
+        restoredNodeIds.add(e.b);
+        restoredNodePairs.push([e.a, e.b]);
+      }
+      // Still exactly 2 distinct nodes after restore (no duplication of the shared start/mid nodes).
+      expect(restoredNodeIds.size).toBe(2);
+      // Both restored halves reference the SAME two node ids as each other (they share endpoints,
+      // forming a ring) rather than each half getting its own disconnected pair.
+      const [pairA, pairB] = restoredNodePairs;
+      const setA = new Set(pairA);
+      const setB = new Set(pairB);
+      expect(setA).toEqual(setB);
+    });
+  });
 });
