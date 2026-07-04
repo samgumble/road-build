@@ -33,6 +33,11 @@ const WILDERNESS_TREE_JITTER = 2.2;
 const STRANDED_FADE_DURATION = 30;
 const STRANDED_SINK_DISTANCE = 0.6; // u, matches Task 35's "sink ~0.6u" spec
 
+// Critical 3 (Groundwork round fix wave): a rescued (re-roaded) record eases back to full
+// scale/height over this window rather than snapping instantly — matches the "ease down" fade's own
+// spirit, just in reverse and much quicker (a rescue is a relieving correction, not a slow decay).
+const RESCUE_RECOVERY_DURATION = 1;
+
 // Task 31: raised from 4000 to make room for several hundred wilderness sites (1-3 trees each,
 // several hundred to ~1200 trees) on top of GrowthSim's own road-driven tree spawns sharing the
 // same InstancedMesh pool.
@@ -102,12 +107,36 @@ interface Animating {
  * instance's slot is either parked off-screen (wilderness — no sim-side record to reconcile with)
  * or actually freed via `freeSlot` (Task 35 stranded decay, triggered by `growth:remove`). `sink`
  * (Task 35 only, 0 for wilderness fades) additionally eases the instance downward as it shrinks,
- * per the user-decided "fade + slight sink" decay look. */
+ * per the user-decided "fade + slight sink" decay look.
+ *
+ * `fromScale`/`fromSink` (Critical 3, Groundwork round fix wave): the scale/sink this fade eases
+ * DOWN FROM — normally 1/0 (a fresh `growth:stranded` always starts a fade from full scale/no
+ * sink), but a re-strand that interrupts an in-flight `Recovering` entry (`growth:stranded` firing
+ * again mid-recovery — see `onStranded`) starts from wherever the recovery had already eased back
+ * to, so the fade resumes smoothly rather than snapping the instance to full scale first. */
 interface Fading {
   instance: Instance;
   elapsed: number;
   duration: number;
   sink: number;
+  fromScale: number;
+  fromSink: number;
+}
+
+/** Critical 3 (Groundwork round fix wave): an instance easing back from wherever it currently sits
+ * (scale/sink-wise) toward full scale (1) and zero sink, after `growth:rescued` interrupted an
+ * in-flight stranded-decay `Fading` entry. `fromScale`/`fromSink` are captured at the MOMENT of
+ * rescue (not assumed to be 1/0 — a rescue can happen at any point in the fade), so the ease always
+ * starts from wherever the instance actually was, never snapping. If the same instance is
+ * re-stranded while still recovering (`growth:stranded` fires again mid-recovery), the reverse
+ * happens: `onStranded` reads this entry's CURRENT interpolated scale/sink and hands it to the new
+ * `Fading` entry's own start point the same way — see `onStranded`/`onRescued`. */
+interface Recovering {
+  instance: Instance;
+  elapsed: number;
+  duration: number;
+  fromScale: number;
+  fromSink: number; // sink distance (u) at the moment of rescue, eased back to 0
 }
 
 function fallbackTreeVariant(color: number, scene: THREE.Scene, capacity: number): VariantMesh {
@@ -200,6 +229,9 @@ export class SceneryRenderer {
   private instances: Instance[] = [];
   private animating: Animating[] = [];
   private fading: Fading[] = [];
+  // Critical 3 (Groundwork round fix wave): instances easing back to full scale after a rescue —
+  // see the `Recovering` interface's doc comment.
+  private recovering: Recovering[] = [];
 
   // Task 35: id -> live Instance lookup (excludes wilderness trees, which have no growth record
   // and thus id === null) so growth:upgrade/stranded/remove can find their target in O(1) instead
@@ -225,10 +257,20 @@ export class SceneryRenderer {
   private pendingSpawns: { rec: PlaceableRecord; animate: boolean; id: number | null }[] = [];
 
   // Task 31: wilderness sites queued if `setWilderness` is called before tree variants finish
-  // loading (mirrors pendingSpawns above). Each site's placed instances are recorded by site
-  // index so a later `wilderness:cleared` notification can find and fade exactly those instances.
-  private pendingWilderness: WildernessTree[] | null = null;
-  private wildernessInstancesBySite: Instance[][] = [];
+  // loading (mirrors pendingSpawns above). Each site's placed instances are recorded keyed by its
+  // ORIGINAL (WildernessSim constructor-order) index — the same index space `wilderness:cleared`'s
+  // `indices` payload uses — so a later notification can find and fade exactly those instances.
+  //
+  // Critical 2 (Groundwork round fix wave): this used to be a dense array pushed to in
+  // `setWilderness`'s iteration order, implicitly keyed by POSITION WITHIN WHATEVER ARRAY WAS
+  // PASSED IN. `main.ts` passed `wildernessSim.active` — a COMPACTED view that skips already-cleared
+  // sites — so after a restore that had cleared >= 1 site (edges saved at 'graded' or later), this
+  // array's positions no longer lined up with the original indices `wilderness:cleared` refers to,
+  // and a live clear after that point could fade the wrong tree(s) entirely. A `Map` keyed by
+  // `originalIndex` (see `WildernessSim.activeWithIndex`) sidesteps the whole problem: whatever
+  // subset of sites gets passed in, in whatever order, each is recorded under its real index.
+  private pendingWilderness: ReadonlyArray<{ tree: WildernessTree; originalIndex: number }> | null = null;
+  private wildernessInstancesBySite = new Map<number, Instance[]>();
 
   // Finding 2 (Task 35 follow-up "Groundwork"): id -> in-flight fade offset (seconds already
   // elapsed into STRANDED_FADE_DURATION), set just before a `rebuild()` call and consulted by
@@ -278,6 +320,10 @@ export class SceneryRenderer {
     this.bus.on('growth:upgrade', (e) => this.onUpgrade(e.id));
     this.bus.on('growth:stranded', (e) => this.onStranded(e.id));
     this.bus.on('growth:remove', (e) => this.onRemove(e.id));
+    // Critical 3 (Groundwork round fix wave): rescue — eases a fading/faded-out instance back to
+    // full scale rather than leaving it permanently stuck at scale~0 with no sim event ever telling
+    // the renderer to recover it.
+    this.bus.on('growth:rescued', (e) => this.onRescued(e.id));
 
     this.loadGltfVariants('tree', TREE_FILES, TARGET_TREE_HEIGHT, TREE_CAPACITY, 2)
       .then((v) => {
@@ -389,6 +435,25 @@ export class SceneryRenderer {
    * i.e. still actively animating toward removal, as opposed to a normal full-scale instance. */
   isFading(id: number): boolean {
     return this.fading.some((f) => f.instance.id === id);
+  }
+
+  /** Test/diagnostic-only (Critical 3, Groundwork round fix wave): whether `id` is currently
+   * tracked in the `recovering` list — i.e. easing back to full scale after a rescue, as opposed to
+   * a normal full-scale instance or one still actively fading. */
+  isRecovering(id: number): boolean {
+    return this.recovering.some((r) => r.instance.id === id);
+  }
+
+  /** Test/diagnostic-only (Critical 2, Groundwork round fix wave): whether the wilderness site at
+   * ORIGINAL index `originalIndex` (see `WildernessSim.activeWithIndex`) has any of its placed
+   * instances currently fading — the renderer-observable proof that `onWildernessCleared` resolved
+   * the correct site via `wildernessInstancesBySite`'s original-index keying, not a compaction-
+   * shifted position. Returns `false` for an index with no placed instances at all (never placed,
+   * or already fully faded/never tracked). */
+  isWildernessSiteFading(originalIndex: number): boolean {
+    const placed = this.wildernessInstancesBySite.get(originalIndex);
+    if (!placed || !placed.length) return false;
+    return placed.some((instance) => this.fading.some((f) => f.instance === instance));
   }
 
   private async loadGltfVariants(
@@ -659,7 +724,14 @@ export class SceneryRenderer {
     const offset = this.pendingFadeOffsets.get(id);
     if (offset === undefined) return;
     this.pendingFadeOffsets.delete(id);
-    const f: Fading = { instance, elapsed: offset, duration: STRANDED_FADE_DURATION, sink: STRANDED_SINK_DISTANCE };
+    const f: Fading = {
+      instance,
+      elapsed: offset,
+      duration: STRANDED_FADE_DURATION,
+      sink: STRANDED_SINK_DISTANCE,
+      fromScale: 1,
+      fromSink: 0,
+    };
     this.applyFadeTransform(f);
     this.fading.push(f);
   }
@@ -671,8 +743,13 @@ export class SceneryRenderer {
    * spawn event) and tracked per-site so `wilderness:cleared` can later fade specific sites out.
    * If tree variants aren't loaded yet, the call is queued and flushed once they are (mirrors
    * `pendingSpawns`/`flushPending`).
+   *
+   * Critical 2 (Groundwork round fix wave): takes each site paired with its ORIGINAL
+   * (`WildernessSim` constructor-order) index — see `WildernessSim.activeWithIndex` — rather than a
+   * plain array, so `wildernessInstancesBySite` stays correctly keyed even when the caller passes a
+   * subset (e.g. a restored world's already-cleared sites are simply absent from this list).
    */
-  setWilderness(sites: ReadonlyArray<WildernessTree>): void {
+  setWilderness(sites: ReadonlyArray<{ tree: WildernessTree; originalIndex: number }>): void {
     if (!this.ready.tree) {
       this.pendingWilderness = sites.slice();
       return;
@@ -680,8 +757,8 @@ export class SceneryRenderer {
     this.placeWildernessSites(sites);
   }
 
-  private placeWildernessSites(sites: ReadonlyArray<WildernessTree>): void {
-    for (const site of sites) {
+  private placeWildernessSites(sites: ReadonlyArray<{ tree: WildernessTree; originalIndex: number }>): void {
+    for (const { tree: site, originalIndex } of sites) {
       const placed: Instance[] = [];
       for (let k = 0; k < site.count; k++) {
         // Deterministic per-tree offset (no RNG needed render-side: a small hash-free spread
@@ -695,7 +772,7 @@ export class SceneryRenderer {
         const instance = this.place({ kind: 'tree', x: tx, z: tz, rot }, false);
         if (instance) placed.push(instance);
       }
-      this.wildernessInstancesBySite.push(placed);
+      this.wildernessInstancesBySite.set(originalIndex, placed);
     }
   }
 
@@ -707,13 +784,23 @@ export class SceneryRenderer {
   }
 
   /** Fades out every placed instance belonging to the given wilderness site indices over
-   * WILDERNESS_FADE_DURATION seconds (Task 31: road construction "clears" trees in its corridor). */
+   * WILDERNESS_FADE_DURATION seconds (Task 31: road construction "clears" trees in its corridor).
+   * `indices` are ORIGINAL `WildernessTree[]` indices (see events.ts's doc comment on
+   * `wilderness:cleared`), which is exactly what `wildernessInstancesBySite` is now keyed by
+   * (Critical 2, Groundwork round fix wave) — no compaction-offset mismatch possible. */
   private onWildernessCleared(indices: number[]): void {
     for (const siteIdx of indices) {
-      const placed = this.wildernessInstancesBySite[siteIdx];
+      const placed = this.wildernessInstancesBySite.get(siteIdx);
       if (!placed) continue;
       for (const instance of placed) {
-        this.fading.push({ instance, elapsed: 0, duration: WILDERNESS_FADE_DURATION, sink: 0 });
+        this.fading.push({
+          instance,
+          elapsed: 0,
+          duration: WILDERNESS_FADE_DURATION,
+          sink: 0,
+          fromScale: 1,
+          fromSink: 0,
+        });
       }
     }
   }
@@ -734,31 +821,114 @@ export class SceneryRenderer {
     const instance = this.byId.get(id);
     if (!instance) return; // instance not placed yet (category still loading) — nothing to swap
     const { x, z, rot } = instance;
-    this.freeSlot(instance);
-    this.place({ kind: 'building', x, z, rot }, true, id);
+    // Minor 6 (Groundwork round fix wave): `place()` can return `null` — over capacity, or (in
+    // practice shouldn't happen here since `onUpgrade` is only ever called once the house category
+    // is already ready, but stay defensive) the building category still loading. Freeing the house
+    // slot FIRST and only THEN attempting to place the building used to mean a failed placement left
+    // this id with no instance at all: `byId` would still point at the just-freed (now-stale) house
+    // instance object, and nothing would be visible — a silent invisibility bug, not a crash, so it
+    // would go unnoticed until someone happened to look for that specific building. Placing the
+    // building FIRST and only freeing the house slot once that succeeds means a full-capacity
+    // building pool simply leaves the house standing (still visible, still correct) rather than
+    // deleting a home and replacing it with nothing.
+    const building = this.place({ kind: 'building', x, z, rot }, true, id);
+    if (building) this.freeSlot(instance);
   }
 
   /** Task 35: a record entered its post-grace fade window — start the scale-down + sink animation.
    * The instance is NOT removed here (see `onRemove`, fired when the sim's own fade timer
    * completes); this only starts the visual. Cancels any pop-in still in flight for the same
-   * instance so the two animations don't fight over the same matrix slot. */
+   * instance so the two animations don't fight over the same matrix slot.
+   *
+   * Critical 3 (Groundwork round fix wave): can also fire for an instance that's currently
+   * `Recovering` (re-stranded before an earlier rescue finished easing back to full scale/height —
+   * "trace both directions" per this finding). Reads that in-flight recovery's CURRENT interpolated
+   * scale/sink (via `recoverCurrent`) and starts the new fade from THERE instead of snapping to full
+   * scale first — the instance keeps whatever partial scale it had drifted back to and continues
+   * shrinking from exactly that point. */
   private onStranded(id: number): void {
     const instance = this.byId.get(id);
     if (!instance) return;
     this.animating = this.animating.filter((a) => a.instance !== instance);
-    this.fading.push({ instance, elapsed: 0, duration: STRANDED_FADE_DURATION, sink: STRANDED_SINK_DISTANCE });
+
+    let fromScale = 1;
+    let fromSink = 0;
+    const recoveringIdx = this.recovering.findIndex((r) => r.instance === instance);
+    if (recoveringIdx !== -1) {
+      const current = this.recoverCurrent(this.recovering[recoveringIdx]);
+      fromScale = current.scale;
+      fromSink = current.sink;
+      this.recovering.splice(recoveringIdx, 1);
+    }
+
+    this.fading.push({
+      instance,
+      elapsed: 0,
+      duration: STRANDED_FADE_DURATION,
+      sink: STRANDED_SINK_DISTANCE,
+      fromScale,
+      fromSink,
+    });
+  }
+
+  /** Critical 3 (Groundwork round fix wave): the sim rescued a record — re-roaded before
+   * `growth:remove` ever fired, whether that happened during the grace window (no fade ever
+   * started — a harmless no-op here, since there's no `Fading` entry to interrupt) or mid-fade
+   * (`growth:stranded` already started a `Fading` entry). In the mid-fade case, reads the fade's
+   * CURRENT interpolated scale/sink (via `fadeCurrent`) and starts a `Recovering` ease back to full
+   * scale/zero sink from THAT point — never snapping to full scale first. */
+  private onRescued(id: number): void {
+    const instance = this.byId.get(id);
+    if (!instance) return;
+
+    const fadingIdx = this.fading.findIndex((f) => f.instance === instance);
+    if (fadingIdx === -1) return; // rescued during grace — nothing was ever visually altered
+
+    const current = this.fadeCurrent(this.fading[fadingIdx]);
+    this.fading.splice(fadingIdx, 1);
+    this.recovering.push({
+      instance,
+      elapsed: 0,
+      duration: RESCUE_RECOVERY_DURATION,
+      fromScale: current.scale,
+      fromSink: current.sink,
+    });
+  }
+
+  /** The scale/sink a `Fading` entry has interpolated to as of its CURRENT `elapsed` (i.e. right
+   * now, before any further time advances) — shared by `onRescued` (captures the rescue point) and
+   * `applyFadeTransform` (paints the same formula every frame). */
+  private fadeCurrent(f: Fading): { scale: number; sink: number } {
+    const t = clamp01(f.elapsed / f.duration);
+    const scale = Math.max(0.0001, f.fromScale - (f.fromScale - 0.0001) * t);
+    const sink = f.fromSink + (f.sink - f.fromSink) * t;
+    return { scale, sink };
+  }
+
+  /** The scale/sink a `Recovering` entry has interpolated to as of its CURRENT `elapsed` — mirrors
+   * `fadeCurrent` above, easing from `fromScale`/`fromSink` UP to full scale (1) / zero sink. */
+  private recoverCurrent(r: Recovering): { scale: number; sink: number } {
+    const t = clamp01(r.elapsed / r.duration);
+    const scale = r.fromScale + (1 - r.fromScale) * t;
+    const sink = r.fromSink * (1 - t);
+    return { scale, sink };
   }
 
   /** Task 35: the sim has deleted the record — free its instance slot(s) for real (unlike
    * wilderness fades, which just park a slot off-screen forever since there's no sim-side removal
    * to reconcile with). Also drops any still-running fade entry for this instance so `update()`
    * doesn't keep animating a matrix slot that's just been reassigned to a different instance by
-   * `freeSlot`'s compaction. */
+   * `freeSlot`'s compaction. Critical 3 (Groundwork round fix wave): also drops any still-running
+   * `Recovering` entry for the same reason — defensive, since a record that's mid-recovery has by
+   * definition just been rescued and shouldn't normally reach `growth:remove` next, but a dangling
+   * `Recovering` entry pointing at a since-compacted slot would be a real (if unlikely) bug if it
+   * ever did. */
   private onRemove(id: number): void {
     const instance = this.byId.get(id);
     if (!instance) return;
     this.fading = this.fading.filter((f) => f.instance !== instance);
     this.animating = this.animating.filter((a) => a.instance !== instance);
+    this.recovering = this.recovering.filter((r) => r.instance !== instance);
     this.freeSlot(instance);
   }
 
@@ -816,7 +986,17 @@ export class SceneryRenderer {
     }
 
     // Drop from bookkeeping AFTER compaction (compaction may need to read instance.slot above).
-    if (instance.id !== null) this.byId.delete(instance.id);
+    //
+    // Minor 6 (Groundwork round fix wave) follow-on fix: only delete `byId`'s entry if it STILL
+    // points at THIS instance. `onUpgrade` now places the replacement building BEFORE freeing the
+    // old house slot (see `onUpgrade`'s doc comment) so a full-capacity building pool leaves the
+    // house intact rather than vanishing — but `place()` for the new building already overwrote
+    // `byId.get(id)` to point at the NEW instance by the time this `freeSlot(oldHouseInstance)` call
+    // runs. An unconditional delete here would then wipe out that brand-new mapping (both share the
+    // same id), leaving the just-placed building unreachable by id despite being visually present.
+    // Guarding on identity makes `freeSlot` safe to call either before OR after a same-id
+    // replacement is placed.
+    if (instance.id !== null && this.byId.get(instance.id) === instance) this.byId.delete(instance.id);
     this.instances = this.instances.filter((inst) => inst !== instance);
   }
 
@@ -872,6 +1052,7 @@ export class SceneryRenderer {
     this.instances = [];
     this.animating = [];
     this.fading = [];
+    this.recovering = []; // Critical 3 (Groundwork round fix wave): no in-flight recovery survives a full rebuild
     this.pendingSpawns = [];
     this.byId.clear();
     this.slotOwners.clear();
@@ -883,6 +1064,16 @@ export class SceneryRenderer {
     this.fieldStripe.count = 0;
     this.windows.count = 0;
     for (const v of [...this.treeVariants, ...this.houseVariants, ...this.buildingVariants]) v.mesh.count = 0;
+
+    // Minor 7 (Groundwork round fix wave): zeroing every tree InstancedMesh's count just above
+    // orphans any wilderness instances placed by an earlier `setWilderness` call — their slots are
+    // gone, but `wildernessInstancesBySite` would otherwise still list them as live, so a SECOND
+    // `setWilderness` call after this rebuild (main.ts always makes exactly one, post-restore, but
+    // nothing enforces that) would double-place: the old dangling entries plus the new ones. Reset
+    // both wilderness-tracking structures here so a re-entrant `rebuild()` -> `setWilderness()`
+    // cycle starts clean, matching every other per-category reset above.
+    this.wildernessInstancesBySite.clear();
+    this.pendingWilderness = null;
 
     this.pendingFadeOffsets.clear();
     for (const d of decayState) {
@@ -900,11 +1091,17 @@ export class SceneryRenderer {
    * animation loop and Finding 2's rebuild-time partial-fade application (which calls this once,
    * synchronously, with `elapsed` pre-set to the saved offset, so a mid-fade restored instance
    * renders at the correct progress on its very first frame — no pop, no restart). Returns the
-   * clamped progress `t` (0..1) so callers can decide whether the fade is complete. */
+   * clamped progress `t` (0..1) so callers can decide whether the fade is complete.
+   *
+   * Critical 3 (Groundwork round fix wave): eases from `f.fromScale`/`f.fromSink` (normally 1/0, but
+   * see `Fading`'s doc comment for the re-strand-mid-recovery case where it isn't) rather than a
+   * hardcoded 1/0 start — same formula as `fadeCurrent`, which reads this same interpolation without
+   * writing it (used by `onRescued` to capture the exact scale/sink at the moment of rescue). */
   private applyFadeTransform(f: Fading): number {
     const t = clamp01(f.elapsed / f.duration);
-    const s = Math.max(0.0001, 1 - t);
-    dummyPos.set(f.instance.x, f.instance.y - f.sink * t, f.instance.z);
+    const s = Math.max(0.0001, f.fromScale - (f.fromScale - 0.0001) * t);
+    const sink = f.fromSink + (f.sink - f.fromSink) * t;
+    dummyPos.set(f.instance.x, f.instance.y - sink, f.instance.z);
     dummyQuat.setFromAxisAngle(upAxis, f.instance.rot);
     dummyScale.set(s, s, s);
     dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
@@ -916,6 +1113,29 @@ export class SceneryRenderer {
       dummyScale.set(s, s, s);
       dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
       this.windows.setMatrixAt(f.instance.windowSlot, dummyMatrix);
+      this.windows.instanceMatrix.needsUpdate = true;
+    }
+    return t;
+  }
+
+  /** Critical 3 (Groundwork round fix wave): writes `r`'s current scale/sink/window transform for
+   * its elapsed time — the mirror image of `applyFadeTransform`, easing UP from `r.fromScale`/
+   * `r.fromSink` toward full scale (1) / zero sink over `r.duration`. Returns the clamped progress
+   * `t` (0..1) so `update()` can retire the entry once it completes. */
+  private applyRecoverTransform(r: Recovering): number {
+    const t = clamp01(r.elapsed / r.duration);
+    const s = r.fromScale + (1 - r.fromScale) * t;
+    const sink = r.fromSink * (1 - t);
+    dummyPos.set(r.instance.x, r.instance.y - sink, r.instance.z);
+    dummyQuat.setFromAxisAngle(upAxis, r.instance.rot);
+    dummyScale.set(s, s, s);
+    dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
+    r.instance.variant.mesh.setMatrixAt(r.instance.slot, dummyMatrix);
+    r.instance.variant.mesh.instanceMatrix.needsUpdate = true;
+    if (r.instance.windowSlot !== null) {
+      dummyScale.set(s, s, s);
+      dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
+      this.windows.setMatrixAt(r.instance.windowSlot, dummyMatrix);
       this.windows.instanceMatrix.needsUpdate = true;
     }
     return t;
@@ -952,6 +1172,20 @@ export class SceneryRenderer {
         // local timer reaches 1 (they're independently-timed but should coincide in practice).
       }
       this.fading = stillFading;
+    }
+
+    // Critical 3 (Groundwork round fix wave): ease rescued instances back to full scale/height.
+    // Once an entry's ease completes (t >= 1) it's simply dropped — the instance is left at exactly
+    // scale 1 / sink 0 (the same steady-state as any normal, never-stranded instance), so no further
+    // per-frame writes are needed for it.
+    if (this.recovering.length) {
+      const stillRecovering: Recovering[] = [];
+      for (const r of this.recovering) {
+        r.elapsed += dt;
+        const t = this.applyRecoverTransform(r);
+        if (t < 1) stillRecovering.push(r);
+      }
+      this.recovering = stillRecovering;
     }
   }
 

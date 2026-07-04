@@ -217,7 +217,16 @@ function main(): void {
       atmosphere.update(dt * loop.timeScale);
       constructionRenderer.update(dt, atmosphere.night);
       carRenderer.update(traffic.cars, atmosphere.night, dt * loop.timeScale);
-      sceneryRenderer.update(dt);
+      // Important 5 (Groundwork round fix wave): SceneryRenderer's fade/recover/pop-in animations
+      // (growth:stranded's decay fade, growth:rescued's recovery ease, wilderness:cleared's fade)
+      // must advance on SIM time, not wall-clock time — the sim events that start/stop them
+      // (growth:remove in particular) fire on `loop`'s fixed-step sim time, which itself already
+      // runs at `loop.timeScale`x speed (see Loop's fixed-step accumulator). Passing raw `dt` here
+      // (previously unscaled, unlike atmosphere/carRenderer just above) meant the sim's own removal
+      // could arrive up to 16x faster than this renderer's local fade timer at the fastest speed
+      // setting, popping buildings out instantly at ~1.5% through their local fade rather than
+      // smoothly finishing together.
+      sceneryRenderer.update(dt * loop.timeScale);
       // Audio intentionally stays real-time: `update()` uses `dt` only for its own wall-clock
       // scheduling (bird/cricket timers, pad chord crossfades), not to advance the day cycle —
       // `timeOfDay` is read from `atmosphere.timeOfDay`, which is already correctly scaled above.
@@ -241,6 +250,11 @@ function main(): void {
         // save time so `rebuild()` restores them at the correct partial-fade progress instead of
         // popping back in at full scale with a freshly-restarted fade animation.
         sceneryRenderer.rebuild(growth.spawned, growth.decayState);
+        // Important 4 (Groundwork round fix wave): seed TrafficSim's settlement-weighting
+        // houses/buildings arrays from the just-restored growth records — without this, those
+        // arrays only ever grew via live `growth:spawn` events, so every reload of an established
+        // town reset traffic weighting back to uniform until fresh houses/buildings grew again.
+        traffic.restore(growth.spawned);
         atmosphere.timeOfDay = save.timeOfDay;
         restoredRoads = save.edges.length > 0;
       }
@@ -252,10 +266,13 @@ function main(): void {
   // Task 31: place wilderness AFTER any restore above — `sceneryRenderer.rebuild()` (restore path)
   // zeroes every tree/house/building InstancedMesh's count and re-places only the saved growth
   // records, so placing wilderness any earlier would just get wiped out by that reset. Using
-  // `wildernessSim.active` (rather than the raw `wildernessSites`) means a restored world's
-  // already-cleared corridor trees never render as placed-then-immediately-faded — they're simply
-  // never placed, matching a fresh boot exactly.
-  sceneryRenderer.setWilderness(wildernessSim.active);
+  // `wildernessSim.activeWithIndex` (rather than the raw `wildernessSites`, or the plain, compacted
+  // `active`) means a restored world's already-cleared corridor trees never render as
+  // placed-then-immediately-faded (they're simply never placed, matching a fresh boot exactly)
+  // while ALSO keeping the renderer's site tracking keyed by original index — Critical 2 (Groundwork
+  // round fix wave): `active`'s compacted array silently misindexed any live `wilderness:cleared`
+  // that arrived after a restore had already pre-cleared >= 1 site.
+  sceneryRenderer.setWilderness(wildernessSim.activeWithIndex);
 
   const hud = new Hud({
     bus,

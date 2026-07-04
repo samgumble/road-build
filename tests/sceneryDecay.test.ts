@@ -94,6 +94,87 @@ describe('SceneryRenderer decay/upgrade (Task 35)', () => {
     expect(sr.instanceStats.treeMeshTotal).toBe(before);
   });
 
+  // Critical 3 (Groundwork round fix wave): `growth:rescued` must recover a mid-fade instance back
+  // to full scale (easing, not snapping) rather than leaving it permanently stuck at scale~0 with
+  // no sim event ever telling the renderer to bring it back — the bug being that `onStranded`
+  // started a fade with nothing ever un-doing it short of `growth:remove`, which never arrives for
+  // a rescued record.
+  describe('rescue recovery (Critical 3)', () => {
+    it('a mid-fade instance eases back to full scale on growth:rescued, not a snap', () => {
+      const id = freshId();
+      spawn(bus, 'tree', 9100, 9100, id);
+      bus.emit('growth:stranded', { id });
+      sr.update(15); // 15s into the 30s fade -> scale ~0.5
+      const midFadeScale = sr.scaleOf(id)!;
+      expect(midFadeScale).toBeCloseTo(0.5, 1);
+      expect(sr.isFading(id)).toBe(true);
+
+      bus.emit('growth:rescued', { id });
+      // Immediately after rescue, before any further update(), the instance must NOT have snapped
+      // to full scale — it should still read at (approximately) the same scale it was rescued at,
+      // now tracked as recovering instead of fading.
+      expect(sr.isFading(id)).toBe(false);
+      expect(sr.isRecovering(id)).toBe(true);
+      expect(sr.scaleOf(id)!).toBeCloseTo(midFadeScale, 1);
+
+      // Advance partway through the ~1s recovery ease — scale should be climbing back toward 1,
+      // strictly greater than where it was rescued but not yet fully there.
+      sr.update(0.5);
+      const midRecoveryScale = sr.scaleOf(id)!;
+      expect(midRecoveryScale).toBeGreaterThan(midFadeScale);
+      expect(midRecoveryScale).toBeLessThan(1);
+
+      // Advance past the recovery duration — fully recovered, back to normal full-scale steady
+      // state, no longer tracked in either animation list.
+      sr.update(1);
+      expect(sr.isRecovering(id)).toBe(false);
+      expect(sr.scaleOf(id)!).toBeCloseTo(1, 2);
+
+      bus.emit('growth:remove', { id });
+    });
+
+    it('growth:rescued during the grace window (no fade ever started) is a harmless no-op', () => {
+      const id = freshId();
+      spawn(bus, 'tree', 9110, 9110, id);
+      sr.update(1); // let the normal pop-in animation finish -> settles at full scale
+      // No growth:stranded ever fired for this id — mirrors a sim-side rescue during grace, where
+      // the renderer never had anything to visually alter in the first place.
+      expect(() => bus.emit('growth:rescued', { id })).not.toThrow();
+      expect(sr.isFading(id)).toBe(false);
+      expect(sr.isRecovering(id)).toBe(false);
+      expect(sr.scaleOf(id)).toBeCloseTo(1, 2);
+      bus.emit('growth:remove', { id });
+    });
+
+    it('re-stranding mid-recovery eases back down from the current partial scale, not a snap to full scale first', () => {
+      const id = freshId();
+      spawn(bus, 'tree', 9120, 9120, id);
+      bus.emit('growth:stranded', { id });
+      sr.update(15); // 15s into the 30s fade -> scale ~0.5
+      const fadeScaleAtRescue = sr.scaleOf(id)!;
+
+      bus.emit('growth:rescued', { id });
+      sr.update(0.5); // partway back through the ~1s recovery ease
+      const recoveredScaleBeforeReStrand = sr.scaleOf(id)!;
+      expect(recoveredScaleBeforeReStrand).toBeGreaterThan(fadeScaleAtRescue);
+      expect(recoveredScaleBeforeReStrand).toBeLessThan(1);
+
+      // Re-stranded while still mid-recovery — trace the "other direction" this finding calls for.
+      bus.emit('growth:stranded', { id });
+      expect(sr.isRecovering(id)).toBe(false);
+      expect(sr.isFading(id)).toBe(true);
+      // Must NOT have snapped to full scale (1) before starting the new fade — reads at
+      // (approximately) wherever the recovery had already eased back to.
+      expect(sr.scaleOf(id)!).toBeCloseTo(recoveredScaleBeforeReStrand, 1);
+
+      // The new fade continues shrinking from that point, not from a fresh scale-1 start.
+      sr.update(0.5);
+      expect(sr.scaleOf(id)!).toBeLessThan(recoveredScaleBeforeReStrand);
+
+      bus.emit('growth:remove', { id });
+    });
+  });
+
   it('removing a middle instance compacts via swap-with-last (no gaps, no ghosts)', () => {
     const before = sr.instanceStats;
     const ids = [freshId(), freshId(), freshId(), freshId(), freshId()];
@@ -241,6 +322,87 @@ describe('SceneryRenderer decay/upgrade (Task 35)', () => {
       expect(sr.isFading(idA)).toBe(false);
       expect(sr.scaleOf(idA)).toBeNull(); // idA's instance no longer exists at all post-rebuild
       bus.emit('growth:remove', { id: idB });
+    });
+  });
+
+  // Critical 2 (Groundwork round fix wave): `wilderness:cleared`'s `indices` always refer to the
+  // ORIGINAL WildernessTree[] index (see events.ts's doc comment). `setWilderness` used to be keyed
+  // by the CALLER'S array position instead — harmless when the caller passes every site (position
+  // == original index), but wrong the moment the caller passes a COMPACTED subset (main.ts uses
+  // `wildernessSim.active`/`activeWithIndex` specifically because a restored world may have already
+  // cleared some sites before boot). This reproduces that exact scenario at the renderer level: seed
+  // `setWilderness` with a subset that SKIPS an already-cleared low-index site (mirroring a restore),
+  // then fire `wilderness:cleared` for a real still-live site's original index, and confirm the
+  // renderer fades THAT site — not whatever happens to sit at the same compacted array position.
+  describe('setWilderness index correlation across a restore-like precleared gap (Critical 2)', () => {
+    it('fades the correct site by original index even when an earlier site was never placed (precleared)', () => {
+      // Three original sites: index 0 (precleared — simulates a restore where this site's corridor
+      // was already graded before boot, so it's never passed to setWilderness at all), index 1 and
+      // index 2 both live. Under the old array-position-keyed bug, passing [site1, site2] (skipping
+      // site0) would store site1 at array position 0 and site2 at position 1 — so a
+      // `wilderness:cleared` for original index 2 would incorrectly resolve to whatever sits at
+      // position 2 (nothing, in this 2-element array) instead of site2's actual placed instances.
+      const site1 = { x: 9000, z: 9000, rot: 0, count: 1 };
+      const site2 = { x: 9010, z: 9010, rot: 0, count: 1 };
+      sr.setWilderness([
+        { tree: site1, originalIndex: 1 },
+        { tree: site2, originalIndex: 2 },
+      ]);
+
+      expect(sr.isWildernessSiteFading(1)).toBe(false);
+      expect(sr.isWildernessSiteFading(2)).toBe(false);
+
+      // Live clear targeting original index 2 (site2) — index 0 (precleared, never placed) and
+      // index 1 (site1) must NOT be affected.
+      bus.emit('wilderness:cleared', { indices: [2] });
+
+      expect(sr.isWildernessSiteFading(2)).toBe(true);
+      expect(sr.isWildernessSiteFading(1)).toBe(false);
+      expect(sr.isWildernessSiteFading(0)).toBe(false); // never placed — nothing to fade, nothing to misfire onto
+
+      // Let the fade complete so it doesn't leak into later tests' instance counts (matches
+      // sceneryRenderer.ts's WILDERNESS_FADE_DURATION of 1.5s).
+      sr.update(1.6);
+    });
+  });
+
+  // Minor 7 (Groundwork round fix wave): `rebuild()` zeroes every tree InstancedMesh's count
+  // (orphaning any previously-placed wilderness instances — their slots are gone, reassigned to
+  // whatever `rebuild()` places next) but used to leave `wildernessInstancesBySite` untouched. A
+  // re-entrant `rebuild()` -> `setWilderness()` cycle (which shouldn't normally happen in main.ts's
+  // boot sequence, but nothing enforced that it couldn't) would then leave stale index entries
+  // pointing at dangling `Instance` objects whose `.slot` no longer corresponds to anything real —
+  // a later `wilderness:cleared` for one of THOSE indices (never re-placed by the second
+  // `setWilderness` call, so nothing legitimately occupies that index anymore) would incorrectly
+  // still report as "fading" instead of "nothing to fade" (no live entry for that index at all).
+  describe('rebuild() resets wilderness tracking so a second setWilderness cycle cannot double-place (Minor 7)', () => {
+    it('an index from before a rebuild is not still "known" after rebuild(), even if never re-placed', () => {
+      const siteA = { x: 9200, z: 9200, rot: 0, count: 1 };
+      sr.setWilderness([{ tree: siteA, originalIndex: 7 }]);
+      expect(sr.isWildernessSiteFading(7)).toBe(false); // sanity: not fading yet
+
+      // A rebuild (as a restore does) wipes the tree mesh's live range out from under siteA's
+      // instance — its slot is gone/reassigned. Without the Minor 7 fix,
+      // `wildernessInstancesBySite` would still map index 7 to that now-dangling Instance object.
+      sr.rebuild([]);
+
+      // The second setWilderness cycle intentionally does NOT re-place index 7 (mirrors a real
+      // restore where a previously-live site's corridor got cleared in the interim, so main.ts's
+      // fresh activeWithIndex list simply omits it this time around).
+      const siteB = { x: 9210, z: 9210, rot: 0, count: 1 };
+      sr.setWilderness([{ tree: siteB, originalIndex: 8 }]);
+
+      // A live clear naming index 7 must be a no-op: nothing legitimately live occupies that index
+      // post-rebuild. Without the fix, the stale dangling entry from before the rebuild would still
+      // be found and (incorrectly) pushed into the fading list.
+      bus.emit('wilderness:cleared', { indices: [7] });
+      expect(sr.isWildernessSiteFading(7)).toBe(false);
+
+      // Index 8 (the real, freshly-placed site) still clears correctly.
+      bus.emit('wilderness:cleared', { indices: [8] });
+      expect(sr.isWildernessSiteFading(8)).toBe(true);
+
+      sr.update(1.6); // let the fade complete so it doesn't leak into later tests
     });
   });
 });
