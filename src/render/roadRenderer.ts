@@ -538,7 +538,22 @@ export class RoadRenderer {
       // completing while paved is still working its own stretch behind it) keeps rendering its own
       // live boundary. `stage` here is always a buildable stage (never 'surveyed' — see the class
       // doc; survey never fires a stage transition), so it's always a valid `FrontProgress` key.
-      if (v.pending) v.pending[stage as Exclude<Stage, 'surveyed'>] = null;
+      if (v.pending) {
+        v.pending[stage as Exclude<Stage, 'surveyed'>] = null;
+        // Critical fix (Task 36 finding): demolition is strictly sequential — once a
+        // demolish-direction stage event lands, any pending front entry for a stage ABOVE this
+        // one is necessarily stale (a train job converted to demolish mid-flight abandons every
+        // in-flight front, per enqueueDemolish, and the sim never emits a completing
+        // construction:stage for those abandoned fronts). Clear them here too so a leftover
+        // `pending.paved` (etc.) from before the conversion can't keep rendering a frozen band on
+        // top of the regressing demolition. Cheap idempotent loop; a no-op once nothing's stale.
+        const stageIdx = STAGES.indexOf(stage);
+        for (let i = stageIdx + 1; i < STAGES.length; i++) {
+          const higher = STAGES[i];
+          if (higher === 'surveyed') continue;
+          v.pending[higher as Exclude<Stage, 'surveyed'>] = null;
+        }
+      }
       v.surveyPending = null;
     }
     if (stage === 'paved') {
@@ -603,6 +618,23 @@ export class RoadRenderer {
       v.pending = { graded: null, gravel: null, paved: null, painted: null };
     }
     v.pending[stage] = t;
+    if (demolish) {
+      // Critical fix (Task 36 finding): a train job that converts to demolish mid-flight abandons
+      // every in-flight front above `stage` (enqueueDemolish drops `active.fronts` and walks
+      // backward sequentially from `edge.stage`) — the sim will never emit a completing
+      // construction:stage for those abandoned fronts, so their `pending` entries would otherwise
+      // stay frozen at whatever `t` they last reported, rendering a stale non-shrinking band on
+      // top of the regressing demolition for the rest of the teardown. Demolition only ever
+      // reports progress for the single stage it's currently walking back through, and that stage
+      // is by construction the highest one that still has (or ever had) real structure — so any
+      // pending entry for a stage ABOVE it is stale by definition and safe to clear unconditionally.
+      const stageIdx = STAGES.indexOf(stage);
+      for (let i = stageIdx + 1; i < STAGES.length; i++) {
+        const higher = STAGES[i];
+        if (higher === 'surveyed') continue;
+        v.pending[higher as Exclude<Stage, 'surveyed'>] = null;
+      }
+    }
     if (stage === 'graded') {
       // Pylon rise (deliverable 2) is driven by the graded-stage work front specifically, tracked
       // independent of `pending` so it isn't cleared/reset by a later stage's progress events.
