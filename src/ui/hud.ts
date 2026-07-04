@@ -157,6 +157,28 @@ interface HudDeps {
 }
 
 const SAVE_KEY = 'groundwork-save';
+/** Task 39: MUSIC HUD toggle's persisted on/off state — separate from MUTE (which isn't persisted
+ * at all; it always starts unmuted). Defaults to ON (music enabled) whenever the key is missing or
+ * unreadable (private browsing, storage disabled, corrupt value), matching this game's
+ * "music-on-by-default" design. */
+const MUSIC_KEY = 'groundwork-music';
+
+function readPersistedMusicOn(): boolean {
+  try {
+    const raw = window.localStorage.getItem(MUSIC_KEY);
+    return raw === null ? true : raw === '1';
+  } catch {
+    return true;
+  }
+}
+
+function persistMusicOn(on: boolean): void {
+  try {
+    window.localStorage.setItem(MUSIC_KEY, on ? '1' : '0');
+  } catch {
+    // localStorage unavailable — the toggle still works for this session, just doesn't persist.
+  }
+}
 
 /**
  * Bottom-center toolbar + top-left seed/status readout, styled as an engineer's site plan: charcoal
@@ -181,6 +203,7 @@ export class Hud {
   private newWorldInput!: HTMLInputElement;
 
   private muteBtn!: HTMLButtonElement;
+  private musicBtn!: HTMLButtonElement;
 
   /** This crew's currently-reported stage, keyed by 0-based crew index (Task 25); a crew has no
    * entry while idle (no job assigned) or once its job reaches a terminal stage ('painted'/
@@ -193,6 +216,11 @@ export class Hud {
     const hud = document.getElementById('hud');
     if (!hud) throw new Error('#hud container not found');
     this.root = hud;
+
+    // Task 39: restore the persisted MUSIC toggle state before any button is built, so
+    // buildMusicButton's initial `refreshMusicButton()` reflects it immediately rather than
+    // flashing the default-on state for a frame.
+    this.deps.audio.musicOn = readPersistedMusicOn();
 
     injectResponsiveStyles();
     this.buildTopLeft();
@@ -254,6 +282,7 @@ export class Hud {
     bar.appendChild(this.buildDivider());
     bar.appendChild(this.buildNewWorldGroup());
     bar.appendChild(this.buildPhotoButton());
+    bar.appendChild(this.buildMusicButton());
     bar.appendChild(this.buildMuteButton());
 
     this.root.appendChild(bar);
@@ -402,6 +431,35 @@ export class Hud {
     setResponsiveLabel(this.muteBtn, muted ? 'Sound Off' : 'Mute', muted ? 'UNMUTE' : 'MUTE');
     this.muteBtn.style.borderBottomColor = muted ? ACCENT : 'transparent';
     this.muteBtn.style.color = muted ? ACCENT : TEXT;
+  }
+
+  /** Task 39: MUSIC toggle — same mono/uppercase/orange-underline aesthetic as MUTE, but controls
+   * only `audio.musicOn` (the real tracks + pad-fallback bus), independent of MUTE. Default ON,
+   * with the orange underline showing while ON (mirroring how every other toggle/mode button here
+   * uses the underline for "this is the active state" — MUTE is the one exception, where the
+   * underline marks the muted state, since that's the one worth calling out). Persisted immediately
+   * on every click via `persistMusicOn`. */
+  private buildMusicButton(): HTMLElement {
+    const btn = el('button', { type: 'button' }, {
+      ...baseButtonStyle(),
+      borderBottom: '2px solid transparent',
+    });
+    btn.addEventListener('click', () => {
+      const next = !this.deps.audio.musicOn;
+      this.deps.audio.musicOn = next;
+      persistMusicOn(next);
+      this.refreshMusicButton();
+    });
+    this.musicBtn = btn;
+    this.refreshMusicButton();
+    return btn;
+  }
+
+  private refreshMusicButton(): void {
+    const on = this.deps.audio.musicOn;
+    setResponsiveLabel(this.musicBtn, 'Music', 'MUSIC');
+    this.musicBtn.style.borderBottomColor = on ? ACCENT : 'transparent';
+    this.musicBtn.style.color = on ? ACCENT : TEXT;
   }
 
   private takePhoto(): void {
