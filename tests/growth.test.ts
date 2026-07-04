@@ -171,13 +171,13 @@ describe('GrowthSim', () => {
       let anchor = { x: 0, z: 0 };
       outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
         if (hf.isLand(x, z) && hf.isLand(x + 64, z)) { anchor = { x, z }; break outer; }
-      g.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+      const [edgeId] = g.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
       for (const e of g.edges.values()) e.stage = 'painted';
       const sim = new GrowthSim(g, hf, bus, createRng('upgrade'));
       bus.emit('roads:changed', {});
       sim.update(3); // apply the throttled road-distance recompute
       const { i, j } = findFlatCell(hf, anchor);
-      return { bus, sim, hf, i, j };
+      return { bus, sim, hf, g, edgeId, i, j };
     }
 
     /** Finds a flat, land cell (and its 4 neighbors) near `near`, suitable for seeding dev levels
@@ -274,6 +274,117 @@ describe('GrowthSim', () => {
       for (let k = 0; k < 300; k++) sim.update(1 / 60);
 
       expect(upgradeCount).toBe(1);
+    });
+
+    // Groundwork batch-review Finding 1 (Critical): tryUpgrade's target-selection scan used to
+    // match ANY house record sitting in the eligible cell, including one that is mid-corridor-
+    // clearing (clearingSince) or mid-stranded-fade (fadingSince) — both states where the record is
+    // already animating out and about to be removed entirely. Upgrading it first (mutating its
+    // `kind` to 'building' in place) would fire growth:upgrade for a record that's a few ticks from
+    // vanishing, which is visually nonsensical (a building appearing then immediately dissolving)
+    // and leaves stale bookkeeping (the clearing/fading maps still reference the id under its old
+    // kind's semantics). Fix: tryUpgrade's scan skips any record id present in clearingSince OR
+    // fadingSince. A grace-only record (strandedSince set, not yet fading — the record is NOT
+    // visually animating, it's just sitting in its normal spot during the silent 60s grace) is a
+    // judgment call: we choose to ALSO skip it here for a simpler, single rule ("any decay timer in
+    // flight blocks upgrade") rather than special-casing "grace is fine, fade is not" — simpler to
+    // reason about and matches the spirit of "don't let two lifecycle pipelines race over the same
+    // record" already used elsewhere in this file (see updateStrandedDecay's clearingSince guard).
+    describe('does not upgrade a record with an in-flight decay/clearing timer (Groundwork Finding 1)', () => {
+      it('skips a house mid-corridor-clearing even when upgrade conditions are met', () => {
+        const { bus, sim, hf, g, edgeId } = seededWorld();
+        const edge = g.edges.get(edgeId)!;
+        const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+        // Need a flat (per growth.ts's own MAX_SLOPE=0.5 gate — update()'s per-cell loop skips
+        // steeper cells entirely, upgrade check included), land cell whose CENTER is within
+        // CLEAR_RADIUS (5u) of a road sample (so the house placed there actually clears). The 4
+        // neighbor cells only need their `dev` array entries set (checked directly below, not via
+        // live accumulation), so they don't need their own slope/land constraints satisfied.
+        const midI = Math.round((sample.x + HALF) / CELL);
+        const midJ = Math.round((sample.z + HALF) / CELL);
+        let found: { i: number; j: number } | null = null;
+        outer: for (let dj = -2; dj <= 2; dj++) {
+          for (let di = -2; di <= 2; di++) {
+            const ci = midI + di, cj = midJ + dj;
+            const c = cellCenter(ci, cj);
+            if (Math.hypot(c.x - sample.x, c.z - sample.z) > 5) continue;
+            if (!hf.isLand(c.x, c.z) || hf.slopeAt(c.x, c.z) > 0.5) continue;
+            found = { i: ci, j: cj };
+            break outer;
+          }
+        }
+        expect(found).not.toBeNull();
+        const { i, j } = found!;
+        const { x: cx, z: cz } = cellCenter(i, j);
+        expect(Math.hypot(cx - sample.x, cz - sample.z)).toBeLessThanOrEqual(5);
+
+        const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+        const idx = (ii: number, jj: number) => jj * GRID_SIZE + ii;
+        dev[idx(i, j)] = 1.35;
+        dev[idx(i - 1, j)] = 0.8; // developed neighbor 1
+        dev[idx(i + 1, j)] = 0.8; // developed neighbor 2
+        const house: SpawnRecord = { kind: 'house', x: cx, z: cz, rot: 0, id: 1 };
+
+        const clearedIds: number[] = [];
+        const upgradedIds: number[] = [];
+        bus.on('growth:cleared', (e) => clearedIds.push(e.id));
+        bus.on('growth:upgrade', (e) => upgradedIds.push(e.id));
+
+        // The edge is already 'painted' (past 'graded') at this point (seededWorld sets it so),
+        // so restore()'s own corridor re-scan clears this record immediately — mirroring the
+        // "restore re-clears the corridor" tests above rather than needing a fresh
+        // construction:stage event.
+        sim.restore(dev, [house]);
+        expect(clearedIds).toEqual([1]); // confirm it's actually mid-clearing before asserting the negative
+
+        sim.update(1 / 60); // upgrade conditions are met on this very tick too
+        expect(upgradedIds).toEqual([]);
+        expect(sim.spawned.find((r) => r.id === 1)?.kind).toBe('house'); // never mutated to 'building'
+      });
+
+      it('skips a house mid-stranded-fade even when upgrade conditions are met', () => {
+        const { bus, sim, i, j } = seededWorld();
+        const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+        const idx = (ii: number, jj: number) => jj * GRID_SIZE + ii;
+        dev[idx(i, j)] = 1.35;
+        dev[idx(i - 1, j)] = 0.8;
+        dev[idx(i + 1, j)] = 0.8;
+        const { x, z } = cellCenter(i, j);
+        const house: SpawnRecord = { kind: 'house', x, z, rot: 0, id: 1 };
+        // Seed the record already mid-fade (post-grace) via restore()'s decay param, exactly like
+        // the "decay state persistence" tests do.
+        sim.restore(dev, [house], [{ id: 1, fading: 5 }]);
+
+        const upgradedIds: number[] = [];
+        bus.on('growth:upgrade', (e) => upgradedIds.push(e.id));
+        sim.update(1 / 60);
+
+        expect(upgradedIds).toEqual([]);
+        expect(sim.spawned.find((r) => r.id === 1)?.kind).toBe('house');
+      });
+
+      it('(documented choice) also skips a grace-only house, not just mid-fade/mid-clearing', () => {
+        const { bus, sim, i, j } = seededWorld();
+        const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+        const idx = (ii: number, jj: number) => jj * GRID_SIZE + ii;
+        dev[idx(i, j)] = 1.35;
+        dev[idx(i - 1, j)] = 0.8;
+        dev[idx(i + 1, j)] = 0.8;
+        const { x, z } = cellCenter(i, j);
+        const house: SpawnRecord = { kind: 'house', x, z, rot: 0, id: 1 };
+        // Grace-only: strandedSince is set, fadingSince is not — the record is NOT visually
+        // fading/animating, it's just silently sitting out its 60s grace window.
+        sim.restore(dev, [house], [{ id: 1, stranded: 10 }]);
+
+        const upgradedIds: number[] = [];
+        bus.on('growth:upgrade', (e) => upgradedIds.push(e.id));
+        sim.update(1 / 60);
+
+        // Documented choice (see describe-block comment above): grace-only records are also
+        // skipped for upgrade purposes, even though they aren't animating — simpler single rule.
+        expect(upgradedIds).toEqual([]);
+        expect(sim.spawned.find((r) => r.id === 1)?.kind).toBe('house');
+      });
     });
   });
 

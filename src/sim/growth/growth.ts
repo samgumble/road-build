@@ -686,6 +686,24 @@ export class GrowthSim {
    * neighbors yet is re-checked next tick rather than every frame forever — actually: only marked
    * once an upgrade actually happens, or once no house record exists in the cell to upgrade at all
    * (nothing to upgrade — mirrors a spawnMask bit meaning "handled", not "eligible").
+   *
+   * Groundwork batch-review Finding 1 (Critical): target selection used to match ANY house record
+   * in the cell, including one already mid-corridor-clearing (`clearingSince`) or mid-stranded-fade
+   * (`fadingSince`) — both states where the record is actively animating out and moments from being
+   * removed by `updateClearing`/`updateStrandedDecay`. Upgrading it first would fire
+   * `growth:upgrade` (mutating `kind` to 'building' in place) for a record that's about to vanish
+   * regardless, which is visually nonsensical and races the two lifecycle pipelines over the same
+   * id. Fix: skip any candidate house whose id is in `clearingSince` OR `fadingSince` — matching
+   * `updateStrandedDecay`'s own guard against racing `clearingSince` (see there). A grace-only
+   * record (`strandedSince` set, not yet fading) is deliberately included in this same skip too —
+   * simpler as one rule ("any decay timer in flight blocks upgrade") than special-casing "grace is
+   * fine, fade/clearing is not," even though a grace-only record isn't visually animating yet.
+   *
+   * When the only matching house is skipped for this reason, `upgradedCell[idx]` is deliberately
+   * NOT marked — this is a transient state (the record will either be rescued, becoming eligible
+   * again, or removed, which resets `upgradedCell[idx]` back to 0 via `removeRecordAt` anyway), so
+   * leaving the cell un-marked just re-checks it next tick, mirroring the "not enough developed
+   * neighbors yet" early-return just above it.
    */
   private tryUpgrade(i: number, j: number, idx: number): void {
     const neighbors: Array<[number, number]> = [
@@ -699,14 +717,20 @@ export class GrowthSim {
     if (developedNeighbors < HOUSE_UPGRADE_MIN_NEIGHBORS) return; // not yet — recheck next tick
 
     let target: SpawnRecord | null = null;
+    let targetSkippedForDecay = false;
     for (const r of this.records) {
       if (r.kind !== 'house') continue;
       const c = cellOf(r.x, r.z);
-      if (c.i === i && c.j === j) {
-        target = r;
-        break;
+      if (c.i !== i || c.j !== j) continue;
+      if (this.clearingSince.has(r.id) || this.fadingSince.has(r.id) || this.strandedSince.has(r.id)) {
+        targetSkippedForDecay = true; // Finding 1: mid-clearing/mid-fade/mid-grace — not eligible
+        continue;
       }
+      target = r;
+      break;
     }
+
+    if (targetSkippedForDecay && !target) return; // recheck next tick — nothing to mark handled
 
     this.upgradedCell[idx] = 1; // handled either way — no house here means nothing to upgrade, ever
     if (!target) return;
