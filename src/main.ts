@@ -180,7 +180,10 @@ function main(): void {
   const loop = new Loop(
     (dt) => {
       buildQueue.update(dt);
-      traffic.update(dt);
+      // Task 32: commute pulse reads Atmosphere's timeOfDay (render-side state) but the sim itself
+      // stays a pure function of its inputs — same dt/timeOfDay sequence always yields the same
+      // result.
+      traffic.update(dt, atmosphere.timeOfDay);
       growth.update(dt);
 
       populationTimer += dt;
