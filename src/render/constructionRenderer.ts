@@ -2933,10 +2933,16 @@ export class ConstructionRenderer {
       // Audio cue: a soft scrape one-shot tied to grader passes (deliverable 6). Emitting a DOM
       // CustomEvent rather than threading a new EventBus contract through both files keeps the sim's
       // event surface (core/events.ts) untouched for a purely cosmetic audio tie-in — ambient.ts
-      // listens for it directly (see AmbientAudio's constructor).
-      window.dispatchEvent(new CustomEvent('construction:graderScrape', {
-        detail: { x: slot.grader.curPos.x },
-      }));
+      // listens for it directly (see AmbientAudio's constructor). Guarded (Task 36 finding): this
+      // is the one spot in the whole class that reaches for a browser global directly, which threw
+      // in a plain Node test environment (no `window`) the moment a test started driving
+      // `ConstructionRenderer.update()` directly (previously nothing exercised this file outside a
+      // real browser) — harmless no-op fallback everywhere `window` isn't defined.
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('construction:graderScrape', {
+          detail: { x: slot.grader.curPos.x },
+        }));
+      }
     }
   }
 
