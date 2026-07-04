@@ -45,6 +45,12 @@ export class CameraRig {
   // Task 29: active touch pointers (pointerType === 'touch' only), keyed by pointerId. Mouse/pen
   // input never enters this map, so every desktop path above is completely unaffected.
   private touches = new Map<number, { x: number; y: number }>();
+  // Task 29 fix (review finding 1): the two pointerIds currently driving the gesture. Tracked
+  // explicitly (rather than inferring "still 2 fingers down") so a pointer-membership change
+  // (e.g. A+B -> +C (ignored, size 3) -> -A (size 2, but now B+C) can be detected and rebaselined
+  // instead of computing deltas against a stale A+B baseline, which produced a one-frame camera
+  // snap.
+  private gesturePair: [number, number] | null = null;
   private twoFingerLastCenter: { x: number; y: number } | null = null;
   private twoFingerLastDist = 0;
   private twoFingerLastAngle = 0;
@@ -78,11 +84,12 @@ export class CameraRig {
       // drawing/demolish). Track every touch pointer here purely to recognize a *second* finger
       // landing, which starts a two-finger camera gesture and cedes control away from DrawTool.
       if (e.pointerType === 'touch') {
+        const wasBelowTwo = this.touches.size < 2;
         this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
-        if (this.touches.size === 2) {
+        if (this.touches.size >= 2) {
           el.setPointerCapture(e.pointerId);
-          this.beginTwoFingerGesture();
-          this.onTwoFingerStart?.();
+          if (wasBelowTwo) this.onTwoFingerStart?.();
+          this.syncGesturePair();
         }
         return;
       }
@@ -130,7 +137,7 @@ export class CameraRig {
       if (e.pointerType === 'touch') {
         this.touches.delete(e.pointerId);
         if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
-        if (this.touches.size < 2) this.twoFingerLastCenter = null;
+        this.syncGesturePair();
         return;
       }
 
@@ -142,7 +149,7 @@ export class CameraRig {
     const onPointerCancel = (e: PointerEvent) => {
       if (e.pointerType !== 'touch') return;
       this.touches.delete(e.pointerId);
-      this.twoFingerLastCenter = null;
+      this.syncGesturePair();
     };
 
     const onWheel = (e: WheelEvent) => {
@@ -223,20 +230,52 @@ export class CameraRig {
    * buttons. `this.touches` only ever contains `pointerType === 'touch'` entries (see onPointerDown
    * above), so this never runs for mouse/pen input.
    */
-  private twoFingerPoints(): [{ x: number; y: number }, { x: number; y: number }] {
-    const pts = [...this.touches.values()];
-    return [pts[0], pts[1]];
+  private twoFingerPoints(): [{ x: number; y: number }, { x: number; y: number }] | null {
+    if (!this.gesturePair) return null;
+    const a = this.touches.get(this.gesturePair[0]);
+    const b = this.touches.get(this.gesturePair[1]);
+    if (!a || !b) return null;
+    return [a, b];
+  }
+
+  /**
+   * Review fix (finding 1): recompute which two pointerIds should drive the gesture — the first
+   * two touches in Map insertion order, matching the old `twoFingerPoints()` behavior — every time
+   * a touch pointer goes down/up/cancels. If fewer than two touches remain, clear the pair and
+   * baseline entirely (as before). If two-or-more remain but the *driving pair's membership*
+   * changed (e.g. A+B -> +C, then -A leaves B+C, which never matched the old A+B baseline), force
+   * a rebaseline instead of letting `updateTwoFingerGesture` compute deltas against stale
+   * center/dist/angle — that mismatch was the one-frame camera snap this fix addresses.
+   */
+  private syncGesturePair(): void {
+    if (this.touches.size < 2) {
+      this.gesturePair = null;
+      this.twoFingerLastCenter = null;
+      return;
+    }
+    const ids = [...this.touches.keys()];
+    const newPair: [number, number] = [ids[0], ids[1]];
+    const changed =
+      !this.gesturePair ||
+      this.gesturePair[0] !== newPair[0] ||
+      this.gesturePair[1] !== newPair[1];
+    this.gesturePair = newPair;
+    if (changed) this.beginTwoFingerGesture();
   }
 
   private beginTwoFingerGesture(): void {
-    const [a, b] = this.twoFingerPoints();
+    const pts = this.twoFingerPoints();
+    if (!pts) return;
+    const [a, b] = pts;
     this.twoFingerLastCenter = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
     this.twoFingerLastDist = Math.hypot(b.x - a.x, b.y - a.y);
     this.twoFingerLastAngle = Math.atan2(b.y - a.y, b.x - a.x);
   }
 
   private updateTwoFingerGesture(): void {
-    const [a, b] = this.twoFingerPoints();
+    const pts = this.twoFingerPoints();
+    if (!pts) return;
+    const [a, b] = pts;
     const center = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
     const dist = Math.hypot(b.x - a.x, b.y - a.y);
     const angle = Math.atan2(b.y - a.y, b.x - a.x);
@@ -261,9 +300,15 @@ export class CameraRig {
     }
 
     // Twist: change in the finger-pair's angle drives azimuth orbit, mirroring RMB drag's yaw.
-    let deltaAngle = angle - this.twoFingerLastAngle;
-    deltaAngle = Math.atan2(Math.sin(deltaAngle), Math.cos(deltaAngle));
-    this.goalAzimuth -= deltaAngle * TWIST_ORBIT_SENSITIVITY;
+    // Review fix (finding 2): guard against near-coincident fingers on *either* frame (current or
+    // last) — if either sample's distance is unstable, atan2's angle becomes noisy and produces
+    // unstable azimuth jumps, so skip applying the twist delta that frame (still updates the
+    // baseline below so the next frame measures a real delta rather than compounding a skip).
+    if (this.twoFingerLastDist >= 1e-3 && dist >= 1e-3) {
+      let deltaAngle = angle - this.twoFingerLastAngle;
+      deltaAngle = Math.atan2(Math.sin(deltaAngle), Math.cos(deltaAngle));
+      this.goalAzimuth -= deltaAngle * TWIST_ORBIT_SENSITIVITY;
+    }
 
     this.twoFingerLastCenter = center;
     this.twoFingerLastDist = dist;
