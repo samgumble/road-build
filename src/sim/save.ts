@@ -22,6 +22,10 @@ export interface SaveV1 {
   timeOfDay: number;
   edges: { ctrl: P2[]; stage: Stage }[];
   growth: { dev: number[]; spawned: SpawnRecord[] };
+  // Deliberately NOT here: ambient wilderness (Task 31, src/sim/growth/wilderness.ts) — it's
+  // derived worldgen state regenerated deterministically from `seed` on every boot, and its
+  // cleared-by-construction subset re-derives from the restored road graph's replayed
+  // `construction:stage` events, so it needs no save slot at all.
 }
 
 /** Minimal shape `serialize` needs from the live world. */

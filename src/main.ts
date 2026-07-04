@@ -14,6 +14,7 @@ import { ConstructionRenderer } from './render/constructionRenderer';
 import { TrafficSim } from './sim/traffic/traffic';
 import { CarRenderer } from './render/carRenderer';
 import { GrowthSim } from './sim/growth/growth';
+import { generateWilderness, WildernessSim } from './sim/growth/wilderness';
 import { SceneryRenderer } from './render/sceneryRenderer';
 import { Atmosphere } from './render/atmosphere';
 import { Hud, randomSeed } from './ui/hud';
@@ -136,6 +137,17 @@ function main(): void {
   const growth = new GrowthSim(graph, hf, bus, createRng('growth-' + hf.seed));
   const sceneryRenderer = new SceneryRenderer(scene, hf, bus);
 
+  // Task 31: ambient wilderness — sparse seeded trees scattered across the island, generated
+  // deterministically from the same seed as the Heightfield. Unlike GrowthSim's road-driven
+  // spawns, this is derived worldgen state: NOT part of the save file (see save.ts's doc comment
+  // on SaveV1), regenerated identically every boot. WildernessSim is constructed here (before any
+  // `restoreWorld` call below) so that if a save exists, restoreWorld's replayed
+  // `construction:stage` events for already-graded+ edges are seen by this sim too, re-deriving
+  // the correct cleared set purely from the restored road graph rather than needing its own save
+  // slot.
+  const wildernessSites = generateWilderness(hf, 'wilderness-' + hf.seed);
+  const wildernessSim = new WildernessSim(wildernessSites, bus, graph);
+
   const cameraRig = new CameraRig(camera, canvas);
 
   const atmosphere = new Atmosphere(scene, sun, hemi, renderer, bus, createRng('atmosphere-' + hf.seed));
@@ -220,6 +232,14 @@ function main(): void {
   } catch {
     // Corrupt localStorage entry or storage unavailable — proceed with the freshly generated world.
   }
+
+  // Task 31: place wilderness AFTER any restore above — `sceneryRenderer.rebuild()` (restore path)
+  // zeroes every tree/house/building InstancedMesh's count and re-places only the saved growth
+  // records, so placing wilderness any earlier would just get wiped out by that reset. Using
+  // `wildernessSim.active` (rather than the raw `wildernessSites`) means a restored world's
+  // already-cleared corridor trees never render as placed-then-immediately-faded — they're simply
+  // never placed, matching a fresh boot exactly.
+  sceneryRenderer.setWilderness(wildernessSim.active);
 
   const hud = new Hud({
     bus,

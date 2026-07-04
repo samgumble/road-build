@@ -4,11 +4,20 @@ import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js
 import type { Heightfield } from '../sim/terrain/heightfield';
 import { EventBus } from '../core/events';
 import type { GrowthKind, SpawnRecord } from '../sim/growth/growth';
+import type { WildernessTree } from '../sim/growth/wilderness';
 import { easeOutBack, clamp01 } from './easing';
 
 const POP_IN_DURATION = 0.8; // seconds, easeOutBack scale 0 -> 1
+// Task 31: fade-out duration for wilderness trees cleared by road construction.
+const WILDERNESS_FADE_DURATION = 1.5;
+// u — small jitter spreading multiple trees within one wilderness site (mirrors GrowthSim's own
+// JITTER constant for road-grown trees) so a 2-3 tree site doesn't read as perfectly stacked.
+const WILDERNESS_TREE_JITTER = 2.2;
 
-const TREE_CAPACITY = 4000;
+// Task 31: raised from 4000 to make room for several hundred wilderness sites (1-3 trees each,
+// several hundred to ~1200 trees) on top of GrowthSim's own road-driven tree spawns sharing the
+// same InstancedMesh pool.
+const TREE_CAPACITY = 6000;
 const FIELD_CAPACITY = 600;
 const HOUSE_CAPACITY = 800;
 const BUILDING_CAPACITY = 300;
@@ -59,6 +68,14 @@ interface Instance {
 
 /** An instance currently animating pop-in scale 0 -> 1. */
 interface Animating {
+  instance: Instance;
+  elapsed: number;
+}
+
+/** An instance currently fading out scale 1 -> 0 (Task 31: wilderness trees cleared by road
+ * construction). Once elapsed reaches WILDERNESS_FADE_DURATION the instance is parked off-screen
+ * (InstancedMesh has no per-slot removal, so "deleting" a middle slot just means hiding it). */
+interface Fading {
   instance: Instance;
   elapsed: number;
 }
@@ -152,6 +169,7 @@ export class SceneryRenderer {
 
   private instances: Instance[] = [];
   private animating: Animating[] = [];
+  private fading: Fading[] = [];
 
   // spawn events that arrive before their category's variants have finished loading are queued
   // and flushed once that category becomes ready. Minor 7: `animate` is carried alongside each
@@ -159,6 +177,12 @@ export class SceneryRenderer {
   // wasn't ready yet still gets placed with no pop-in once its variants load — matching every
   // other already-ready category in that same restore.
   private pendingSpawns: { rec: SpawnRecord; animate: boolean }[] = [];
+
+  // Task 31: wilderness sites queued if `setWilderness` is called before tree variants finish
+  // loading (mirrors pendingSpawns above). Each site's placed instances are recorded by site
+  // index so a later `wilderness:cleared` notification can find and fade exactly those instances.
+  private pendingWilderness: WildernessTree[] | null = null;
+  private wildernessInstancesBySite: Instance[][] = [];
 
   constructor(private scene: THREE.Scene, private hf: Heightfield, private bus: EventBus) {
     const fieldGeo = new THREE.PlaneGeometry(FIELD_SIZE, FIELD_SIZE);
@@ -194,12 +218,14 @@ export class SceneryRenderer {
 
     this.bus.on('growth:spawn', (e) => this.onSpawn(e));
     this.bus.on('atmosphere:phase', ({ night }) => this.onPhase(night));
+    this.bus.on('wilderness:cleared', (e) => this.onWildernessCleared(e.indices));
 
     this.loadGltfVariants('tree', TREE_FILES, TARGET_TREE_HEIGHT, TREE_CAPACITY, 2)
       .then((v) => {
         this.treeVariants = v;
         this.ready.tree = true;
         this.flushPending();
+        this.flushPendingWilderness();
       })
       .catch(() => {
         const perVariant = Math.floor(TREE_CAPACITY / 2);
@@ -210,6 +236,7 @@ export class SceneryRenderer {
         this.usingFallback.tree = true;
         this.ready.tree = true;
         this.flushPending();
+        this.flushPendingWilderness();
       });
 
     this.loadGltfVariants('house', HOUSE_FILES, TARGET_HOUSE_HEIGHT, HOUSE_CAPACITY, 1)
@@ -246,6 +273,13 @@ export class SceneryRenderer {
       house: this.usingFallback.house ? 'fallback' : 'gltf',
       building: this.usingFallback.building ? 'fallback' : 'gltf',
     };
+  }
+
+  /** Instance counts per tree variant mesh + total draw calls contributed by tree rendering
+   * (one draw call per InstancedMesh) — exposed for Task 31 verification/reporting. */
+  get treeStats(): { perVariant: number[]; total: number; drawCalls: number } {
+    const perVariant = this.treeVariants.map((v) => v.mesh.count);
+    return { perVariant, total: perVariant.reduce((a, b) => a + b, 0), drawCalls: this.treeVariants.length };
   }
 
   private async loadGltfVariants(
@@ -386,11 +420,14 @@ export class SceneryRenderer {
     return list[this.variantIndex(x, z, list.length)];
   }
 
-  private place(rec: SpawnRecord, animate: boolean): void {
+  /** Places one spawn record's instance(s) into the appropriate InstancedMesh(es). Returns the
+   * primary placed `Instance` (Task 31: needed so `setWilderness` can track per-site instances for
+   * later fade-out), or `null` if placement was skipped (over capacity / category not ready). */
+  private place(rec: SpawnRecord, animate: boolean): Instance | null {
     const y = this.hf.heightAt(rec.x, rec.z);
 
     if (rec.kind === 'field') {
-      if (this.fieldCount >= this.field.instanceMatrix.count) return;
+      if (this.fieldCount >= this.field.instanceMatrix.count) return null;
       const slot = this.fieldCount++;
       dummyPos.set(rec.x, y + 0.01, rec.z);
       dummyQuat.setFromAxisAngle(upAxis, rec.rot);
@@ -427,16 +464,16 @@ export class SceneryRenderer {
       const instance: Instance = { kind: rec.kind, variant: { mesh: this.field, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlot: null };
       this.instances.push(instance);
       if (animate) this.animating.push({ instance, elapsed: 0 });
-      return;
+      return instance;
     }
 
     const variant = this.pickVariant(rec.kind, rec.x, rec.z);
-    if (!variant) return; // category not ready yet and not queued (shouldn't happen; onSpawn queues first)
-    if (variant.mesh.instanceMatrix.count === 0) return;
+    if (!variant) return null; // category not ready yet and not queued (shouldn't happen; onSpawn queues first)
+    if (variant.mesh.instanceMatrix.count === 0) return null;
 
     // find next free slot in this variant (linear scan of variant's own instance count)
     const slot = this.countFor(variant);
-    if (slot >= variant.mesh.instanceMatrix.count) return; // over capacity, drop silently
+    if (slot >= variant.mesh.instanceMatrix.count) return null; // over capacity, drop silently
 
     let finalY = y;
     if (rec.kind === 'house' || rec.kind === 'building') {
@@ -474,6 +511,59 @@ export class SceneryRenderer {
     const instance: Instance = { kind: rec.kind, variant, slot, x: rec.x, y: finalY, z: rec.z, rot: rec.rot, windowSlot };
     this.instances.push(instance);
     if (animate) this.animating.push({ instance, elapsed: 0 });
+    return instance;
+  }
+
+  /**
+   * Places sparse ambient wilderness trees (Task 31) generated once at boot from the same seed as
+   * the Heightfield — rendered through the same tree InstancedMesh pool as GrowthSim's road-driven
+   * trees, but with NO pop-in (instant appearance, since this is a worldgen baseline, not a live
+   * spawn event) and tracked per-site so `wilderness:cleared` can later fade specific sites out.
+   * If tree variants aren't loaded yet, the call is queued and flushed once they are (mirrors
+   * `pendingSpawns`/`flushPending`).
+   */
+  setWilderness(sites: ReadonlyArray<WildernessTree>): void {
+    if (!this.ready.tree) {
+      this.pendingWilderness = sites.slice();
+      return;
+    }
+    this.placeWildernessSites(sites);
+  }
+
+  private placeWildernessSites(sites: ReadonlyArray<WildernessTree>): void {
+    for (const site of sites) {
+      const placed: Instance[] = [];
+      for (let k = 0; k < site.count; k++) {
+        // Deterministic per-tree offset (no RNG needed render-side: a small hash-free spread
+        // derived from the tree's index within the site keeps siblings from stacking exactly on
+        // top of one another, mirroring GrowthSim's own JITTER for road-grown tree clumps).
+        const angle = (k / site.count) * Math.PI * 2 + site.rot;
+        const r = k === 0 ? 0 : WILDERNESS_TREE_JITTER * (0.4 + 0.6 * ((k * 37) % 7) / 6);
+        const tx = site.x + Math.cos(angle) * r;
+        const tz = site.z + Math.sin(angle) * r;
+        const rot = site.rot + k * 2.399963; // golden-angle-ish spread so rotations don't repeat
+        const instance = this.place({ kind: 'tree', x: tx, z: tz, rot }, false);
+        if (instance) placed.push(instance);
+      }
+      this.wildernessInstancesBySite.push(placed);
+    }
+  }
+
+  private flushPendingWilderness(): void {
+    if (!this.pendingWilderness) return;
+    const sites = this.pendingWilderness;
+    this.pendingWilderness = null;
+    this.placeWildernessSites(sites);
+  }
+
+  /** Fades out every placed instance belonging to the given wilderness site indices over
+   * WILDERNESS_FADE_DURATION seconds (Task 31: road construction "clears" trees in its corridor). */
+  private onWildernessCleared(indices: number[]): void {
+    for (const siteIdx of indices) {
+      const placed = this.wildernessInstancesBySite[siteIdx];
+      if (!placed) continue;
+      for (const instance of placed) this.fading.push({ instance, elapsed: 0 });
+    }
   }
 
   /** Number of instances currently placed into `variant`'s InstancedMesh. */
@@ -505,21 +595,39 @@ export class SceneryRenderer {
   }
 
   update(dt: number): void {
-    if (!this.animating.length) return;
-    const stillAnimating: Animating[] = [];
-    for (const a of this.animating) {
-      a.elapsed += dt;
-      const t = clamp01(a.elapsed / POP_IN_DURATION);
-      const s = Math.max(0.001, easeOutBack(t));
-      dummyPos.set(a.instance.x, a.instance.y, a.instance.z);
-      dummyQuat.setFromAxisAngle(upAxis, a.instance.rot);
-      dummyScale.set(s, s, s);
-      dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
-      a.instance.variant.mesh.setMatrixAt(a.instance.slot, dummyMatrix);
-      a.instance.variant.mesh.instanceMatrix.needsUpdate = true;
-      if (t < 1) stillAnimating.push(a);
+    if (this.animating.length) {
+      const stillAnimating: Animating[] = [];
+      for (const a of this.animating) {
+        a.elapsed += dt;
+        const t = clamp01(a.elapsed / POP_IN_DURATION);
+        const s = Math.max(0.001, easeOutBack(t));
+        dummyPos.set(a.instance.x, a.instance.y, a.instance.z);
+        dummyQuat.setFromAxisAngle(upAxis, a.instance.rot);
+        dummyScale.set(s, s, s);
+        dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
+        a.instance.variant.mesh.setMatrixAt(a.instance.slot, dummyMatrix);
+        a.instance.variant.mesh.instanceMatrix.needsUpdate = true;
+        if (t < 1) stillAnimating.push(a);
+      }
+      this.animating = stillAnimating;
     }
-    this.animating = stillAnimating;
+
+    if (this.fading.length) {
+      const stillFading: Fading[] = [];
+      for (const f of this.fading) {
+        f.elapsed += dt;
+        const t = clamp01(f.elapsed / WILDERNESS_FADE_DURATION);
+        const s = Math.max(0.0001, 1 - t);
+        dummyPos.set(f.instance.x, f.instance.y, f.instance.z);
+        dummyQuat.setFromAxisAngle(upAxis, f.instance.rot);
+        dummyScale.set(s, s, s);
+        dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
+        f.instance.variant.mesh.setMatrixAt(f.instance.slot, dummyMatrix);
+        f.instance.variant.mesh.instanceMatrix.needsUpdate = true;
+        if (t < 1) stillFading.push(f);
+      }
+      this.fading = stillFading;
+    }
   }
 
   dispose(): void {

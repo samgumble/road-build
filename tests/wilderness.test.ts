@@ -188,4 +188,36 @@ describe('WildernessSim clearing', () => {
     expect(sim2.active.length).toBe(sim1.active.length);
     expect(sim2.active).toEqual(sim1.active);
   });
+
+  it('restore at a stage past graded (e.g. gravel/painted, as a real save.ts restore replays) still re-clears the corridor', () => {
+    // Regression: save.ts's restoreWorld force-sets edge.stage directly to whatever stage was
+    // saved (which may be well past 'graded' — e.g. 'gravel', 'paved', 'painted') and re-emits
+    // construction:stage with THAT stage, not a literal 'graded' event. A sim that only matched
+    // `stage === 'graded'` exactly would silently fail to re-clear on a road saved past grading.
+    for (const restoredStage of ['gravel', 'paved', 'painted'] as const) {
+      const bus = new EventBus();
+      const hf = new Heightfield('wild-restore-late', bus);
+      const graph = new RoadGraph(bus, makeSampler(hf));
+      let anchor = { x: 0, z: 0 };
+      outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+        if (hf.isLand(x, z) && hf.isLand(x + 64, z)) { anchor = { x, z }; break outer; }
+      const [edgeId] = graph.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+      const edge = graph.edges.get(edgeId)!;
+      const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+      const trees = [
+        { x: sample.x, z: sample.z, rot: 0, count: 1 }, // inside corridor
+        { x: anchor.x - 100, z: anchor.z - 100, rot: 0, count: 1 }, // far outside
+      ];
+      const sim = new WildernessSim(trees, bus, graph);
+      expect(sim.active.length).toBe(2);
+
+      // Mirror restoreWorld: force the stage directly, then emit construction:stage with that
+      // (possibly-past-graded) stage — never a literal 'graded' event for this edge.
+      edge.stage = restoredStage;
+      bus.emit('construction:stage', { edgeId, stage: restoredStage, crew: -1 });
+
+      expect(sim.active.length).toBe(1);
+      expect(sim.active[0].x).toBe(trees[1].x);
+    }
+  });
 });

@@ -3,6 +3,9 @@ import { RoadGraph } from '../roads/graph';
 import { EventBus } from '../../core/events';
 import { createRng } from '../../core/rng';
 import { WORLD_SIZE, ROAD_WIDTH } from '../../core/constants';
+import { STAGES } from '../../core/types';
+
+const GRADED_INDEX = STAGES.indexOf('graded');
 
 const HALF = WORLD_SIZE / 2;
 
@@ -132,7 +135,14 @@ export class WildernessSim {
   ) {
     this.cleared = new Array(trees.length).fill(false);
     this.bus.on('construction:stage', (e) => {
-      if (e.stage !== 'graded') return;
+      // A LIVE build always fires a discrete 'graded' transition exactly once as the excavator
+      // finishes that stage. But a RESTORED edge (save.ts's restoreWorld) force-sets `edge.stage`
+      // directly to whatever stage it was saved at and re-emits `construction:stage` with THAT
+      // stage — which may be 'gravel', 'paved', or 'painted' if the save happened well past
+      // grading, never a literal 'graded' event. Any of those stages implies grading already
+      // happened, so the corridor must still clear; 'removed' and 'surveyed' do not.
+      if (e.stage === 'removed') return;
+      if (STAGES.indexOf(e.stage) < GRADED_INDEX) return;
       this.clearCorridor(e.edgeId);
     });
   }
