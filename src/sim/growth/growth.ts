@@ -664,9 +664,16 @@ export class GrowthSim {
       const stranded = this.roadDist[idx] === -1;
 
       if (!stranded) {
-        // Safe again — cancel any in-flight timers for this record.
-        if (this.strandedSince.has(r.id)) this.strandedSince.delete(r.id);
-        if (this.fadingSince.has(r.id)) this.fadingSince.delete(r.id);
+        // Safe again — cancel any in-flight timers for this record. Critical 3 (Groundwork round
+        // fix wave): only emit `growth:rescued` when a timer was ACTUALLY in flight (grace or fade)
+        // — a record that was never stranded to begin with has nothing to rescue, and this branch
+        // runs every tick for every non-stranded record, so gating on "was there a timer" keeps this
+        // an edge-triggered event (fires once per rescue) rather than a per-tick spam.
+        const wasStranded = this.strandedSince.has(r.id);
+        const wasFading = this.fadingSince.has(r.id);
+        if (wasStranded) this.strandedSince.delete(r.id);
+        if (wasFading) this.fadingSince.delete(r.id);
+        if (wasStranded || wasFading) this.bus.emit('growth:rescued', { id: r.id });
         continue;
       }
 

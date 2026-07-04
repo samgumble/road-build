@@ -252,4 +252,77 @@ describe('TrafficSim', () => {
       expect(after.hits / after.total).toBeLessThan(uniformRate * 1.5);
     });
   });
+
+  // Important 4 (Groundwork round fix wave): TrafficSim's houses/buildings arrays previously
+  // populated ONLY from live `growth:spawn` events — nothing ever seeded them from a restored
+  // world's `growth.spawned` records, so every reload of a save with an established settlement
+  // reset traffic weighting back to uniform (as if no houses/buildings existed at all) until fresh
+  // ones grew again live. `traffic.restore(records)` mirrors the `growth:spawn` handler exactly,
+  // called once in main.ts right after `restoreWorld`.
+  describe('restore() seeds settlement weights from a restored world (Important 4)', () => {
+    it('weights spawn endpoints toward nodes near a restored settlement, without any live growth:spawn ever firing (statistical, seeded)', () => {
+      const { g, sim } = multiNodeWorld();
+      const nodesBefore = [...g.nodes.values()];
+      const targetNode = nodesBefore.reduce((a, b) => (b.z > a.z ? b : a));
+
+      // Mirrors a save's growth.spawned array — houses clustered near the target node — fed in via
+      // restore() only, exactly as main.ts does after restoreWorld. No growth:spawn is ever emitted.
+      const records = [];
+      for (let k = 0; k < 6; k++) {
+        records.push({
+          kind: 'house' as const,
+          x: targetNode.x + k * 0.5,
+          z: targetNode.z - 2 + k * 0.5,
+          rot: 0,
+          id: 100 + k,
+        });
+      }
+      sim.restore(records);
+      sim.update(2.1, 0.5); // apply the throttled recompute (mirrors T32's own pattern)
+
+      const targetNodeId = targetNode.id;
+      const nodeCount = g.nodes.size;
+      let hitsAtTarget = 0;
+      let totalDraws = 0;
+      for (let i = 0; i < 2000; i++) {
+        const picked = (sim as any).pickSpawnPair();
+        if (!picked) continue;
+        totalDraws++;
+        if (picked.from === targetNodeId || picked.to === targetNodeId) hitsAtTarget++;
+      }
+      expect(totalDraws).toBeGreaterThan(0);
+      const observedRate = hitsAtTarget / totalDraws;
+      const uniformRate = 2 / nodeCount;
+      expect(observedRate).toBeGreaterThan(uniformRate * 1.5);
+    });
+
+    it('restore() seeds both houses and buildings, keyed by id, so later growth:upgrade/growth:remove still work against restored records', () => {
+      const { bus, sim } = multiNodeWorld();
+      sim.restore([
+        { kind: 'house', x: 100, z: 100, rot: 0, id: 1 },
+        { kind: 'building', x: 50, z: 50, rot: 0, id: 2 },
+        { kind: 'tree', x: 10, z: 10, rot: 0, id: 3 }, // non-settlement kind — must be ignored
+        { kind: 'field', x: 20, z: 20, rot: 0, id: 4 }, // non-settlement kind — must be ignored
+      ]);
+      expect((sim as any).houses).toEqual([{ x: 100, z: 100, id: 1 }]);
+      expect((sim as any).buildings).toEqual([{ x: 50, z: 50, id: 2 }]);
+
+      // A restored house can still be upgraded/removed by id afterward, same as a live-spawned one.
+      bus.emit('growth:upgrade', { id: 1 });
+      expect((sim as any).houses).toEqual([]);
+      expect((sim as any).buildings).toEqual([{ x: 50, z: 50, id: 2 }, { x: 100, z: 100, id: 1 }]);
+
+      bus.emit('growth:remove', { id: 2 });
+      expect((sim as any).buildings).toEqual([{ x: 100, z: 100, id: 1 }]);
+    });
+
+    it('restore() replaces (not appends to) any pre-existing houses/buildings state', () => {
+      const { bus, sim } = multiNodeWorld();
+      bus.emit('growth:spawn', { kind: 'house', x: 1, z: 1, rot: 0, id: 900 });
+      expect((sim as any).houses.length).toBe(1);
+
+      sim.restore([{ kind: 'house', x: 2, z: 2, rot: 0, id: 901 }]);
+      expect((sim as any).houses).toEqual([{ x: 2, z: 2, id: 901 }]);
+    });
+  });
 });

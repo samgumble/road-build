@@ -622,6 +622,17 @@ export class BuildQueue {
    * doc / Task 36 report for that short-edge degenerate case), so `edge.stage`'s "last completed
    * stage" semantics (lanes/growth/wilderness reacting to 'painted' completion) are preserved
    * exactly as the sequential single-front walk always guaranteed.
+   *
+   * Minor 10 (Groundwork round fix wave): the spacing-gate reasoning above (`front[i].t` can never
+   * reach `edge.length` while `front[i-1]` is both not-done and less than `TRAIN_SPACING` ahead)
+   * implicitly assumes each `dt` this method is called with is bounded/consistent enough that a
+   * single tick's advance (`speed * dt`) can't leapfrog the entire `TRAIN_SPACING` gap in one step —
+   * true today because `Loop` (src/core/loop.ts) always calls sim `update()` (and therefore this
+   * method, transitively) with the fixed `SIM_DT` from src/core/constants.ts, never a variable
+   * wall-clock dt. If a future change ever fed this method a variable or much larger dt (e.g. a
+   * "catch up" step after a long pause, or a fixed-step change to a coarser SIM_DT), the ordering
+   * guarantee above would need re-deriving against `speed * dt` vs `TRAIN_SPACING`, not assumed to
+   * still hold for free.
    */
   private updateTrain(crew: number, job: ActiveJob, edge: RoadEdge, dt: number, night: boolean): void {
     const fronts = job.fronts!;

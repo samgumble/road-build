@@ -299,6 +299,20 @@ interface RestoreDeps {
  * `BuildQueue.update`'s grading pass in `src/sim/construction/queue.ts`) so reloading doesn't leave
  * ungraded terrain under an already-built road. Finally restores growth state and emits
  * `roads:changed` once so downstream systems (lane markings, growth road-distance field) recompute.
+ *
+ * Minor 8 (Groundwork round fix wave), an honest caveat: "restore reproduces the exact same world"
+ * is conditional, not absolute. `GrowthSim.rateMult` (this save format's `dev`/`spawned`/`decay`
+ * fields do NOT include it — see growth.ts) is a per-cell random multiplier rolled lazily from the
+ * sim's own seeded RNG the first time each cell starts accumulating development; a restored world
+ * re-rolls every cell's `rateMult` from scratch the next time that cell accumulates, drawing from
+ * wherever the RNG's stream happens to sit post-restore rather than reproducing the original roll.
+ * Separately, this composed world's overall determinism (same seed + same build sequence always
+ * produces the same result, exercised by growth.test.ts's "is deterministic" case) holds only for a
+ * given `timeOfDay`/`night` INPUT SEQUENCE fed into `growth.update`/`buildQueue.update` — those calls
+ * read render-side Atmosphere state (see main.ts's loop callback), so replaying a save under a
+ * different day/night cadence than the original session experienced (e.g. a different real-time
+ * play pace, or the "16x" speed control toggled at different moments) is not guaranteed to
+ * reproduce bit-identical results, even discounting the `rateMult` caveat above.
  */
 export function restoreWorld(save: SaveV3, deps: RestoreDeps): void {
   const { bus, hf, graph, growth, queue, quarry } = deps;
@@ -385,12 +399,24 @@ export function restoreWorld(save: SaveV3, deps: RestoreDeps): void {
     const [firstEdge] = graph.edges.values();
     if (firstEdge) {
       const placement = placeQuarry(hf, firstEdge.samples, save.seed);
-      if (placement) {
-        quarry.restore(placement);
-        bus.emit('quarry:placed', placement);
-      }
+      if (placement) quarry.restore(placement);
     }
   }
+
+  // Critical 1 (Groundwork round fix wave): emit `quarry:placed` once here, unconditionally,
+  // whenever a placement exists after the two paths above have had their chance to establish one —
+  // whether it was fed back silently via `quarry.restore(save.quarry)` at the very top of this
+  // function (the normal v2/v3 case) or just computed fresh above (the v1-migration case, which
+  // already emitted correctly before this fix). `ConstructionRenderer` (the quarry prop/pad +
+  // shuttle-truck routing) is always constructed BEFORE `restoreWorld` runs (see main.ts's boot
+  // order), so its constructor-time `quarry?.placement` check unavoidably sees `null` for every
+  // restore — the event is the ONLY way it (or anything else listening) can learn a quarry already
+  // exists. Previously this emit only happened on the v1-migration branch, so every v2/v3 save
+  // (the overwhelmingly common case — any save actually taken after Task 34 shipped) silently lost
+  // its quarry's prop/pad/shuttle-routing on every reload. Safe to emit even when nothing actually
+  // changed here (an already-visible prop just gets the same position/rotation re-applied — see
+  // `ConstructionRenderer.placeQuarryProp`, which is idempotent by construction).
+  if (quarry?.placement) bus.emit('quarry:placed', quarry.placement);
 
   // Final emit after all stages are forced: `commitChain` already fired `roads:changed` per edge,
   // but at that point each edge was still 'surveyed' (stage is forced afterward above), so growth's

@@ -3,6 +3,7 @@ import { EventBus } from '../../core/events';
 import { RoadGraph } from '../roads/graph';
 import { buildLaneGraph, findRoute } from '../roads/lanes';
 import type { Lane, LaneGraph } from '../roads/lanes';
+import type { SpawnRecord } from '../growth/growth';
 
 /** Fixed palette of 8 muted car tones, picked per-car by rng. */
 const COLOR_PALETTE: number[] = [
@@ -207,6 +208,34 @@ export class TrafficSim {
         this.weightRecomputePending = true;
       }
     });
+  }
+
+  /**
+   * Important 4 (Groundwork round fix wave): seeds `houses`/`buildings` from a restored world's
+   * `growth.spawned` records — mirrors the constructor's `growth:spawn` handler exactly (same
+   * kind/x/z/id extraction), just applied in bulk to records that already existed at save time
+   * rather than arriving one at a time via live events. Without this, `houses`/`buildings` only
+   * ever grew via that live event, so reloading a save with an established settlement reset traffic
+   * weighting back to uniform (as if nothing had ever been built) until fresh houses/buildings grew
+   * again in the newly-loaded world — a save/reload regression a player would read as "my town lost
+   * its traffic" even though the buildings themselves were all still there.
+   *
+   * Called once in main.ts right after `restoreWorld` (which is itself responsible for restoring
+   * `growth.spawned` in the first place — this method only reads that already-restored list, it
+   * doesn't touch GrowthSim at all). REPLACES (not appends to) any existing `houses`/`buildings`
+   * state, matching `rebuild()`'s "full rebuild from a saved list" semantics elsewhere in this
+   * codebase (see SceneryRenderer.rebuild) — there is no live traffic state worth preserving across
+   * a restore, since restore only ever happens once, at boot, before any live `growth:spawn` could
+   * have fired.
+   */
+  restore(spawned: ReadonlyArray<SpawnRecord>): void {
+    this.houses = [];
+    this.buildings = [];
+    for (const r of spawned) {
+      if (r.kind === 'house') this.houses.push({ x: r.x, z: r.z, id: r.id });
+      else if (r.kind === 'building') this.buildings.push({ x: r.x, z: r.z, id: r.id });
+    }
+    this.weightRecomputePending = true;
   }
 
   private onRoadsChanged(): void {

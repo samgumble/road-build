@@ -28,6 +28,16 @@ export interface GameEvents {
   // and cleared the owning cell's spawnMask bits (regrowth becomes possible once re-roaded).
   // Renderer frees the instance slot; houseCount already decremented sim-side for house records.
   'growth:remove': { id: number };
+  // Critical 3 (Groundwork round fix wave, additive): a record that was stranded (mid-grace OR
+  // mid-fade) became safe again — re-roaded before `growth:remove` ever fired. `updateStrandedDecay`
+  // cancels its own internal timers silently in this case (always did), but previously emitted
+  // NOTHING, so a renderer-side Fading entry already in flight (started by `growth:stranded`) had no
+  // way to know the sim gave up on removing it — it just kept easing to scale~0 and sat there
+  // forever once its local timer ran out, with no sim event ever arriving to free/reset it. Fired
+  // for BOTH directions of rescue: re-roaded during the grace window (renderer never even started a
+  // fade — a harmless no-op there) and re-roaded mid-fade (renderer must ease the instance back to
+  // full scale, not snap). See sceneryRenderer.ts's `onRescued`.
+  'growth:rescued': { id: number };
   'atmosphere:phase': { night: boolean };
   // Task 31: ambient wilderness clearing. `indices` are positions into the WildernessTree[] array
   // the renderer/sim were both constructed with (stable per tree for the life of the world).

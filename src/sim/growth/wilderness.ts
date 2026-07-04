@@ -147,14 +147,44 @@ export class WildernessSim {
     });
   }
 
-  /** Trees not yet cleared, in original index order (index into this list is stable per tree —
-   * matches the constructor's input array order, since `cleared` entries are simply skipped). */
+  /** Trees not yet cleared, COMPACTED into a fresh array — this list's own index position is NOT
+   * stable across the tree's lifetime: clearing site 5 out of [0,1,2,3,4,5,6] shifts every tree
+   * after it down by one in the array this getter returns. `wilderness:cleared`'s `indices` payload
+   * always refers to the ORIGINAL (constructor-order) index, which this compacted view does not
+   * preserve — a consumer that needs to correlate a later `wilderness:cleared` index against
+   * whatever it rendered from `active` (e.g. after a restore that pre-cleared >= 1 site) will
+   * misindex. Use `activeWithIndex` instead for anything that needs to stay correlated with
+   * `wilderness:cleared` (see `SceneryRenderer.setWilderness`, Critical 2 of the Groundwork round
+   * fix wave). Kept only for callers that truly don't care about later clears (there are none left
+   * in this codebase as of that fix, but the getter is harmless to keep for tests/diagnostics). */
   get active(): ReadonlyArray<WildernessTree> {
     const out: WildernessTree[] = [];
     for (let i = 0; i < this.trees.length; i++) if (!this.cleared[i]) out.push(this.trees[i]);
     return out;
   }
 
+  /** Trees not yet cleared, each paired with its ORIGINAL (constructor-order) index — the same
+   * index space `wilderness:cleared`'s `indices` payload uses. This is the correct source for
+   * anything that will later react to `wilderness:cleared` by index (Critical 2, Groundwork round
+   * fix wave): unlike `active`'s compacted array, an entry's `originalIndex` here never shifts as
+   * other sites clear, so a renderer seeded from this list (even one seeded AFTER some sites were
+   * already cleared, e.g. by a restored save) stays correctly correlated with every subsequent
+   * live clear. */
+  get activeWithIndex(): ReadonlyArray<{ tree: WildernessTree; originalIndex: number }> {
+    const out: { tree: WildernessTree; originalIndex: number }[] = [];
+    for (let i = 0; i < this.trees.length; i++) {
+      if (!this.cleared[i]) out.push({ tree: this.trees[i], originalIndex: i });
+    }
+    return out;
+  }
+
+  /** Minor 9 (Groundwork round fix wave, accepted design): clearing is one-directional. Once a
+   * tree's index is marked `cleared`, nothing in this class ever un-marks it — demolishing the road
+   * that cleared a corridor (edge stage walked back down to 'removed'/'surveyed') does NOT bring
+   * its wilderness trees back. This is deliberate, not an oversight: wilderness is sparse, one-time
+   * worldgen dressing rather than a resource meant to be farmed by build/demolish cycles, and
+   * regrowing it would need tracking each tree's clearing edge and re-validating against whatever
+   * else may have since built over that ground — real complexity for a look nobody asked for. */
   private clearCorridor(edgeId: number): void {
     const edge = this.graph.edges.get(edgeId);
     if (!edge) return;

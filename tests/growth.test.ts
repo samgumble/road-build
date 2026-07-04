@@ -408,6 +408,78 @@ describe('GrowthSim', () => {
       expect(removedIds).toEqual([]);
     });
 
+    // Critical 3 (Groundwork round fix wave): `updateStrandedDecay` cancelling a record's grace/fade
+    // timer on re-road used to emit nothing at all — the renderer had no way to know a rescue
+    // happened. These cover both directions a rescue can happen: still in the grace window (no fade
+    // ever started) and mid-fade (`growth:stranded` already fired, renderer's Fading entry is live).
+    describe('rescue emits growth:rescued (Critical 3)', () => {
+      it('emits growth:rescued when re-roaded during the grace window (before any fade starts)', () => {
+        const { bus, sim, g, farSpot } = roadedWorld('rescue-during-grace');
+        const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+        sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
+        sim.update(3);
+
+        const strandedIds: number[] = [];
+        const rescuedIds: number[] = [];
+        bus.on('growth:stranded', (e) => strandedIds.push(e.id));
+        bus.on('growth:rescued', (e) => rescuedIds.push(e.id));
+
+        // Only partway into the 60s grace — never crosses into 'stranded'/fade.
+        for (let k = 0; k < 60 * 20; k++) sim.update(1 / 60);
+        expect(strandedIds).toEqual([]);
+        expect(rescuedIds).toEqual([]);
+
+        // Re-road right next to it before the grace elapses.
+        g.commitChain([farSpot, { x: farSpot.x + 32, z: farSpot.z }]);
+        for (const e of g.edges.values()) e.stage = 'painted';
+        bus.emit('roads:changed', {});
+        for (let k = 0; k < 60 * 30; k++) sim.update(1 / 60); // let the recompute throttle open + settle
+
+        expect(strandedIds).toEqual([]); // never actually reached the stranded/fade phase
+        expect(rescuedIds).toEqual([1]); // but the grace timer WAS cancelled — must be reported
+      });
+
+      it('emits growth:rescued when re-roaded mid-fade (after growth:stranded already fired)', () => {
+        const { bus, sim, g, farSpot } = roadedWorld('rescue-during-fade');
+        const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+        sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
+        sim.update(3);
+
+        const strandedIds: number[] = [];
+        const rescuedIds: number[] = [];
+        const removedIds: number[] = [];
+        bus.on('growth:stranded', (e) => strandedIds.push(e.id));
+        bus.on('growth:rescued', (e) => rescuedIds.push(e.id));
+        bus.on('growth:remove', (e) => removedIds.push(e.id));
+
+        // Cross the grace period so it's mid-fade (mirrors the existing "cancels the grace/fade
+        // timers" test above).
+        for (let k = 0; k < 60 * 65; k++) sim.update(1 / 60);
+        expect(strandedIds).toEqual([1]);
+        expect(rescuedIds).toEqual([]);
+
+        g.commitChain([farSpot, { x: farSpot.x + 32, z: farSpot.z }]);
+        for (const e of g.edges.values()) e.stage = 'painted';
+        bus.emit('roads:changed', {});
+        for (let k = 0; k < 60 * 30; k++) sim.update(1 / 60);
+
+        expect(rescuedIds).toEqual([1]);
+        expect(removedIds).toEqual([]); // rescued before its fade ever completed
+      });
+
+      it('does not emit growth:rescued for a record that was simply never stranded', () => {
+        const { bus, sim, anchor } = roadedWorld('rescue-never-stranded');
+        const house: SpawnRecord = { kind: 'house', x: anchor.x, z: anchor.z, rot: 0, id: 1 };
+        sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
+        sim.update(3);
+
+        let rescuedCount = 0;
+        bus.on('growth:rescued', () => { rescuedCount++; });
+        for (let k = 0; k < 60 * 65; k++) sim.update(1 / 60); // well past the 60s grace, never stranded
+        expect(rescuedCount).toBe(0);
+      });
+    });
+
     it('clears the cell spawnMask on removal, allowing regrowth after re-roading', () => {
       const { bus, sim, farSpot } = roadedWorld('stranded-regrowth');
       const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };

@@ -133,7 +133,21 @@ describe('save/load', () => {
       expect(save.quarry).toBeNull();
     });
 
-    it('restoring does not re-place or re-emit quarry:placed for an already-saved quarry', () => {
+    // Critical 1 (Groundwork round fix wave): this test previously asserted that restoring a v2/v3
+    // save with an already-known quarry placement emits NO `quarry:placed` event at all. That
+    // enshrined a real bug: `ConstructionRenderer` (which draws the quarry prop/pad and steers
+    // shuttle trucks toward it) is constructed in main.ts BEFORE `restoreWorld` runs, and only picks
+    // up an already-known placement two ways — its constructor's `quarry?.placement` check (dead by
+    // definition here, since the renderer is built first) or the `quarry:placed` event. The OTHER
+    // migration path (v1 save, no `quarry` field at all — see the "a v1 save... migrates forward"
+    // test below) DOES emit on restore, which is why only migrated v1 saves ever actually showed the
+    // quarry after reload; every v2/v3 save silently lost it. The fix: restoreWorld now emits
+    // `quarry:placed` unconditionally whenever a placement exists after restore (freshly computed OR
+    // fed back via `quarry.restore()`), and `placeQuarryProp` is idempotent (re-applying the same
+    // placement is a harmless no-op), so re-emitting on an already-known placement is safe. See
+    // restoreRender.test.ts's "restored quarry renders its prop" test for the renderer-level
+    // regression coverage this fix actually targets.
+    it('restoring an already-saved quarry (still) re-emits quarry:placed so a renderer built before restoreWorld picks it up', () => {
       const w = freshWorld('quarry-restore-noemit');
       const anchor = findAnchor(w.hf, 64);
       w.graph.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
@@ -143,11 +157,13 @@ describe('save/load', () => {
 
       const w2 = freshWorld('quarry-restore-noemit');
       let placedCount = 0;
-      w2.bus.on('quarry:placed', () => { placedCount++; });
+      let lastPlacement: unknown = null;
+      w2.bus.on('quarry:placed', (e) => { placedCount++; lastPlacement = e; });
       restoreWorld(save, w2);
 
       expect(w2.quarry.placement).toEqual(placement);
-      expect(placedCount).toBe(0); // restore() seeds silently, no duplicate event
+      expect(placedCount).toBe(1); // emitted so a pre-constructed renderer learns of the restored quarry
+      expect(lastPlacement).toEqual(placement);
     });
 
     it('a v1 save (no quarry field) migrates forward: deserialize succeeds, and restoring with an existing road places a quarry deterministically', () => {

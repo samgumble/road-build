@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import * as THREE from 'three';
 import { RoadRenderer, STAGE_COLOR } from '../src/render/roadRenderer';
+import { ConstructionRenderer } from '../src/render/constructionRenderer';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { Heightfield } from '../src/sim/terrain/heightfield';
 import { GrowthSim } from '../src/sim/growth/growth';
@@ -119,5 +120,35 @@ describe('restoreWorld render sync', () => {
     for (const mesh of pylonMeshes) {
       expect(mesh.scale.y).toBeCloseTo(1, 2);
     }
+  });
+
+  // Critical 1 (Groundwork round fix wave): restoring a v2/v3 save with an already-placed quarry
+  // used to leave `ConstructionRenderer`'s quarry prop invisible and shuttle trucks routing toward
+  // the map edge instead of the landmark, because `restoreWorld` fed the placement into `QuarrySim`
+  // via `quarry.restore()` (no event) and `ConstructionRenderer` is always constructed BEFORE
+  // `restoreWorld` runs (see main.ts) — so its constructor-time `quarry?.placement` check saw `null`
+  // and it never got a `quarry:placed` event either. Only a save that predated the quarry feature
+  // (v1 migration) happened to work, because THAT path (restoreWorld's separate "compute fresh"
+  // branch) does emit. This test builds the renderer BEFORE calling restoreWorld — mirroring
+  // main.ts's real construction order — and asserts the prop is actually visible/positioned after
+  // restore, plus that the shuttle-facing `quarryPosition` getter is populated.
+  it('restored quarry renders its prop and is visible to shuttle routing, even though the renderer predates restoreWorld', () => {
+    const w1 = buildWorld('restore-quarry-test');
+    const anchor = { x: 0, z: 0 };
+    w1.graph.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+    expect(w1.quarry.placement).not.toBeNull();
+    const placement = w1.quarry.placement!;
+    const json = serialize({ seed: 'restore-quarry-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth, quarry: w1.quarry });
+    const save = deserialize(json)!;
+
+    // Fresh world, and — matching main.ts's real boot order — construct the renderer BEFORE
+    // restoreWorld runs, so it can only learn of the restored quarry via the event path.
+    const w2 = buildWorld('restore-quarry-test');
+    const constructionRenderer = new ConstructionRenderer(w2.scene, w2.bus, w2.graph, w2.hf, w2.renderer, w2.quarry);
+
+    restoreWorld(save, { bus: w2.bus, hf: w2.hf, graph: w2.graph, growth: w2.growth, quarry: w2.quarry });
+
+    expect(w2.quarry.placement).toEqual(placement);
+    expect(constructionRenderer.quarryPosition).toEqual({ x: placement.x, z: placement.z });
   });
 });
