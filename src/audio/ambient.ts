@@ -42,6 +42,19 @@ const MUSIC_BASE_URL = 'music/';
 const TRACK_CROSSFADE = 6; // seconds, equal-power crossfade between outgoing/incoming tracks
 const TRACK_GAP_MIN = 30; // seconds of silence between one track ending and the next starting
 const TRACK_GAP_MAX = 90;
+// Groundwork batch-review Finding 2: a per-load watchdog so a track that never fires
+// canplaythrough/error (a stalled fetch — e.g. a connection that hangs rather than cleanly
+// erroring) doesn't wedge `phase` in 'loading' forever, which would otherwise both play nothing
+// AND (if a previous track had already set the sticky `loadedAny` flag) keep the pad fallback
+// gated off — permanent silence with no fallback either. 20s is generously past any realistic
+// load time for these small ambient files, so it never fires under normal conditions.
+const TRACK_LOAD_WATCHDOG_MS = 20000;
+// Groundwork batch-review Finding 2: after this many consecutive full rotations through every
+// track with zero successful plays, stop retrying for the rest of the session rather than
+// hammering a 2s retry loop forever (e.g. fully offline, or the whole music/ directory 404ing) —
+// the pad fallback keeps covering for it regardless (hasLoadedTrack() stays false, same as it
+// always would in an all-failed scenario), so nothing is lost by giving up the retry loop itself.
+const MUSIC_MAX_FAILED_CYCLES = 2;
 const TRACK_LOAD_DELAY_MIN = 3; // seconds after the qualifying gesture before we even start fetching
 const TRACK_LOAD_DELAY_MAX = 6;
 const TRACK_GAIN = 0.9; // per-track element gain (tracks are already mixed/mastered; this just
@@ -1278,6 +1291,19 @@ class MusicPlayer {
    * `ended` event (which would clip the outgoing tail with no gap for the fade). */
   private crossfadeAt: number | null = null;
   private endedFallbackAt: number | null = null; // safety net if duration never resolves
+  /** Groundwork batch-review Finding 2(c): set once by `dispose()`, checked at the top of every
+   * callback that could otherwise re-arm playback (load watchdog, canplaythrough/error listeners,
+   * the `el.play()` rejection handler, and the gap timer) — a disposed player must never start a
+   * new load, crossfade, or schedule another retry/gap timer, even if one of those callbacks was
+   * already in flight (e.g. a network response arriving) at the moment `dispose()` ran. */
+  private disposed = false;
+  /** Groundwork batch-review Finding 2(b): consecutive PLAYNEXT ATTEMPTS (not tracks — see
+   * `beginLoading`/`playNext`) that have failed since the last successful play, used to detect
+   * "every track in the rotation has failed MUSIC_MAX_FAILED_CYCLES times in a row" without
+   * tracking per-track state — simply counting attempts and dividing by rotation length is
+   * equivalent since `playNext` always advances `orderIdx` first. Reset to 0 on any success. */
+  private consecutiveFailures = 0;
+  private watchdogTimer: ReturnType<typeof window.setTimeout> | null = null;
 
   constructor(private ctx: AudioContext, private destination: AudioNode) {
     this.slots = [this.makeSlot(), this.makeSlot()];
@@ -1335,9 +1361,24 @@ class MusicPlayer {
    * respecting the gap) rather than surfacing an error or retrying the same file in a hot loop.
    * "Inactive slot" on the very first call (before anything has ever played) is just `slots[1]` —
    * both slots start silent, so either would do, but staying consistent with the later
-   * always-the-other-one rule keeps this simple. */
+   * always-the-other-one rule keeps this simple.
+   *
+   * Groundwork batch-review Finding 2: guarded at the top by `disposed` (2c) and by
+   * `consecutiveFailures` having already crossed `MUSIC_MAX_FAILED_CYCLES` full rotations (2b) —
+   * either stops the rotation outright rather than looping forever. A per-load watchdog timer (2a)
+   * treats a load that never fires `canplaythrough`/`error` (a stalled fetch) as a failure via the
+   * exact same `onFailure` path, so `phase` can never wedge in 'loading' indefinitely.
+   */
   private playNext(): void {
+    if (this.disposed) return;
     if (MUSIC_TRACKS.length === 0) return;
+    if (this.consecutiveFailures >= MUSIC_MAX_FAILED_CYCLES * MUSIC_TRACKS.length) {
+      // Finding 2(b): given up retrying for the session — the pad fallback (hasLoadedTrack() is
+      // false in this all-failed scenario, same as it always would be) keeps covering for it.
+      this.phase = 'idle';
+      return;
+    }
+
     const nextSlotIdx = this.activeSlot === 0 ? 1 : 0;
     const slot = this.slots[nextSlotIdx];
     const track = this.currentTrack();
@@ -1347,23 +1388,38 @@ class MusicPlayer {
     const el = slot.el;
 
     const onFailure = () => {
+      if (this.disposed) return;
       cleanup();
+      this.consecutiveFailures++;
       // Skip this track; try the next one after a short beat rather than hammering the network in
-      // a tight loop if e.g. the whole music/ directory 404s.
+      // a tight loop if e.g. the whole music/ directory 404s. playNext()'s own guard above is what
+      // actually stops the loop once MUSIC_MAX_FAILED_CYCLES rotations have all failed.
       this.phase = 'idle';
       this.gapTimer = window.setTimeout(() => this.playNext(), 2000);
     };
     const onReady = () => {
+      if (this.disposed) return;
       cleanup();
+      this.consecutiveFailures = 0;
       this.fadeInSlot(nextSlotIdx);
     };
     const cleanup = () => {
       el.removeEventListener('canplaythrough', onReady);
       el.removeEventListener('error', onFailure);
+      if (this.watchdogTimer !== null) {
+        window.clearTimeout(this.watchdogTimer);
+        this.watchdogTimer = null;
+      }
     };
 
     el.addEventListener('canplaythrough', onReady, { once: true });
     el.addEventListener('error', onFailure, { once: true });
+    // Finding 2(a): a stalled load (neither event ever fires) would otherwise wedge `phase` in
+    // 'loading' forever — treat a timeout exactly like a load failure via the same onFailure path.
+    this.watchdogTimer = window.setTimeout(() => {
+      this.watchdogTimer = null;
+      onFailure();
+    }, TRACK_LOAD_WATCHDOG_MS);
     el.preload = 'auto';
     el.src = MUSIC_BASE_URL + track.file;
     el.load();
@@ -1380,8 +1436,12 @@ class MusicPlayer {
     const playResult = incoming.el.play();
     if (playResult && typeof playResult.catch === 'function') {
       playResult.catch(() => {
+        // Groundwork batch-review Finding 2(c): this promise settles asynchronously and can resolve
+        // after dispose() has already torn the player down — never re-arm a retry in that case.
+        if (this.disposed) return;
         // Autoplay/decoding rejection this late (post-gesture, post-delay) is rare but not
         // impossible (e.g. a mid-session permission change) — treat exactly like a load failure.
+        this.consecutiveFailures++;
         this.phase = 'idle';
         this.gapTimer = window.setTimeout(() => this.playNext(), 2000);
       });
@@ -1409,6 +1469,10 @@ class MusicPlayer {
     }
 
     window.setTimeout(() => {
+      // Finding 2(c): dispose() already pauses/clears both slots synchronously — avoid touching
+      // them again here (and avoid resurrecting `phase` out of dispose()'s terminal state) if this
+      // timer fires after teardown.
+      if (this.disposed) return;
       outgoing.el.pause();
       outgoing.el.removeAttribute('src');
       outgoing.el.load();
@@ -1439,6 +1503,7 @@ class MusicPlayer {
    * crossfade ever having been scheduled (duration never resolved, e.g. a `loadedmetadata` that
    * never fired), so a track can't loop forever silently rather than rotating. */
   update(): void {
+    if (this.disposed) return; // Finding 2(c): a disposed player must never schedule a new gap/retry
     if (this.phase !== 'playing') return;
     const now = performance.now();
     if (this.crossfadeAt !== null && now >= this.crossfadeAt) {
@@ -1459,11 +1524,21 @@ class MusicPlayer {
     this.gapTimer = window.setTimeout(() => this.playNext(), gap);
   }
 
-  /** Cancels any pending gap/retry timer and pauses both slots — mirrors AmbientAudio's own
-   * dispose() pattern. Called from AmbientAudio.dispose() when tearing down the whole audio system. */
+  /** Cancels any pending gap/retry/watchdog timer and pauses both slots — mirrors AmbientAudio's
+   * own dispose() pattern. Called from AmbientAudio.dispose() when tearing down the whole audio
+   * system.
+   *
+   * Groundwork batch-review Finding 2(c): sets `disposed` FIRST, before touching timers/elements —
+   * every other method in this class checks `disposed` at its own top, so once this flag flips, no
+   * in-flight callback (a load's canplaythrough/error, the load watchdog, a play() rejection, a gap
+   * timer, or update()'s own polling) can re-arm playback or schedule another timer, even if one of
+   * those callbacks was already queued (e.g. a network response landing) at the moment this ran. */
   dispose(): void {
+    this.disposed = true;
     if (this.gapTimer !== null) window.clearTimeout(this.gapTimer);
     this.gapTimer = null;
+    if (this.watchdogTimer !== null) window.clearTimeout(this.watchdogTimer);
+    this.watchdogTimer = null;
     for (const slot of this.slots) {
       slot.el.pause();
       slot.el.removeAttribute('src');

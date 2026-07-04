@@ -890,14 +890,25 @@ export class SceneryRenderer {
    * `STRANDED_FADE_DURATION` and no sink (demolition, not gradual abandonment) — `Fading.duration`
    * is already per-instance (not a hardcoded constant read elsewhere), so no renderer machinery
    * needs to change to support a second, shorter fade duration living alongside the slow one.
-   * Cancels any in-flight pop-in the same way `onStranded` does, and — unlike `onStranded` — never
-   * needs to consult an in-flight `Recovering` entry: a freshly-placed instance can't be mid-rescue
-   * recovery the moment its road corridor clears it (corridor clearing and stranded-decay are
-   * mutually exclusive per-record in the sim, see GrowthSim's own guard in `updateStrandedDecay`). */
+   * Cancels any in-flight pop-in the same way `onStranded` does.
+   *
+   * Groundwork batch-review Finding 3: the sim's `clearingSince`/`strandedSince`/`fadingSince` being
+   * mutually exclusive per-record (GrowthSim's guard in `updateStrandedDecay`) does NOT mean the
+   * renderer's own `recovering` list can never overlap a fresh clearing fade — `recovering` tracks a
+   * SEPARATE, renderer-only ease-back timeline (`RESCUE_RECOVERY_DURATION`) that outlives the sim's
+   * own instant rescue: a record can be rescued (sim clears its stranded timers immediately, this
+   * renderer starts easing back to full scale over ~1s), and THEN have a road corridor reach it and
+   * clear it — via a totally independent code path — before that recovery ease has finished. Without
+   * evicting the stale `recovering` entry here, `update()`'s two per-frame loops (`fading` then
+   * `recovering`) would both write this instance's matrix every frame, with `recovering`'s write
+   * (which runs after `fading`'s) winning — visually snapping the instance back toward full
+   * scale/zero sink instead of clearing, even though `fading` is also live for it. Mirrors how
+   * `GrowthSim.clearCorridor` evicts `strandedSince`/`fadingSince` sim-side the same way. */
   private onCleared(id: number): void {
     const instance = this.byId.get(id);
     if (!instance) return;
     this.animating = this.animating.filter((a) => a.instance !== instance);
+    this.recovering = this.recovering.filter((r) => r.instance !== instance);
     this.fading.push({
       instance,
       elapsed: 0,

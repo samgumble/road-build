@@ -466,5 +466,45 @@ describe('SceneryRenderer decay/upgrade (Task 35)', () => {
       expect(sr.isFading(id)).toBe(false);
       bus.emit('growth:remove', { id });
     });
+
+    // Groundwork batch-review Finding 3: a growth:cleared record used to leave a stale `recovering`
+    // entry alive if it arrived while the renderer was still easing a rescued instance back to full
+    // scale (RESCUE_RECOVERY_DURATION ~1s) — the sim's clearing/stranded-decay pipelines are mutually
+    // exclusive, but the renderer's own `recovering` animation outlives the sim's instant rescue, so
+    // a road corridor reaching a just-rescued record within that ~1s window could still race it.
+    // Without evicting `recovering` in `onCleared`, update()'s recovering loop (which runs AFTER the
+    // fading loop, each frame) would overwrite the clearing fade's transform with the recovery's,
+    // visually snapping the instance back toward full scale/zero sink instead of clearing.
+    it('rescue-then-clear within the recovery window evicts the stale recovering entry, clearing fade wins', () => {
+      const id = freshId();
+      spawn(bus, 'tree', 9320, 9320, id);
+      bus.emit('growth:stranded', { id });
+      sr.update(15); // 15s into the 30s stranded fade -> scale ~0.5
+      const fadeScaleAtRescue = sr.scaleOf(id)!;
+      expect(fadeScaleAtRescue).toBeCloseTo(0.5, 1);
+
+      bus.emit('growth:rescued', { id });
+      expect(sr.isRecovering(id)).toBe(true);
+      expect(sr.isFading(id)).toBe(false);
+
+      // A road corridor reaches this record and clears it well within the ~1s recovery window.
+      bus.emit('growth:cleared', { id });
+      expect(sr.isRecovering(id)).toBe(false); // stale recovering entry evicted
+      expect(sr.isFading(id)).toBe(true); // clearing's own fade now owns this instance
+
+      // Advance well past the recovery ease's own duration (~1s) but still mid the quick ~1.5s
+      // clearing fade — if the stale recovering entry had NOT been evicted, its per-frame write
+      // would win (it runs after fading's in update()) and this would read back near full scale
+      // instead of continuing to shrink toward 0.
+      sr.update(0.9);
+      expect(sr.isRecovering(id)).toBe(false);
+      expect(sr.isFading(id)).toBe(true);
+      const scaleMidClear = sr.scaleOf(id)!;
+      expect(scaleMidClear).toBeLessThan(0.5); // still clearing, not snapped back toward full scale
+
+      sr.update(1); // past the quick ~1.5s clearing fade entirely
+      expect(sr.isFading(id)).toBe(false);
+      bus.emit('growth:remove', { id });
+    });
   });
 });
