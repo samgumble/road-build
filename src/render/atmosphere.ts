@@ -3,6 +3,7 @@ import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js
 import { EventBus } from '../core/events';
 import { DAY_LENGTH, WORLD_SIZE } from '../core/constants';
 import { clamp01 } from './easing';
+import { Sky } from './sky';
 
 /** A single keyframe stop, at a given point in the 0..1 day cycle. */
 interface Stop {
@@ -103,6 +104,8 @@ export class Atmosphere {
   private wasNight: boolean;
   private baseFogNear: number;
   private baseFogFar: number;
+  private sky: Sky;
+  private sunDirScratch = new THREE.Vector3();
 
   constructor(
     private scene: THREE.Scene,
@@ -118,6 +121,11 @@ export class Atmosphere {
 
     this.wasNight = sunElevation(this.timeOfDay) < -NIGHT_HYSTERESIS;
 
+    this.sky = new Sky(this.scene);
+    // The dome fully replaces scene.background visually (it's drawn behind everything at the far
+    // plane), but we keep scene.background set too — it's what THREE uses as the fallback/clear
+    // color and what fog math implicitly assumes matches the horizon, so leaving it in sync costs
+    // nothing and avoids any edge-case flash before the dome's first frame.
     this.buildClouds();
 
     const rainGeom = new THREE.BufferGeometry();
@@ -333,6 +341,16 @@ export class Atmosphere {
     // part of the night still has enough ambient skyglow to read terrain silhouettes, without
     // raising the daytime end (keeps day/night contrast, i.e. the "mood", intact).
     this.hemi.intensity = THREE.MathUtils.lerp(0.24, 0.55, elevation01);
+
+    // Sky dome consumes the same horizon color driving fog/background, plus the sun's true
+    // (unclamped-y) direction for its disc/glow — using the un-clamped elevationRaw for the disc's
+    // own height keeps the sun visually setting below the horizon rather than parking at y=20.
+    this.sunDirScratch.set(
+      Math.cos(azimuth) * radius,
+      elevationRaw * radius,
+      Math.sin(azimuth) * radius,
+    );
+    this.sky.update(skyColor, this.sunDirScratch, elevationRaw);
   }
 
   private applyExposure(dt: number): void {

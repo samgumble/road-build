@@ -19,6 +19,8 @@ import { Atmosphere } from './render/atmosphere';
 import { Hud, randomSeed } from './ui/hud';
 import { serialize, deserialize, restoreWorld } from './sim/save';
 import { AmbientAudio } from './audio/ambient';
+import { QUALITY } from './render/quality';
+import { createPostFx } from './render/postfx';
 
 // Important 3: saves used to live under one shared key (`groundwork-save`), so visiting with a
 // different `?seed=` would silently ignore that seed's own progress (deserialize's seed mismatch
@@ -101,7 +103,14 @@ function main(): void {
     return;
   }
 
-  const { renderer, scene, camera, sun, hemi } = rig;
+  const { renderer, scene, camera, sun, hemi, onResize } = rig;
+
+  // Task 28: high tier runs an EffectComposer (bloom + vignette + OutputPass); low tier renders
+  // directly, same as before this task. `renderFrame` below is the single source of truth both
+  // the main loop and the HUD's on-demand redraw use, so the two paths can never drift apart.
+  const postFx = QUALITY === 'high' ? createPostFx(renderer, scene, camera) : null;
+  const renderFrame = () => (postFx ? postFx.render() : renderer.render(scene, camera));
+  onResize(() => postFx?.setSize(window.innerWidth, window.innerHeight));
 
   migrateLegacySave();
   const { seed } = resolveSeed();
@@ -178,7 +187,8 @@ function main(): void {
       // scheduling (bird/cricket timers, pad chord crossfades), not to advance the day cycle —
       // `timeOfDay` is read from `atmosphere.timeOfDay`, which is already correctly scaled above.
       audio.update(dt, atmosphere.timeOfDay, camera.position.x);
-      renderer.render(scene, camera);
+      terrain.update(dt);
+      renderFrame();
     },
   );
 
@@ -206,7 +216,7 @@ function main(): void {
     drawTool,
     loop,
     seed,
-    renderFrame: () => renderer.render(scene, camera),
+    renderFrame,
     canvas,
     audio,
     onNewWorld: (newSeed) => {
