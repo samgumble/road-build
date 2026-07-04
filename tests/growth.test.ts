@@ -434,5 +434,222 @@ describe('GrowthSim', () => {
       // (0.4 isn't exactly representable in float32).
       expect(sim.devLevels[cellIdx]).toBeLessThanOrEqual(0.4 + 1e-6);
     });
+
+    // Finding 1 (Task 35 follow-up "Groundwork"): a cell can hold multiple co-located records
+    // (e.g. tree + field + house, all placed near the same cell center). Removing ONE of them via
+    // stranded decay must clear only THAT record's own kind bit in spawnMask, not every bit for the
+    // cell — otherwise an unrelated kind (e.g. tree, whose threshold 0.22 is well below the 0.4 decay
+    // floor) silently re-arms and respawns even though its own record never left.
+    //
+    // Divergent per-record stranding timing isn't reachable through the public API (a cell's
+    // records all share the same `roadDist` cell, so any records present together always strand/
+    // grace/fade in lockstep, and `restore()` unconditionally clears every record's timer state on
+    // every call — verified by tracing `updateStrandedDecay`/`restore()` directly). Per the
+    // finding's documented fallback, this test instead constructs the genuinely distinguishing
+    // case: a cell whose spawnMask has tree+field+house bits set (mirroring a naturally-grown cell
+    // where all three thresholds were crossed) but only ONE backing record (house) actually
+    // exists — a perfectly legitimate real-world state, since e.g. a tree's bit can be set by dev
+    // crossing 0.22 without a tree record actually spawning (TREE_SPAWN_CHANCE thins ~60% of
+    // qualifying cells to keep woodland from reading as a hedge — see growth.ts). Removing the
+    // house (the only present record) via stranded decay must clear ONLY the house bit, leaving
+    // the tree/field bits (which own no record to remove) untouched — the blanket-clear bug would
+    // instead wipe all three, silently re-arming tree/field regrowth despite neither ever having a
+    // record to begin with.
+    it('removing one record clears only its own spawnMask bit, leaving unrelated recordless bits alone', () => {
+      const { bus, sim, farSpot } = roadedWorld('stranded-per-kind');
+      const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+      const ci = Math.round((farSpot.x + HALF) / CELL);
+      const cj = Math.round((farSpot.z + HALF) / CELL);
+      const cellIdx = cj * GRID_SIZE + ci;
+      // dev >= 0.75 (house threshold) sets tree+field+house bits via restore()'s spawnMask
+      // derivation, but only a house record is actually passed in — tree/field's bits are set with
+      // no backing record, a legitimate state per the doc comment above.
+      dev[cellIdx] = 0.8;
+      const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      sim.restore(dev, [house]);
+      sim.update(3);
+
+      const TREE_BIT = 1 << 0, FIELD_BIT = 1 << 1, HOUSE_BIT = 1 << 2;
+      expect(sim.spawnMaskAt(ci, cj) & (TREE_BIT | FIELD_BIT | HOUSE_BIT)).toBe(TREE_BIT | FIELD_BIT | HOUSE_BIT);
+
+      const removedIds: number[] = [];
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+      for (let k = 0; k < 60 * 91; k++) sim.update(1 / 60); // grace(60) + fade(30) + margin
+      expect(removedIds).toEqual([1]);
+
+      // The house bit must be cleared (its record is gone); tree/field bits — which never had a
+      // record — must remain set exactly as they were, NOT wiped by a blanket cell clear.
+      expect(sim.spawnMaskAt(ci, cj) & HOUSE_BIT).toBe(0);
+      expect(sim.spawnMaskAt(ci, cj) & TREE_BIT).toBe(TREE_BIT);
+      expect(sim.spawnMaskAt(ci, cj) & FIELD_BIT).toBe(FIELD_BIT);
+    });
+
+    // Finding 1, upgraded-record case: an upgraded record (house -> building, same id) that later
+    // gets stranded and removed must clear BOTH the house bit and the building bit — the house
+    // bit's original record is gone too (it became this same building record, not a separate
+    // still-present one), so leaving the house bit set would incorrectly block a future house from
+    // ever re-spawning at this cell once it redevelops.
+    it('removing an upgraded (former-house) building record clears both the house and building bits', () => {
+      const { bus, sim, farSpot } = roadedWorld('stranded-upgraded-bits');
+      const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+      const ci = Math.round((farSpot.x + HALF) / CELL);
+      const cj = Math.round((farSpot.z + HALF) / CELL);
+      const cellIdx = cj * GRID_SIZE + ci;
+      // dev=1.1 exceeds ALL four thresholds (tree/field/house/building), so `restore()` sets every
+      // bit — but only the building record is actually passed in (tree/field never had records
+      // here, same "recordless bit" legitimacy as the previous test). This also makes the case
+      // distinguishing: a blanket clear would wipe tree/field's bits too, not just house+building.
+      dev[cellIdx] = 1.1; // past the building threshold (1.05) — as if house upgraded to building
+      const building: SpawnRecord = { kind: 'building', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      sim.restore(dev, [building]);
+      sim.update(3);
+
+      const TREE_BIT = 1 << 0, FIELD_BIT = 1 << 1, HOUSE_BIT = 1 << 2, BUILDING_BIT = 1 << 3;
+      expect(sim.spawnMaskAt(ci, cj)).toBe(TREE_BIT | FIELD_BIT | HOUSE_BIT | BUILDING_BIT);
+
+      const removedIds: number[] = [];
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+      for (let k = 0; k < 60 * 91; k++) sim.update(1 / 60);
+      expect(removedIds).toEqual([1]);
+      // House + building bits clear (the upgraded record, and its former house stage, are both
+      // gone); tree/field bits — which never had a backing record — remain untouched.
+      expect(sim.spawnMaskAt(ci, cj) & (HOUSE_BIT | BUILDING_BIT)).toBe(0);
+      expect(sim.spawnMaskAt(ci, cj) & TREE_BIT).toBe(TREE_BIT);
+      expect(sim.spawnMaskAt(ci, cj) & FIELD_BIT).toBe(FIELD_BIT);
+    });
+  });
+
+  // Finding 2 (Task 35 follow-up "Groundwork"): grace/fade timelines must survive a save/reload —
+  // `decayState` exposes the current in-flight timers as sim-time-relative offsets, and
+  // `restore()`'s new (optional) `decay` param re-arms those timers so they CONTINUE rather than
+  // restart from zero.
+  describe('decay state persistence (Finding 2)', () => {
+    function findFarLandSpot(hf: Heightfield, anchor: { x: number; z: number }, minDist: number): { x: number; z: number } {
+      for (let x = -220; x <= 220; x += 8) {
+        for (let z = -220; z <= 220; z += 8) {
+          if (Math.hypot(x - anchor.x, z - anchor.z) < minDist) continue;
+          if (hf.isLand(x, z) && hf.isLand(x + 32, z)) return { x, z };
+        }
+      }
+      throw new Error('no far land spot found');
+    }
+
+    function roadedWorld(seedName: string) {
+      const bus = new EventBus();
+      const hf = new Heightfield(seedName, bus);
+      const g = new RoadGraph(bus, makeSampler(hf));
+      let anchor = { x: 0, z: 0 };
+      outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+        if (hf.isLand(x, z) && hf.isLand(x + 32, z)) { anchor = { x, z }; break outer; }
+      g.commitChain([anchor, { x: anchor.x + 32, z: anchor.z }]);
+      for (const e of g.edges.values()) e.stage = 'painted';
+      const sim = new GrowthSim(g, hf, bus, createRng(seedName));
+      bus.emit('roads:changed', {});
+      sim.update(3);
+      const farSpot = findFarLandSpot(hf, anchor, 40);
+      return { bus, sim, g, hf, anchor, farSpot };
+    }
+
+    it('decayState is empty with no in-flight timers', () => {
+      const { sim, anchor } = roadedWorld('decay-empty');
+      // Near the road (never stranded), unlike `farSpot` used by the other tests below.
+      const house: SpawnRecord = { kind: 'house', x: anchor.x, z: anchor.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
+      sim.update(3);
+      expect(sim.decayState).toEqual([]);
+    });
+
+    it('decayState reports a mid-grace record\'s elapsed offset', () => {
+      const { sim, farSpot } = roadedWorld('decay-midgrace');
+      const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
+      sim.update(3); // apply pending recompute -> record reads as stranded from here
+      for (let k = 0; k < 60 * 20; k++) sim.update(1 / 60); // 20s into the 60s grace
+      const state = sim.decayState;
+      expect(state.length).toBe(1);
+      expect(state[0].id).toBe(1);
+      expect(state[0].stranded).toBeCloseTo(20, 0);
+      expect(state[0].fading).toBeUndefined();
+    });
+
+    it('decayState reports a mid-fade record\'s elapsed offset', () => {
+      const { sim, farSpot } = roadedWorld('decay-midfade');
+      const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]);
+      sim.update(3);
+      for (let k = 0; k < 60 * 75; k++) sim.update(1 / 60); // past the 60s grace, 15s into the 30s fade
+      const state = sim.decayState;
+      expect(state.length).toBe(1);
+      expect(state[0].id).toBe(1);
+      expect(state[0].fading).toBeCloseTo(15, 0);
+      expect(state[0].stranded).toBeUndefined();
+    });
+
+    it('restoring with a saved mid-grace offset resumes the timeline: removal happens after the REMAINING grace+fade, not a full restart', () => {
+      const { bus, sim, farSpot } = roadedWorld('decay-resume-grace');
+      const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      // Simulate "saved 40s into the 60s grace period" directly via restore()'s decay param —
+      // mirrors what a real save/reload would reconstruct from `decayState` at save time. Uses a
+      // single small `update(1/60)` (not the usual `update(3)`) to apply the pending road-distance
+      // recompute, so the "3 elapsed sim-seconds" budgeting other tests use doesn't eat into this
+      // test's precisely-tracked remaining-grace math.
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house], [{ id: 1, stranded: 40 }]);
+      sim.update(1 / 60); // apply the pending recompute so this cell reads stranded (roadDist === -1)
+
+      const strandedIds: number[] = [];
+      const removedIds: number[] = [];
+      bus.on('growth:stranded', (e) => strandedIds.push(e.id));
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+
+      // Only ~20s remain of the 60s grace (40 already elapsed, minus the tick just above) — advance
+      // 19s, should not yet fire.
+      for (let k = 0; k < 60 * 19; k++) sim.update(1 / 60);
+      expect(strandedIds).toEqual([]);
+      // Cross the remaining ~1s of grace.
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+      expect(strandedIds).toEqual([1]);
+      expect(removedIds).toEqual([]);
+      // A FULL 60s grace (not the remaining ~20s) would NOT have elapsed yet at this point (only
+      // ~21s of sim-time has passed since restore) — proving the timeline resumed rather than
+      // restarted from zero.
+
+      // Now the 30s fade runs its full course from here.
+      for (let k = 0; k < 60 * 29; k++) sim.update(1 / 60);
+      expect(removedIds).toEqual([]);
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60);
+      expect(removedIds).toEqual([1]);
+    });
+
+    it('restoring with a saved mid-fade offset resumes the fade timeline and completes on schedule', () => {
+      const { bus, sim, farSpot } = roadedWorld('decay-resume-fade');
+      const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      // Saved 25s into the 30s fade — only 5s should remain.
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house], [{ id: 1, fading: 25 }]);
+      sim.update(1 / 60); // apply pending recompute — see the grace-offset test above for why 1/60
+
+      const removedIds: number[] = [];
+      bus.on('growth:remove', (e) => removedIds.push(e.id));
+
+      for (let k = 0; k < 60 * 4; k++) sim.update(1 / 60); // just under the remaining 5s
+      expect(removedIds).toEqual([]);
+      for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60); // cross it
+      expect(removedIds).toEqual([1]);
+    });
+
+    it('a decay entry referencing a dead/absent id is ignored defensively', () => {
+      const { sim, farSpot } = roadedWorld('decay-stale-id');
+      const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      expect(() =>
+        sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house], [{ id: 999, stranded: 10 }]),
+      ).not.toThrow();
+      expect(sim.decayState).toEqual([]);
+    });
+
+    it('restoring with no decay param (v1/v2 migration path) leaves empty decay maps', () => {
+      const { sim, farSpot } = roadedWorld('decay-no-param');
+      const house: SpawnRecord = { kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [house]); // no 3rd arg
+      expect(sim.decayState).toEqual([]);
+    });
   });
 });

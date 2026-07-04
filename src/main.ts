@@ -237,7 +237,10 @@ function main(): void {
       const save = deserialize(raw);
       if (save && save.seed === seed) {
         restoreWorld(save, { bus, hf, graph, growth, queue: buildQueue, quarry });
-        sceneryRenderer.rebuild(growth.spawned);
+        // Finding 2 (Task 35 follow-up "Groundwork"): pass along any records that were mid-fade at
+        // save time so `rebuild()` restores them at the correct partial-fade progress instead of
+        // popping back in at full scale with a freshly-restarted fade animation.
+        sceneryRenderer.rebuild(growth.spawned, growth.decayState);
         atmosphere.timeOfDay = save.timeOfDay;
         restoredRoads = save.edges.length > 0;
       }

@@ -130,6 +130,41 @@ const THRESHOLDS: Threshold[] = [
 // every neighbor check.
 const NEIGHBOR_DEVELOPED_DEV = THRESHOLDS[2].value;
 
+/** Groundwork (Task 35 follow-up) Finding 1: `updateStrandedDecay`'s removal branch used to zero
+ * a cell's ENTIRE spawnMask whenever any one record over that cell was removed, clearing every
+ * other co-located record's kind bit too even though only one record actually left. A cell can
+ * hold up to 4 co-located records (tree(s) + field + house/building all placed near the same cell
+ * center); their fates can diverge across re-road/re-strand cycles, and the stranded-decay target
+ * dev (0.4) sits above the tree threshold (0.22), so a blanket clear silently re-arms tree
+ * regrowth even when the tree record itself never left. Looks up the single bit a given record's
+ * `kind` owns in `spawnMask` — an upgraded record (kind 'building', but its cell's `spawnMask`
+ * still carries the 'house' bit from before the upgrade) clears BOTH bits, since the house-stage
+ * record is gone too (it became this same building record, not a separate one still present). */
+function bitsForKind(kind: GrowthKind): number {
+  if (kind === 'building') {
+    const buildingBit = THRESHOLDS.find((t) => t.kind === 'building')!.bit;
+    const houseBit = THRESHOLDS.find((t) => t.kind === 'house')!.bit;
+    return buildingBit | houseBit;
+  }
+  return THRESHOLDS.find((t) => t.kind === kind)!.bit;
+}
+
+/**
+ * Finding 2 (Task 35 follow-up "Groundwork"): a record's in-flight grace/fade timer, expressed as
+ * a sim-time OFFSET already elapsed (seconds into `STRANDED_GRACE_S` or `STRANDED_FADE_S`) rather
+ * than an absolute `simTime` — a fresh `GrowthSim` instance's `simTime` always starts at 0 on
+ * reload, so persisting an absolute timestamp would be meaningless (and would need to be adjusted
+ * by however long the save sat unloaded, which isn't tracked or desired: the fix here is "resume
+ * the same timeline", not "keep counting wall-clock time while the game was closed"). Exactly one
+ * of `stranded`/`fading` is present per entry — a record is never in both phases at once. Absent
+ * entirely for a record with no in-flight timer (the common case).
+ */
+export interface DecayEntry {
+  id: number;
+  stranded?: number; // seconds already elapsed into the STRANDED_GRACE_S grace period
+  fading?: number; // seconds already elapsed into the STRANDED_FADE_S fade
+}
+
 export interface SpawnRecord {
   kind: GrowthKind;
   x: number;
@@ -219,6 +254,26 @@ export class GrowthSim {
     return Array.from(this.dev);
   }
 
+  /** Test/diagnostic-only: the raw spawnMask bitfield for cell (i, j) — exposes per-kind bit
+   * state (Finding 1, Task 35 follow-up "Groundwork") so tests can directly verify that removing
+   * one co-located record's kind bit leaves sibling kinds' bits untouched, rather than inferring it
+   * indirectly through regrowth timing. Not used by any production code path. */
+  spawnMaskAt(i: number, j: number): number {
+    return this.spawnMask[cellIndex(i, j)];
+  }
+
+  /**
+   * Finding 2 (Task 35 follow-up "Groundwork"): read-only snapshot of every record currently
+   * mid-grace or mid-fade, as sim-time-relative offsets (see `DecayEntry`'s doc comment) — for save
+   * serialization. Order is not significant; only present for records with an in-flight timer.
+   */
+  get decayState(): DecayEntry[] {
+    const out: DecayEntry[] = [];
+    for (const [id, since] of this.strandedSince) out.push({ id, stranded: this.simTime - since });
+    for (const [id, since] of this.fadingSince) out.push({ id, fading: this.simTime - since });
+    return out;
+  }
+
   /**
    * Restores sim state from a save (Task 15): replaces the `dev` accumulator and replays the
    * `spawned` list directly into `records`/`houses`/`spawnMask` without re-emitting `growth:spawn`
@@ -226,8 +281,18 @@ export class GrowthSim {
    * `SceneryRenderer.rebuild()`, so scenery pops back in with no animation). Thresholds already
    * crossed by the restored `dev` level are marked in `spawnMask` so `update()` won't re-spawn them.
    * Triggers a road-distance recompute on the next `update()` since the graph was just rebuilt too.
+   *
+   * Finding 2 (Task 35 follow-up "Groundwork"): `decay` (optional, defaults to empty — v1/v2
+   * migrated saves and any caller predating this param have no decay state to restore) re-arms
+   * `strandedSince`/`fadingSince` from each entry's saved offset so an in-flight grace/fade
+   * timeline CONTINUES from where it was saved rather than restarting — `this.simTime` is always 0
+   * at the point `restore()` runs (a fresh `GrowthSim` instance, no `update()` calls yet), so
+   * `since = this.simTime - offset` yields a negative "since" that makes `updateStrandedDecay`'s
+   * `this.simTime - since >= THRESHOLD` checks land exactly `offset` seconds further along the
+   * timeline than a record that just became stranded. A record with no matching `decay` entry (the
+   * common case — not currently stranded) is simply left with no timer, same as before.
    */
-  restore(dev: ArrayLike<number>, spawned: ReadonlyArray<SpawnRecord>): void {
+  restore(dev: ArrayLike<number>, spawned: ReadonlyArray<SpawnRecord>, decay: ReadonlyArray<DecayEntry> = []): void {
     this.dev.set(dev);
     this.spawnMask.fill(0);
     this.upgradedCell.fill(0);
@@ -244,6 +309,16 @@ export class GrowthSim {
     });
     this.nextRecordId = Math.max(this.nextRecordId, maxId + 1);
     this.houses = this.records.filter((r) => r.kind === 'house').length;
+
+    const liveIds = new Set(this.records.map((r) => r.id));
+    for (const entry of decay) {
+      if (!liveIds.has(entry.id)) continue; // defend against a stale/corrupt save referencing a dead id
+      if (typeof entry.stranded === 'number' && Number.isFinite(entry.stranded)) {
+        this.strandedSince.set(entry.id, this.simTime - entry.stranded);
+      } else if (typeof entry.fading === 'number' && Number.isFinite(entry.fading)) {
+        this.fadingSince.set(entry.id, this.simTime - entry.fading);
+      }
+    }
 
     for (let j = 0; j < GRID_SIZE; j++) {
       for (let i = 0; i < GRID_SIZE; i++) {
@@ -621,7 +696,15 @@ export class GrowthSim {
       if (removed.kind === 'house') this.houses--;
       const { i, j } = cellOf(removed.x, removed.z);
       const idx = cellIndex(i, j);
-      this.spawnMask[idx] = 0;
+      // Finding 1: clear only the removed record's OWN kind bit(s) — see `bitsForKind`'s doc
+      // comment — not the whole cell's spawnMask, so any other co-located record (e.g. a tree or
+      // field sharing this cell) keeps its "already spawned" bit set and doesn't silently re-spawn
+      // just because an unrelated record here decayed away.
+      this.spawnMask[idx] &= ~bitsForKind(removed.kind);
+      // `upgradedCell` still resets unconditionally: it's cell-scoped bookkeeping for "has THIS
+      // cell already attempted its one upgrade check", not a per-record kind bit, and removing the
+      // (possibly-upgraded) record here means the cell is eligible to attempt an upgrade again from
+      // scratch once/if a new house record grows back.
       this.upgradedCell[idx] = 0;
       this.dev[idx] = Math.min(this.dev[idx], STRANDED_DEV_DECAY_TARGET);
       this.bus.emit('growth:remove', { id: removed.id });

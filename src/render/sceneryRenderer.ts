@@ -3,7 +3,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Heightfield } from '../sim/terrain/heightfield';
 import { EventBus } from '../core/events';
-import type { GrowthKind, SpawnRecord } from '../sim/growth/growth';
+import type { GrowthKind, SpawnRecord, DecayEntry } from '../sim/growth/growth';
 import type { WildernessTree } from '../sim/growth/wilderness';
 
 /** Minimal shape `place()` actually needs — a `SpawnRecord` satisfies this, but so does a
@@ -230,6 +230,15 @@ export class SceneryRenderer {
   private pendingWilderness: WildernessTree[] | null = null;
   private wildernessInstancesBySite: Instance[][] = [];
 
+  // Finding 2 (Task 35 follow-up "Groundwork"): id -> in-flight fade offset (seconds already
+  // elapsed into STRANDED_FADE_DURATION), set just before a `rebuild()` call and consulted by
+  // `place()` right after an instance is actually placed (whether immediately or later via
+  // `flushPending`, if that record's category was still loading at rebuild time) so a mid-fade
+  // record restores already partially faded — no pop-in, no fade restarting from scale 1. Cleared
+  // once consumed per-id; anything left unconsumed after a `rebuild()` call simply means no record
+  // with that id was actually placed (shouldn't happen for a well-formed save, but harmless).
+  private pendingFadeOffsets = new Map<number, number>();
+
   constructor(private scene: THREE.Scene, private hf: Heightfield, private bus: EventBus) {
     const fieldGeo = new THREE.PlaneGeometry(FIELD_SIZE, FIELD_SIZE);
     fieldGeo.rotateX(-Math.PI / 2);
@@ -362,6 +371,24 @@ export class SceneryRenderer {
       fieldStripeMeshCount: this.fieldStripe.count,
       windowMeshCount: this.windows.count,
     };
+  }
+
+  /** Test/diagnostic-only (Finding 2, Task 35 follow-up "Groundwork"): reads back the current
+   * scale factor baked into a live instance's matrix by `id` — lets tests verify `rebuild()`'s
+   * partial-fade restoration actually wrote a partially-scaled-down transform (rather than full
+   * scale 1) without needing a real WebGL render. Returns `null` if `id` has no live instance. */
+  scaleOf(id: number): number | null {
+    const instance = this.byId.get(id);
+    if (!instance) return null;
+    instance.variant.mesh.getMatrixAt(instance.slot, dummyMatrix);
+    dummyMatrix.decompose(dummyPos, dummyQuat, dummyScale);
+    return dummyScale.x;
+  }
+
+  /** Test/diagnostic-only: whether `id` is currently tracked in the `fading` list (Finding 2) —
+   * i.e. still actively animating toward removal, as opposed to a normal full-scale instance. */
+  isFading(id: number): boolean {
+    return this.fading.some((f) => f.instance.id === id);
   }
 
   private async loadGltfVariants(
@@ -566,6 +593,7 @@ export class SceneryRenderer {
       this.ownersFor(this.field)[slot] = instance;
       if (id !== null) this.byId.set(id, instance);
       if (animate) this.animating.push({ instance, elapsed: 0 });
+      if (id !== null) this.applyPendingFadeIfAny(instance, id);
       return instance;
     }
 
@@ -616,7 +644,24 @@ export class SceneryRenderer {
     if (windowSlot !== null) this.ownersFor(this.windows)[windowSlot] = instance;
     if (id !== null) this.byId.set(id, instance);
     if (animate) this.animating.push({ instance, elapsed: 0 });
+    if (id !== null) this.applyPendingFadeIfAny(instance, id);
     return instance;
+  }
+
+  /** Finding 2 (Task 35 follow-up "Groundwork"): if `id` has a pending rebuild-time fade offset
+   * (set by `rebuild()`, consumed here the moment the instance is actually placed — which may be
+   * later than `rebuild()` itself, via `flushPending`, if the category was still loading), starts
+   * a `Fading` entry pre-seeded with that elapsed time and immediately paints the instance at the
+   * correct partial-fade transform so it never renders at full scale even for one frame. Consumes
+   * (deletes) the offset so a later re-placement of the same id (shouldn't happen, but harmless)
+   * doesn't re-apply it. */
+  private applyPendingFadeIfAny(instance: Instance, id: number): void {
+    const offset = this.pendingFadeOffsets.get(id);
+    if (offset === undefined) return;
+    this.pendingFadeOffsets.delete(id);
+    const f: Fading = { instance, elapsed: offset, duration: STRANDED_FADE_DURATION, sink: STRANDED_SINK_DISTANCE };
+    this.applyFadeTransform(f);
+    this.fading.push(f);
   }
 
   /**
@@ -812,8 +857,18 @@ export class SceneryRenderer {
     this.windowMat.emissiveIntensity = night ? WINDOW_NIGHT_INTENSITY : WINDOW_DAY_INTENSITY;
   }
 
-  /** Rebuilds the whole scene from a saved `spawned` list with no pop-in animation (Task 15). */
-  rebuild(spawned: ReadonlyArray<SpawnRecord>): void {
+  /**
+   * Rebuilds the whole scene from a saved `spawned` list with no pop-in animation (Task 15).
+   *
+   * Finding 2 (Task 35 follow-up "Groundwork"): `decayState` (optional — omitted for the couple of
+   * call sites, if any, that don't have one handy) carries any records that were mid-fade at save
+   * time (see `GrowthSim.decayState`/`DecayEntry`); each such record is placed already scaled/sunk
+   * to the correct progress (no animation) and continues fading from that point via the normal
+   * `update()` loop, rather than popping back in at full scale with a freshly-restarted fade. A
+   * record that's merely mid-GRACE (not yet fading) needs no special rendering at all — it's
+   * visually identical to any other fully-present instance until `growth:stranded` actually fires.
+   */
+  rebuild(spawned: ReadonlyArray<SpawnRecord>, decayState: ReadonlyArray<DecayEntry> = []): void {
     this.instances = [];
     this.animating = [];
     this.fading = [];
@@ -829,10 +884,41 @@ export class SceneryRenderer {
     this.windows.count = 0;
     for (const v of [...this.treeVariants, ...this.houseVariants, ...this.buildingVariants]) v.mesh.count = 0;
 
+    this.pendingFadeOffsets.clear();
+    for (const d of decayState) {
+      if (typeof d.fading === 'number') this.pendingFadeOffsets.set(d.id, d.fading);
+    }
+
     for (const rec of spawned) {
       if (this.categoryReady(rec.kind)) this.place(rec, false, rec.id);
       else this.pendingSpawns.push({ rec, animate: false, id: rec.id }); // restored — no pop-in once ready
     }
+  }
+
+  /** Writes `f`'s current scale/sink/window transform for its elapsed time (Task 35's fade-out
+   * look: ease scale down to ~0 while sinking `f.sink` u), shared by `update()`'s per-frame
+   * animation loop and Finding 2's rebuild-time partial-fade application (which calls this once,
+   * synchronously, with `elapsed` pre-set to the saved offset, so a mid-fade restored instance
+   * renders at the correct progress on its very first frame — no pop, no restart). Returns the
+   * clamped progress `t` (0..1) so callers can decide whether the fade is complete. */
+  private applyFadeTransform(f: Fading): number {
+    const t = clamp01(f.elapsed / f.duration);
+    const s = Math.max(0.0001, 1 - t);
+    dummyPos.set(f.instance.x, f.instance.y - f.sink * t, f.instance.z);
+    dummyQuat.setFromAxisAngle(upAxis, f.instance.rot);
+    dummyScale.set(s, s, s);
+    dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
+    f.instance.variant.mesh.setMatrixAt(f.instance.slot, dummyMatrix);
+    f.instance.variant.mesh.instanceMatrix.needsUpdate = true;
+    if (f.instance.windowSlot !== null) {
+      // Task 35: a stranded house/building fades its window quad out too (scale to ~0) rather
+      // than leaving a lit window floating over a sunk, near-invisible husk.
+      dummyScale.set(s, s, s);
+      dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
+      this.windows.setMatrixAt(f.instance.windowSlot, dummyMatrix);
+      this.windows.instanceMatrix.needsUpdate = true;
+    }
+    return t;
   }
 
   update(dt: number): void {
@@ -857,22 +943,7 @@ export class SceneryRenderer {
       const stillFading: Fading[] = [];
       for (const f of this.fading) {
         f.elapsed += dt;
-        const t = clamp01(f.elapsed / f.duration);
-        const s = Math.max(0.0001, 1 - t);
-        dummyPos.set(f.instance.x, f.instance.y - f.sink * t, f.instance.z);
-        dummyQuat.setFromAxisAngle(upAxis, f.instance.rot);
-        dummyScale.set(s, s, s);
-        dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
-        f.instance.variant.mesh.setMatrixAt(f.instance.slot, dummyMatrix);
-        f.instance.variant.mesh.instanceMatrix.needsUpdate = true;
-        if (f.instance.windowSlot !== null) {
-          // Task 35: a stranded house/building fades its window quad out too (scale to ~0) rather
-          // than leaving a lit window floating over a sunk, near-invisible husk.
-          dummyScale.set(s, s, s);
-          dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
-          this.windows.setMatrixAt(f.instance.windowSlot, dummyMatrix);
-          this.windows.instanceMatrix.needsUpdate = true;
-        }
+        const t = this.applyFadeTransform(f);
         if (t < 1) stillFading.push(f);
         // t >= 1: the sim's own `growth:remove` (Task 35) or `wilderness:cleared`'s fade (Task 31,
         // never actually removed from the scene) governs whether the slot is freed — see

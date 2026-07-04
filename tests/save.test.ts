@@ -280,4 +280,162 @@ describe('save/load', () => {
       expect(w.growth.houseCount).toBe(1);
     });
   });
+
+  // Finding 2 (Task 35 follow-up "Groundwork"): stranded-decay grace/fade timelines must survive a
+  // save/reload rather than resetting — `growth.decay` persists in-flight timers as sim-time-
+  // relative offsets (see GrowthSim.decayState/DecayEntry).
+  describe('decay state persistence (Finding 2)', () => {
+    /** Land spot far enough from `anchor` (>MAX_ROAD_DIST_CELLS' ~24u) that a record placed there
+     * reads as stranded once the road-distance BFS runs, mirroring growth.test.ts's own helper. */
+    function findFarLandSpot(hf: Heightfield, anchor: { x: number; z: number }, minDist: number): { x: number; z: number } {
+      for (let x = -220; x <= 220; x += 8) {
+        for (let z = -220; z <= 220; z += 8) {
+          if (Math.hypot(x - anchor.x, z - anchor.z) < minDist) continue;
+          if (hf.isLand(x, z) && hf.isLand(x + 32, z)) return { x, z };
+        }
+      }
+      throw new Error('no far land spot found');
+    }
+
+    it('a save with no in-flight timers serializes an empty decay array', () => {
+      const w = freshWorld('decay-empty-save');
+      const anchor = findAnchor(w.hf, 32);
+      w.graph.commitChain([anchor, { x: anchor.x + 32, z: anchor.z }]);
+      for (const e of w.graph.edges.values()) e.stage = 'painted';
+      w.bus.emit('roads:changed', {});
+      for (let i = 0; i < 60 * 10; i++) w.growth.update(1 / 60);
+
+      const json = serialize({ seed: 'decay-empty-save', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry });
+      const save = deserialize(json)!;
+      expect(save.growth.decay).toEqual([]);
+    });
+
+    it('save mid-grace -> restore -> removal happens after the REMAINING grace+fade, not a full restart', () => {
+      const w = freshWorld('decay-save-midgrace');
+      const anchor = findAnchor(w.hf, 32);
+      w.graph.commitChain([anchor, { x: anchor.x + 32, z: anchor.z }]);
+      for (const e of w.graph.edges.values()) e.stage = 'painted';
+      w.bus.emit('roads:changed', {});
+      w.growth.update(3); // apply the throttled recompute
+
+      const farSpot = findFarLandSpot(w.hf, anchor, 40);
+      w.growth.restore(new Float32Array(w.growth.devLevels.length), [{ kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 }]);
+      w.growth.update(1 / 60); // apply pending recompute from restore() -> reads stranded
+      for (let i = 0; i < 60 * 40; i++) w.growth.update(1 / 60); // 40s into the 60s grace
+
+      const state = w.growth.decayState;
+      expect(state.length).toBe(1);
+      expect(state[0].stranded).toBeCloseTo(40, 0);
+
+      const json = serialize({ seed: 'decay-save-midgrace', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry });
+      const save = deserialize(json)!;
+      expect(save.growth.decay).toEqual([{ id: 1, stranded: expect.closeTo(40, 1) }]);
+
+      const w2 = freshWorld('decay-save-midgrace');
+      restoreWorld(save, w2);
+
+      const strandedIds: number[] = [];
+      const removedIds: number[] = [];
+      w2.bus.on('growth:stranded', (e) => strandedIds.push(e.id));
+      w2.bus.on('growth:remove', (e) => removedIds.push(e.id));
+
+      // Only ~20s of grace remain (40 already elapsed pre-save) — well under a full 60s from here.
+      for (let i = 0; i < 60 * 19; i++) w2.growth.update(1 / 60);
+      expect(strandedIds).toEqual([]);
+      for (let i = 0; i < 60 * 3; i++) w2.growth.update(1 / 60);
+      expect(strandedIds).toEqual([1]);
+      expect(removedIds).toEqual([]);
+
+      for (let i = 0; i < 60 * 32; i++) w2.growth.update(1 / 60); // the 30s fade
+      expect(removedIds).toEqual([1]);
+    });
+
+    it('save mid-fade -> restore -> renderer-observable fading map carries the correct remaining offset, and removal completes on schedule', () => {
+      const w = freshWorld('decay-save-midfade');
+      const anchor = findAnchor(w.hf, 32);
+      w.graph.commitChain([anchor, { x: anchor.x + 32, z: anchor.z }]);
+      for (const e of w.graph.edges.values()) e.stage = 'painted';
+      w.bus.emit('roads:changed', {});
+      w.growth.update(3);
+
+      const farSpot = findFarLandSpot(w.hf, anchor, 40);
+      w.growth.restore(new Float32Array(w.growth.devLevels.length), [{ kind: 'house', x: farSpot.x, z: farSpot.z, rot: 0, id: 1 }]);
+      w.growth.update(1 / 60);
+      for (let i = 0; i < 60 * 75; i++) w.growth.update(1 / 60); // past 60s grace, 15s into the 30s fade
+
+      const state = w.growth.decayState;
+      expect(state.length).toBe(1);
+      expect(state[0].fading).toBeCloseTo(15, 0);
+
+      const json = serialize({ seed: 'decay-save-midfade', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry });
+      const save = deserialize(json)!;
+      expect(save.growth.decay[0].fading).toBeCloseTo(15, 1);
+      expect(save.growth.decay[0].stranded).toBeUndefined();
+
+      const w2 = freshWorld('decay-save-midfade');
+      restoreWorld(save, w2);
+      // Restored sim's own decayState immediately reflects the resumed offset (the reliable,
+      // renderer-independent observable point for "resumed, not restarted" — SceneryRenderer's own
+      // partial-fade application on `rebuild()` is covered by tests/sceneryDecay.test.ts).
+      const restoredState = w2.growth.decayState;
+      expect(restoredState.length).toBe(1);
+      expect(restoredState[0].fading).toBeCloseTo(15, 0);
+
+      const removedIds: number[] = [];
+      w2.bus.on('growth:remove', (e) => removedIds.push(e.id));
+      for (let i = 0; i < 60 * 14; i++) w2.growth.update(1 / 60); // just under the remaining ~15s
+      expect(removedIds).toEqual([]);
+      for (let i = 0; i < 60 * 3; i++) w2.growth.update(1 / 60); // cross it
+      expect(removedIds).toEqual([1]);
+    });
+
+    it('migrating a v1/v2 save (no decay field) loads with an empty decay array', () => {
+      const v1Save = {
+        version: 1,
+        seed: 'decay-migration-v1',
+        timeOfDay: 0,
+        edges: [],
+        growth: { dev: [], spawned: [{ kind: 'tree', x: 1, z: 2, rot: 0 }] },
+      };
+      const save1 = deserialize(JSON.stringify(v1Save));
+      expect(save1).not.toBeNull();
+      expect(save1!.growth.decay).toEqual([]);
+
+      const v2Save = {
+        version: 2,
+        seed: 'decay-migration-v2',
+        timeOfDay: 0,
+        edges: [],
+        growth: { dev: [], spawned: [{ kind: 'tree', x: 1, z: 2, rot: 0 }] },
+        quarry: null,
+      };
+      const save2 = deserialize(JSON.stringify(v2Save));
+      expect(save2).not.toBeNull();
+      expect(save2!.growth.decay).toEqual([]);
+
+      // Restores cleanly into a live world with no in-flight timers.
+      const w = freshWorld('decay-migration-v1');
+      restoreWorld(save1!, w);
+      expect(w.growth.decayState).toEqual([]);
+    });
+
+    it('rejects a save with a malformed decay entry (both stranded and fading present)', () => {
+      const base = {
+        version: 3,
+        seed: 'decay-malformed',
+        timeOfDay: 0,
+        edges: [],
+        quarry: null,
+      };
+      expect(
+        deserialize(JSON.stringify({ ...base, growth: { dev: [], spawned: [], decay: [{ id: 1, stranded: 5, fading: 5 }] } })),
+      ).toBeNull();
+      expect(
+        deserialize(JSON.stringify({ ...base, growth: { dev: [], spawned: [], decay: [{ id: 1 }] } })),
+      ).toBeNull();
+      expect(
+        deserialize(JSON.stringify({ ...base, growth: { dev: [], spawned: [], decay: [{ stranded: 5 }] } })),
+      ).toBeNull();
+    });
+  });
 });

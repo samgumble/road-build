@@ -186,4 +186,61 @@ describe('SceneryRenderer decay/upgrade (Task 35)', () => {
     expect(finalStats.fieldStripeMeshCount).toBe(baseline.fieldStripeMeshCount);
     expect(finalStats.windowMeshCount).toBe(baseline.windowMeshCount);
   });
+
+  // Finding 2 (Task 35 follow-up "Groundwork"): rebuild() must apply partial fade for records that
+  // were mid-fade at save time — no animation, correct scale/sink for the saved offset — rather
+  // than popping them back in at full scale with a freshly-restarted fade.
+  describe('rebuild() partial-fade restoration (Finding 2)', () => {
+    it('a record with no decay entry rebuilds at full scale, not fading', () => {
+      const id = freshId();
+      sr.rebuild([{ kind: 'tree', x: 8000, z: 8000, rot: 0, id }]);
+      expect(sr.scaleOf(id)).toBeCloseTo(1, 3);
+      expect(sr.isFading(id)).toBe(false);
+      bus.emit('growth:remove', { id });
+    });
+
+    it('a record with a mid-fade decay entry rebuilds already partially scaled down, continuing to fade', () => {
+      const id = freshId();
+      // 15s into the 30s fade (STRANDED_FADE_DURATION) -> expected scale 1 - 15/30 = 0.5.
+      sr.rebuild([{ kind: 'house', x: 8010, z: 8010, rot: 0, id }], [{ id, fading: 15 }]);
+      const scale = sr.scaleOf(id);
+      expect(scale).not.toBeNull();
+      expect(scale!).toBeCloseTo(0.5, 1);
+      expect(sr.isFading(id)).toBe(true);
+
+      // Continues fading from that point — advancing the remaining ~15s completes it.
+      sr.update(16);
+      expect(sr.isFading(id)).toBe(false);
+      bus.emit('growth:remove', { id });
+    });
+
+    it('a record saved right at the very start of its fade (offset ~0) rebuilds at full scale but still tracked as fading', () => {
+      const id = freshId();
+      sr.rebuild([{ kind: 'tree', x: 8020, z: 8020, rot: 0, id }], [{ id, fading: 0 }]);
+      expect(sr.scaleOf(id)).toBeCloseTo(1, 2);
+      expect(sr.isFading(id)).toBe(true);
+      bus.emit('growth:remove', { id });
+    });
+
+    it('a record with only a mid-grace decay entry (not yet fading) rebuilds normally, at full scale and not fading', () => {
+      const id = freshId();
+      sr.rebuild([{ kind: 'field', x: 8030, z: 8030, rot: 0, id }], [{ id, stranded: 45 }]);
+      expect(sr.scaleOf(id)).toBeCloseTo(1, 3);
+      expect(sr.isFading(id)).toBe(false);
+      bus.emit('growth:remove', { id });
+    });
+
+    it('rebuild() clears any previously-tracked fade/decay state from an earlier rebuild', () => {
+      const idA = freshId();
+      sr.rebuild([{ kind: 'tree', x: 8040, z: 8040, rot: 0, id: idA }], [{ id: idA, fading: 10 }]);
+      expect(sr.isFading(idA)).toBe(true);
+
+      // A second rebuild() with a disjoint record set must not leave idA's fade entry dangling.
+      const idB = freshId();
+      sr.rebuild([{ kind: 'tree', x: 8050, z: 8050, rot: 0, id: idB }]);
+      expect(sr.isFading(idA)).toBe(false);
+      expect(sr.scaleOf(idA)).toBeNull(); // idA's instance no longer exists at all post-rebuild
+      bus.emit('growth:remove', { id: idB });
+    });
+  });
 });

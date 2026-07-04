@@ -3,7 +3,7 @@ import { STAGES } from '../core/types';
 import { ROAD_WIDTH } from '../core/constants';
 import { RoadGraph } from './roads/graph';
 import { Heightfield } from './terrain/heightfield';
-import { GrowthSim, type SpawnRecord } from './growth/growth';
+import { GrowthSim, type SpawnRecord, type DecayEntry } from './growth/growth';
 import {
   BuildQueue,
   CLAMP_FLAT_RADIUS,
@@ -48,20 +48,30 @@ export interface SaveV2 {
 }
 
 /**
- * v3 (Task 35): no shape change over v2 besides `growth.spawned` records now always carrying a
- * stable `id` (SpawnRecord.id became non-optional once upgrades/stranded-decay needed a way to
- * reference a specific record across events). v1/v2 saves predate ids entirely; migrating them
- * forward assigns sequential ids in array order (deterministic given the same saved array), which
- * is exactly what `GrowthSim.restore` would also do defensively if handed id-less records directly
- * — this migration just does it explicitly and earlier, at the save layer, so `AnySave` callers can
- * rely on every record having a real id straight out of `deserialize`.
+ * v3 (Task 35, extended by the Task 35 follow-up "Groundwork"): `growth.spawned` records always
+ * carry a stable `id` (SpawnRecord.id became non-optional once upgrades/stranded-decay needed a
+ * way to reference a specific record across events). v1/v2 saves predate ids entirely; migrating
+ * them forward assigns sequential ids in array order (deterministic given the same saved array),
+ * which is exactly what `GrowthSim.restore` would also do defensively if handed id-less records
+ * directly — this migration just does it explicitly and earlier, at the save layer, so `AnySave`
+ * callers can rely on every record having a real id straight out of `deserialize`.
+ *
+ * Groundwork Finding 2 (additive within this same v3 shape — this save format shipped only in
+ * local commits, never deployed, so no version bump is needed for this addition; see this task's
+ * instructions): `growth.decay` persists any record currently mid-grace or mid-fade as a
+ * sim-time-relative offset (`DecayEntry`, see growth.ts) so a save taken mid-decay reloads with its
+ * timeline CONTINUING rather than restarting — without this, a record 59s into its 60s grace would
+ * reload with a full fresh 60s grace, and a record mid-fade would pop back to full scale/height
+ * with its fade animation restarted from 0. Absent/empty for a save with no in-flight timers at
+ * save time (the common case) and always empty for a migrated v1/v2 save (predates this state
+ * entirely — `deserialize` fills it in as `[]`, matching "nothing was mid-decay").
  */
 export interface SaveV3 {
   version: 3;
   seed: string;
   timeOfDay: number;
   edges: { ctrl: P2[]; stage: Stage }[];
-  growth: { dev: number[]; spawned: SpawnRecord[] };
+  growth: { dev: number[]; spawned: SpawnRecord[]; decay: DecayEntry[] };
   quarry: QuarryPlacement | null;
 }
 
@@ -87,6 +97,13 @@ export function serialize(world: SerializableWorld): string {
       // compact without any perceptible loss of fidelity when it's restored.
       dev: world.growth.devLevels.map((v) => Math.round(v * 1000) / 1000),
       spawned: world.growth.spawned.slice(),
+      // Finding 2 (Groundwork): in-flight grace/fade timers, as sim-time-relative offsets (see
+      // GrowthSim.decayState / DecayEntry's doc comments) — empty when nothing is mid-decay.
+      decay: world.growth.decayState.map((d) => ({
+        id: d.id,
+        ...(d.stranded !== undefined ? { stranded: Math.round(d.stranded * 1000) / 1000 } : {}),
+        ...(d.fading !== undefined ? { fading: Math.round(d.fading * 1000) / 1000 } : {}),
+      })),
     },
     quarry: world.quarry.placement,
   };
@@ -142,6 +159,26 @@ function validQuarry(q: unknown): q is QuarryPlacement | null {
   );
 }
 
+/** Finding 2 (Groundwork): validates a `growth.decay` array — each entry needs a finite `id` and
+ * exactly a finite `stranded` XOR a finite `fading` offset (never both, never neither — mirrors
+ * `DecayEntry`'s own "exactly one of stranded/fading" invariant; a corrupt/hand-edited save
+ * violating this is rejected outright like any other malformed field, rather than silently
+ * dropping the ambiguous half). `undefined` (the whole `decay` key missing, e.g. a v1/v2 migrated
+ * save that predates it) is accepted as "no decay state" — validated/defaulted separately in
+ * `deserialize`. */
+function validDecay(decay: unknown): decay is DecayEntry[] {
+  if (!Array.isArray(decay)) return false;
+  for (const d of decay) {
+    if (typeof d !== 'object' || d === null) return false;
+    const e = d as Partial<DecayEntry>;
+    if (typeof e.id !== 'number' || !Number.isFinite(e.id)) return false;
+    const hasStranded = typeof e.stranded === 'number' && Number.isFinite(e.stranded);
+    const hasFading = typeof e.fading === 'number' && Number.isFinite(e.fading);
+    if (hasStranded === hasFading) return false; // exactly one of the two must be present
+  }
+  return true;
+}
+
 /** Loosely-typed shape covering v1/v2/v3 on-disk saves, used only inside `deserialize` before the
  * version-specific validation/migration below settles on a real `SaveV3`. */
 interface RawSaveShape {
@@ -149,7 +186,7 @@ interface RawSaveShape {
   seed?: unknown;
   timeOfDay?: unknown;
   edges?: unknown;
-  growth?: { dev?: unknown; spawned?: unknown };
+  growth?: { dev?: unknown; spawned?: unknown; decay?: unknown };
   quarry?: unknown;
 }
 
@@ -204,12 +241,26 @@ export function deserialize(json: string): SaveV3 | null {
   // it unconditionally on an already-v3 save is a harmless no-op (every record already has an id).
   const spawned = assignIds(rawSpawned);
 
+  // Step 3 (Groundwork Finding 2): `growth.decay` — additive within v3 (this save format never
+  // shipped, so no version bump was needed for this addition; see this task's instructions). A
+  // v1/v2 save (or any v3 save predating this field) simply has no key here at all: that migrates
+  // to `[]` ("nothing was mid-decay"), exactly matching a real save taken while nothing happened to
+  // be stranded. A `decay` key that IS present but fails validation (malformed/corrupt) rejects the
+  // whole save, consistent with every other field's handling above.
+  let decay: DecayEntry[];
+  if (!('decay' in p.growth) || p.growth.decay === undefined) {
+    decay = [];
+  } else {
+    if (!validDecay(p.growth.decay)) return null;
+    decay = p.growth.decay;
+  }
+
   return {
     version: 3,
     seed: p.seed,
     timeOfDay: p.timeOfDay,
     edges: p.edges,
-    growth: { dev, spawned },
+    growth: { dev, spawned, decay },
     quarry: quarry as QuarryPlacement | null,
   };
 }
@@ -321,7 +372,7 @@ export function restoreWorld(save: SaveV3, deps: RestoreDeps): void {
     }
   }
 
-  growth.restore(save.growth.dev, save.growth.spawned);
+  growth.restore(save.growth.dev, save.growth.spawned, save.growth.decay);
 
   // v1-migration case (Task 34): `save.quarry === undefined` means this save predates the quarry
   // feature entirely (deserialize's migration path leaves it unset, distinct from an explicit
