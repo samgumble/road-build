@@ -215,7 +215,13 @@ function main(): void {
       // render callback computes `dt` straight from wall-clock time with no timeScale applied at
       // all, so the day cycle previously ran at real-world speed regardless of the selected speed.
       atmosphere.update(dt * loop.timeScale);
-      constructionRenderer.update(dt, atmosphere.night);
+      // Task 46 (Groundwork stutter fix): ConstructionRenderer's vehicle position/heading damping
+      // needs to know how much SIM time this rendered frame actually covered (see
+      // ConstructionRenderer.update's `timeScale` param doc) — but its many wall-clock-calibrated
+      // liveness windows (IDLE_TIMEOUT, break theater, etc., all keyed off `this.clock`) must stay
+      // real-time, so (unlike sceneryRenderer/carRenderer/atmosphere just below/above) `dt` itself
+      // is NOT scaled here; timeScale is passed through as a separate argument instead.
+      constructionRenderer.update(dt, atmosphere.night, loop.timeScale);
       carRenderer.update(traffic.cars, atmosphere.night, dt * loop.timeScale);
       // Important 5 (Groundwork round fix wave): SceneryRenderer's fade/recover/pop-in animations
       // (growth:stranded's decay fade, growth:rescued's recovery ease, wilderness:cleared's fade)

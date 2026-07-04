@@ -2765,9 +2765,24 @@ export class ConstructionRenderer {
   /**
    * Advances every crew's vehicles/dressing/floodlight independently (Task 25), then the shared
    * systems (crane theater, particle pools, tire marks, stakes) once globally.
+   *
+   * `timeScale` (Task 46, Groundwork stutter fix): the HUD speed control (1x/4x/16x) batches up to
+   * `Math.ceil(8 * timeScale)` fixed sim steps into a single rendered frame (see Loop), so
+   * `construction:progress` events can move a vehicle's `targetPos`/`targetHeading` by many
+   * sim-seconds' worth of travel between one rendered frame and the next. `stepVehicle`'s
+   * position/heading damping (POS_LAMBDA/ROT_LAMBDA) previously chased that target using plain
+   * wall-clock `dt`, so the damped position could never catch up before the NEXT batch moved the
+   * target again — a sawtooth that got worse, not better, at higher speed (see task-46-report.md).
+   * `stepDt` below scales just that damping's effective dt by `timeScale`, so it tracks how much
+   * sim-time actually elapsed this rendered frame. Every OTHER per-frame timer in this class
+   * (IDLE_TIMEOUT liveness, break theater, dust/steam intervals, dig-cycle phase, bed-tip cycle)
+   * stays on plain wall-clock `dt` — those are real-time animation/liveness constants, not
+   * sim-progress catch-up, and scaling them too would break IDLE_TIMEOUT's very premise (a single
+   * rendered frame's clock advance would then regularly exceed the 0.2s idle window on its own).
    */
-  update(dt: number, night: boolean): void {
+  update(dt: number, night: boolean, timeScale = 1): void {
     this.clock += dt;
+    const stepDt = dt * Math.max(1, timeScale);
 
     if (this.quarryPopping) {
       this.quarryPopElapsed += dt;
@@ -2782,11 +2797,11 @@ export class ConstructionRenderer {
     // before `stepVehicle` for the crane runs this same frame.
     this.updateBridgeCrossings(dt);
     const craneActive = this.clock - this.craneSeenAt <= this.IDLE_TIMEOUT;
-    this.stepVehicle(this.craneState, dt, craneActive);
+    this.stepVehicle(this.craneState, stepDt, craneActive);
     this.craneRig.beaconMat.emissiveIntensity = this.beaconIntensity(night);
 
     for (let crew = 0; crew < this.crews.length; crew++) {
-      this.updateCrew(crew, dt, night);
+      this.updateCrew(crew, dt, night, stepDt);
     }
 
     // Shared per-frame updates (Task 25: pools/marks/stakes are shared capacity pools, not
@@ -2804,8 +2819,10 @@ export class ConstructionRenderer {
     return (1.0 + 0.6 * pulsePhase) * (night ? 2 : 1);
   }
 
-  /** Advances one crew's vehicles, site dressing, and floodlight for one frame. */
-  private updateCrew(crew: number, dt: number, night: boolean): void {
+  /** Advances one crew's vehicles, site dressing, and floodlight for one frame. `stepDt` is the
+   * timeScale-scaled dt used ONLY for stepVehicle's position/heading catch-up damping (see
+   * `update`'s doc comment); every other timer here stays on wall-clock `dt`. */
+  private updateCrew(crew: number, dt: number, night: boolean, stepDt: number): void {
     const slot = this.crews[crew];
 
     // Task 33: break theater — same idle-timeout liveness pattern as every other per-crew signal
@@ -2820,13 +2837,13 @@ export class ConstructionRenderer {
     for (const [kind, state] of slot.states) {
       const lastSeen = slot.lastSeenAt.get(kind) ?? -Infinity;
       const active = this.clock - lastSeen <= this.IDLE_TIMEOUT;
-      this.stepVehicle(state, dt, active);
+      this.stepVehicle(state, stepDt, active);
     }
     const rollerActive = this.clock - slot.lastRollerSeenAt <= this.IDLE_TIMEOUT && !slot.onBreak;
-    this.stepVehicle(slot.roller, dt, rollerActive);
+    this.stepVehicle(slot.roller, stepDt, rollerActive);
 
     const graderActive = this.clock - slot.lastGraderSeenAt <= this.IDLE_TIMEOUT && !slot.onBreak;
-    this.stepVehicle(slot.grader, dt, graderActive);
+    this.stepVehicle(slot.grader, stepDt, graderActive);
 
     const beaconIntensity = this.beaconIntensity(night);
     for (const kind of PER_CREW_KINDS) {

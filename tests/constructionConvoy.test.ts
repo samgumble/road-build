@@ -142,3 +142,90 @@ describe('ConstructionRenderer convoy (Task 36)', () => {
     expect(worstGrowth).toBeLessThan(0.01);
   });
 });
+
+describe('ConstructionRenderer timeScale-aware damping (Task 46, Groundwork stutter fix)', () => {
+  /** At high HUD speed (timeScale), Loop batches many fixed sim steps into a single rendered
+   * frame (see src/core/loop.ts), so a vehicle's targetPos can jump a large distance between one
+   * rendered frame and the next. `update`'s new `timeScale` param scales stepVehicle's
+   * position-damping rate to match, so a batched jump is caught up within roughly the same WALL-
+   * CLOCK time regardless of timeScale — without it, the fixed wall-clock damping rate left a much
+   * larger residual gap the higher timeScale went (this is what actually read as "stutter"). */
+  it('closes a large targetPos jump faster (in wall-clock renderer ticks) at timeScale=16 than at timeScale=1', () => {
+    const dt = 1 / 60;
+
+    // Drive one crew's excavator to a first position so it's live and positioned, then jump the
+    // target far away in one step (simulating the batched-progress-events scenario) and measure
+    // how many renderer ticks it takes to close most of the gap, at timeScale=1 vs 16.
+    function crewExcavatorState(r: ConstructionRenderer) {
+      const slot = (r as unknown as {
+        crews: { states: Map<string, { hasTarget: boolean; curPos: THREE.Vector3; targetPos: THREE.Vector3 }> }[];
+      }).crews[0];
+      return slot.states.get('excavator')!;
+    }
+
+    function ticksToConverge(timeScale: number): number {
+      const { renderer: r, bus } = buildRig(`timescale-damp-test-${timeScale}`, 40);
+      bus.emit('construction:progress', {
+        edgeId: 0, stage: 'graded', t: 0, pos: { x: 0, y: 0, z: 0 }, heading: 0,
+        vehicle: 'excavator', demolish: false, crew: 0, onBreak: false,
+      });
+      r.update(dt, false, timeScale); // let it fade/settle in at the first position
+      for (let i = 0; i < 30; i++) r.update(dt, false, timeScale);
+
+      // Jump the target far away in a single event, as a batched-progress-tick would.
+      bus.emit('construction:progress', {
+        edgeId: 0, stage: 'graded', t: 0, pos: { x: 100, y: 0, z: 0 }, heading: 0,
+        vehicle: 'excavator', demolish: false, crew: 0, onBreak: false,
+      });
+
+      let ticks = 0;
+      const maxTicks = 600;
+      while (ticks < maxTicks) {
+        r.update(dt, false, timeScale);
+        ticks++;
+        const state = crewExcavatorState(r);
+        if (state.curPos.distanceTo(state.targetPos) < 5) break;
+      }
+      return ticks;
+    }
+
+    const ticksAt1x = ticksToConverge(1);
+    const ticksAt16x = ticksToConverge(16);
+    // At 16x the damping rate should be ~16x faster in wall-clock renderer ticks, so it converges
+    // in meaningfully fewer ticks — not the same (pre-fix) or more.
+    expect(ticksAt16x).toBeLessThan(ticksAt1x);
+  });
+
+  it('IDLE_TIMEOUT liveness is unaffected by timeScale (only stepVehicle damping is scaled)', () => {
+    // Regression guard for the naive "scale ALL of dt by timeScale" approach considered and
+    // rejected during Task 46: that approach broke IDLE_TIMEOUT (a wall-clock-calibrated 0.2s
+    // liveness window) because a single rendered frame's clock advance at timeScale=16 could
+    // already exceed 0.2s on its own, popping vehicles invisible every frame. Confirms a vehicle
+    // stays visible (scale grows normally) across several renderer ticks at timeScale=16.
+    const { renderer, bus } = buildRig('timescale-liveness-test', 40);
+    const dt = 1 / 60;
+    bus.emit('construction:progress', {
+      edgeId: 0, stage: 'graded', t: 0, pos: { x: 0, y: 0, z: 0 }, heading: 0,
+      vehicle: 'excavator', demolish: false, crew: 0, onBreak: false,
+    });
+    const scales: number[] = [];
+    for (let i = 0; i < 10; i++) {
+      // Re-emit each tick, as a real sim would while the excavator is actively working.
+      bus.emit('construction:progress', {
+        edgeId: 0, stage: 'graded', t: 0, pos: { x: 0, y: 0, z: 0 }, heading: 0,
+        vehicle: 'excavator', demolish: false, crew: 0, onBreak: false,
+      });
+      renderer.update(dt, false, 16);
+      const slot = (renderer as unknown as {
+        crews: { states: Map<string, { scale: number }> }[];
+      }).crews[0];
+      scales.push(slot.states.get('excavator')!.scale);
+    }
+    // Scale should ramp up toward 1, never drop back toward 0 mid-ramp (which IDLE_TIMEOUT
+    // breakage would cause — the vehicle would be marked inactive most frames).
+    expect(scales[scales.length - 1]).toBeGreaterThan(0.9);
+    for (let i = 1; i < scales.length; i++) {
+      expect(scales[i]).toBeGreaterThanOrEqual(scales[i - 1] - 0.001);
+    }
+  });
+});
