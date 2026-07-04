@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import type { VehicleKind } from '../core/types';
+import type { VehicleKind, Stage } from '../core/types';
+import { STAGES } from '../core/types';
 import { EventBus } from '../core/events';
 import { RoadGraph } from '../sim/roads/graph';
 import { sampleAt } from '../sim/roads/path';
@@ -126,6 +127,50 @@ const SEGMENT_DESCEND_DURATION = 1.5; // seconds, easeOutCubic
 const SEGMENT_SETTLE_BOUNCE_DURATION = 0.35; // seconds, easeOutBack tiny settle bounce after descent
 const CRANE_SLEW_LAMBDA = 4; // damping for the cab's yaw tracking the current span
 
+// --- Site realism (Task 26) ---------------------------------------------------------------------
+const HI_VIS_ORANGE = '#e8641b'; // spec-mandated hi-vis torso color for worker figures
+const HARDHAT_COLOR = '#f2c94c';
+const WORKER_FADE_LAMBDA = 1 / FADE_DURATION; // workers fade with the rest of the crew's dressing
+
+// Flagger: stands just off the cone bracket, slow arm-wave cycle.
+const FLAGGER_WAVE_HZ = 0.5;
+const FLAGGER_WAVE_AMOUNT = THREE.MathUtils.degToRad(35);
+
+// Spotter: paces the active vehicle from ~4u away, damped walk-steps as the work front advances.
+const SPOTTER_STANDOFF = 4; // u from the active vehicle
+const SPOTTER_LAMBDA = 4; // position damping, slower than vehicles so it reads as "walking to keep up"
+const SPOTTER_STEP_HZ = 1.6; // walk-step bob rate while actively repositioning
+const SPOTTER_BOB_AMOUNT = 0.05; // u, small vertical bob while walking
+const SPOTTER_MOVE_EPS = 0.05; // u/s; below this the spotter reads as "standing", no bob
+
+// Stockpile worker: idles near the stockpile, occasional shovel-lean cycle.
+const SHOVEL_CYCLE_DURATION = 3.2; // seconds per lean-and-scoop cycle
+const SHOVEL_CYCLE_CHANCE = 0.4; // fraction of the time a cycle actually plays (otherwise stands idle)
+const SHOVEL_IDLE_GAP_MIN = 1.5;
+const SHOVEL_IDLE_GAP_MAX = 4;
+
+// Motor grader (deliverable 2): trails the dump truck's gravel drops, blade lowered, leveling the
+// ribbon (visual only — the ribbon already renders; the grader is theater).
+const GRADER_TRAIL_DISTANCE = 6; // u behind the work front, per spec
+const GRADER_COLOR = '#c9a227';
+
+// Exhaust puffs (deliverable 3): reuse the ParticlePool mechanism at a subtle rate.
+const EXHAUST_INTERVAL = 0.8; // seconds between puffs per active vehicle
+const EXHAUST_LIFETIME = 1.4;
+const EXHAUST_SIZE = 0.7;
+const EXHAUST_COLOR = '#38352f';
+const EXHAUST_POOL_SIZE = 120;
+
+// Stockpile depletion (deliverable 4): mound scale lerps from 1 (survey) down to STOCKPILE_MIN_SCALE
+// (painting) across the job's stage progression.
+const STOCKPILE_MIN_SCALE = 0.2;
+const STOCKPILE_SCALE_LAMBDA = 3; // damping so depletion eases rather than snaps at each stage change
+
+// Paint stencil (deliverable 5) — the wet-sheen roughness lerp on fresh dashes itself lives in
+// roadRenderer.ts (mirrors its own fresh-asphalt pattern; see WET_SHEEN_DURATION there).
+const STENCIL_TRAIL = 1.6; // u behind the liner's nozzle
+const CENTERLINE_STENCIL_HALF_WIDTH = 0.35; // u, matches roadRenderer's CENTERLINE_WIDTH/2 (0.5/2 + slack)
+
 function flatMat(color: string, emissive?: string): THREE.MeshStandardMaterial {
   return new THREE.MeshStandardMaterial({
     color,
@@ -212,6 +257,10 @@ interface VehicleRig {
   // paver mat only
   matMesh?: THREE.Mesh;
   matMat?: THREE.MeshStandardMaterial;
+
+  // liner stencil frame only (Task 26 deliverable 5)
+  stencilMesh?: THREE.Group;
+  stencilMat?: THREE.MeshStandardMaterial;
 
   // crane articulation only (Task 22)
   craneCab?: THREE.Group; // slews (yaws) to track the current span being placed
@@ -490,7 +539,31 @@ function buildLiner(): VehicleRig {
 
   const beaconMat = addBeacon(cab, 0.75);
 
-  return { kind: 'liner', group, body, beaconMat, wheels, materials };
+  // Paint stencil frame (deliverable 5): a thin rectangular frame lying flat on the road just
+  // behind the nozzle, standing in for the guide stencil a real line-painting crew walks/tows over
+  // the dash it's about to lay. Parented to `group` (not `body`) so it stays screen-flat regardless
+  // of chassis pitch/roll, same reasoning as the paver's fresh-asphalt mat.
+  const stencilMat = flatMat('#d8d4c8');
+  stencilMat.transparent = true;
+  stencilMat.opacity = 0;
+  materials.push(stencilMat);
+  const stencilMesh = new THREE.Group();
+  stencilMesh.position.set(-STENCIL_TRAIL - 1.7, 0.05, 0);
+  const railGeo = new THREE.BoxGeometry(1.0, 0.03, 0.05);
+  for (const zSide of [-1, 1]) {
+    const rail = new THREE.Mesh(railGeo, stencilMat);
+    rail.position.set(0, 0, zSide * CENTERLINE_STENCIL_HALF_WIDTH);
+    stencilMesh.add(rail);
+  }
+  const rungGeo = new THREE.BoxGeometry(0.05, 0.03, CENTERLINE_STENCIL_HALF_WIDTH * 2);
+  for (const xSide of [-1, 1]) {
+    const rung = new THREE.Mesh(rungGeo, stencilMat);
+    rung.position.set(xSide * 0.475, 0, 0);
+    stencilMesh.add(rung);
+  }
+  group.add(stencilMesh);
+
+  return { kind: 'liner', group, body, beaconMat, wheels, materials, stencilMesh, stencilMat };
 }
 
 const SKIN_COLOR = '#c99a6f';
@@ -1145,6 +1218,10 @@ class ConePool {
 interface StockpileRig {
   group: THREE.Group;
   materials: THREE.MeshStandardMaterial[];
+  // Depletion (Task 26 deliverable 4): the two gravel mounds shrink as the job progresses through
+  // its stages; kept as their own group (separate from the pallet/crates, which stay full-size —
+  // only the loose material pile visibly depletes) so `updateStockpileDepletion` can scale just them.
+  moundGroup: THREE.Group;
 }
 
 function buildStockpile(): StockpileRig {
@@ -1155,13 +1232,16 @@ function buildStockpile(): StockpileRig {
   const wrapMat = flatMat('#d8d0b0');
   materials.push(gravelMat, palletMat, wrapMat);
 
+  const moundGroup = new THREE.Group();
+  group.add(moundGroup);
+
   const mound = new THREE.Mesh(new THREE.ConeGeometry(1.6, 1.3, 10), gravelMat);
   mound.position.set(0, 0.65, 0);
-  group.add(mound);
+  moundGroup.add(mound);
 
   const mound2 = new THREE.Mesh(new THREE.ConeGeometry(1.0, 0.8, 8), gravelMat);
   mound2.position.set(1.6, 0.4, 0.6);
-  group.add(mound2);
+  moundGroup.add(mound2);
 
   // pallet stack: two crates on a base slab
   const base = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.15, 1.1), palletMat);
@@ -1176,7 +1256,119 @@ function buildStockpile(): StockpileRig {
   crateB.position.set(-2.15, 0.95, -0.35);
   group.add(crateB);
 
-  return { group, materials };
+  return { group, materials, moundGroup };
+}
+
+const WORKER_SKIN = '#c99a6f';
+
+/** One worker figure: legs, hi-vis torso, head sphere, hardhat, arm — at most 6 primitives, the
+ * budget shared with `buildSurveyor`'s figure. `armPivotY` names the arm's shoulder-height offset so
+ * per-role animation (flagger wave, shovel lean) can rotate the same arm mesh about a sensible
+ * pivot without each builder re-deriving it. Legs are a single fused box (not two) to leave a
+ * primitive free for the hardhat brim while staying under budget: body(1) + head(1) + hardhat(1) +
+ * torso(1) + arm(1) + legs(1) = 6.
+ */
+interface WorkerRig {
+  group: THREE.Group;
+  arm: THREE.Group; // pivots at the shoulder for wave/lean animation
+  materials: THREE.MeshStandardMaterial[];
+}
+
+function buildWorkerFigure(): WorkerRig {
+  const group = new THREE.Group();
+  const materials: THREE.MeshStandardMaterial[] = [];
+  const skinMat = flatMat(WORKER_SKIN);
+  const hiVisMat = flatMat(HI_VIS_ORANGE);
+  const hatMat = flatMat(HARDHAT_COLOR);
+  materials.push(skinMat, hiVisMat, hatMat);
+
+  const legs = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.62, 0.16), skinMat);
+  legs.position.set(0, 0.31, 0);
+  group.add(legs);
+
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.5, 0.24), hiVisMat);
+  torso.position.set(0, 0.87, 0);
+  group.add(torso);
+
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.14, 8, 6), skinMat);
+  head.position.set(0, 1.28, 0);
+  group.add(head);
+
+  const hardhat = new THREE.Mesh(new THREE.SphereGeometry(0.15, 8, 5, 0, Math.PI * 2, 0, Math.PI / 2), hatMat);
+  hardhat.position.set(0, 1.32, 0);
+  group.add(hardhat);
+
+  // Arm as a pivoted group so callers can rotate it at the shoulder for wave/lean animation.
+  const arm = new THREE.Group();
+  arm.position.set(0.17, 1.0, 0);
+  group.add(arm);
+  const armMesh = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.1, 0.1), skinMat);
+  armMesh.position.set(0.18, 0, 0);
+  arm.add(armMesh);
+
+  return { group, arm, materials };
+}
+
+/** Motor grader rig (Task 26 deliverable 2): long frame, angled center blade, 6 wheels — 12
+ * primitives total (frame, cab, engine hood, blade, 6 wheels, 2 blade-arm struts), comfortably
+ * under the ≤12 budget. Pure theater: trails the truck's gravel drops with the blade lowered,
+ * leveling the ribbon the sim already renders (no geometry change needed). */
+function buildGrader(): VehicleRig {
+  const group = new THREE.Group();
+  const body = new THREE.Group();
+  group.add(body);
+  const materials: THREE.MeshStandardMaterial[] = [];
+  const bodyMat = flatMat(GRADER_COLOR);
+  const cabMat = flatMat(CAB_COLOR);
+  const wheelMat = flatMat(WHEEL_COLOR);
+  const bladeMat = flatMat('#4a4a4a');
+  materials.push(bodyMat, cabMat, wheelMat, bladeMat);
+
+  const frame = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.35, 0.9), bodyMat);
+  frame.position.set(0, 0.55, 0);
+  body.add(frame);
+
+  const hood = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.5, 0.7), bodyMat);
+  hood.position.set(1.5, 0.65, 0);
+  body.add(hood);
+
+  const cab = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.8, 0.9), cabMat);
+  cab.position.set(0.1, 1.05, 0);
+  body.add(cab);
+
+  // angled center blade, lowered near the ground just ahead of the front axle
+  const blade = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.5, 1.8), bladeMat);
+  blade.position.set(0.55, 0.28, 0);
+  blade.rotation.y = THREE.MathUtils.degToRad(20); // angled to cast material to one side
+  body.add(blade);
+
+  const strutGeo = new THREE.BoxGeometry(0.6, 0.08, 0.08);
+  for (const side of [-1, 1]) {
+    const strut = new THREE.Mesh(strutGeo, bodyMat);
+    strut.position.set(0.25, 0.4, side * 0.3);
+    strut.rotation.y = THREE.MathUtils.degToRad(20);
+    body.add(strut);
+  }
+
+  const wheelGeo = wheelCylinder(0.4, 0.3);
+  const wheels: WheelRef[] = [];
+  // 6 wheels: 2 front (steerable in reality, decorative here), 4 rear in a tandem bogie
+  for (const [x, zs] of [[1.4, [0.5, -0.5]], [-1.1, [0.5, -0.5]], [-1.6, [0.5, -0.5]]] as [number, number[]][]) {
+    for (const z of zs) {
+      const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+      wheel.position.set(x, 0.4, z);
+      body.add(wheel);
+      wheels.push({ mesh: wheel, radius: 0.4 });
+    }
+  }
+
+  const beaconMat = addBeacon(cab, 1.5);
+
+  // The grader is pure render-side theater (like the roller) with no corresponding `VehicleKind` in
+  // the sim's `construction:progress` contract — `kind` is never actually read anywhere in this
+  // file (see PER_CREW_KINDS/stateFor, which only ever key off real per-crew vehicle kinds), so
+  // reusing 'roller' here is just a harmless placeholder to satisfy VehicleRig's shape.
+  return { kind: 'roller', group, body, beaconMat, wheels, materials };
 }
 
 /** A single floodlight-tower prop: a pole + emissive head + one THREE.SpotLight (budgeted). */
@@ -1260,12 +1452,35 @@ interface CrewSlot {
   stockpile: StockpileRig;
   stockpileVisibility: number;
   stockpileEdgeId: number | null;
+  stockpileScale: number; // eased 0..1 depletion level (Task 26 deliverable 4), 1 = full mound
   floodlight: FloodlightRig;
   floodlightVisibility: number;
   // scratch fields for updateSiteDressing -> cones.update handoff (avoids a per-frame allocation)
   dressingActive: boolean;
   dressingPos: THREE.Vector3;
   dressingHeading: number;
+
+  // --- Task 26: worker figures --------------------------------------------------------------
+  flagger: WorkerRig;
+  spotter: WorkerRig;
+  stockpileWorker: WorkerRig;
+  workerVisibility: number; // eased 0..1, follows the same job-active signal as cones/stockpile
+  flaggerPhase: number; // wave-cycle clock
+  spotterPos: THREE.Vector3; // damped walk-step position (slower than the vehicle itself)
+  spotterHeading: number;
+  spotterStepPhase: number; // walk-bob clock, only advances while actually moving
+  shovelPhase: number; // shovel-lean cycle clock
+  shovelActive: boolean; // whether a lean cycle is currently playing
+  shovelIdleGap: number; // seconds until the next roll for a new cycle
+
+  // --- Task 26: motor grader -----------------------------------------------------------------
+  grader: VehicleState;
+  lastGraderSeenAt: number;
+  graderScrapeTimer: number; // seconds until the next scrape one-shot (audio, driven from here)
+  graderScrapeGap: number;
+
+  // --- Task 26: exhaust puffs ----------------------------------------------------------------
+  exhaustTimer: Map<string, number>;
 }
 
 /**
@@ -1287,6 +1502,7 @@ export class ConstructionRenderer {
   private dustPool: ParticlePool;
   private steamPool: ParticlePool;
   private gravelPool: ParticlePool;
+  private exhaustPool: ParticlePool; // Task 26 deliverable 3: shared across crews (positions carry crew implicitly)
   private tireMarks: TireMarkPool;
   private stakes: StakePool;
 
@@ -1326,11 +1542,13 @@ export class ConstructionRenderer {
     this.dustPool = new ParticlePool(DUST_POOL_SIZE, DUST_SIZE, DUST_COLOR, DUST_LIFETIME);
     this.steamPool = new ParticlePool(STEAM_POOL_SIZE, STEAM_SIZE, STEAM_COLOR, STEAM_LIFETIME);
     this.gravelPool = new ParticlePool(80, 1.0, GRAVEL_COLOR, 0.9);
+    this.exhaustPool = new ParticlePool(EXHAUST_POOL_SIZE, EXHAUST_SIZE, EXHAUST_COLOR, EXHAUST_LIFETIME);
     this.tireMarks = new TireMarkPool(TIRE_MARK_POOL_SIZE);
     this.stakes = new StakePool(STAKE_POOL_SIZE);
     this.scene.add(this.dustPool.points);
     this.scene.add(this.steamPool.points);
     this.scene.add(this.gravelPool.points);
+    this.scene.add(this.exhaustPool.points);
     this.scene.add(this.tireMarks.mesh);
     this.scene.add(this.stakes.mesh);
 
@@ -1383,6 +1601,26 @@ export class ConstructionRenderer {
     // driven exclusively by the synthetic trailing-position logic in onProgress()/update() below.
     const roller = this.makeState(rigs.roller);
 
+    // Worker figures (Task 26 deliverable 1): built once per crew, hidden until the crew has a job,
+    // faded with the same dressing signal as cones/stockpile.
+    const flagger = buildWorkerFigure();
+    const spotter = buildWorkerFigure();
+    const stockpileWorker = buildWorkerFigure();
+    for (const w of [flagger, spotter, stockpileWorker]) {
+      w.group.visible = false;
+      w.group.scale.setScalar(0.001);
+      this.scene.add(w.group);
+    }
+
+    // Motor grader (deliverable 2): a standalone rig+state pair per crew, same pattern as `roller`
+    // above — pure render theater synthesized from the truck's gravel-stage progress, no
+    // corresponding VehicleKind in the sim's event contract.
+    const graderRig = buildGrader();
+    graderRig.group.visible = false;
+    graderRig.group.scale.setScalar(0.001);
+    this.scene.add(graderRig.group);
+    const grader = this.makeState(graderRig);
+
     return {
       rigs,
       states: new Map(),
@@ -1395,11 +1633,28 @@ export class ConstructionRenderer {
       stockpile,
       stockpileVisibility: 0,
       stockpileEdgeId: null,
+      stockpileScale: 1,
       floodlight,
       floodlightVisibility: 0,
       dressingActive: false,
       dressingPos: new THREE.Vector3(),
       dressingHeading: 0,
+      flagger,
+      spotter,
+      stockpileWorker,
+      workerVisibility: 0,
+      flaggerPhase: 0,
+      spotterPos: new THREE.Vector3(),
+      spotterHeading: 0,
+      spotterStepPhase: 0,
+      shovelPhase: 0,
+      shovelActive: false,
+      shovelIdleGap: SHOVEL_IDLE_GAP_MIN,
+      grader,
+      lastGraderSeenAt: -Infinity,
+      graderScrapeTimer: 0,
+      graderScrapeGap: 6 + Math.random() * (10 - 6),
+      exhaustTimer: new Map(),
     };
   }
 
@@ -1636,6 +1891,21 @@ export class ConstructionRenderer {
       truckState.stage = 'paved';
       truckState.demolish = false;
       truckState.onBridge = nearestSampleBridge(edge.samples, e.t);
+    }
+
+    // Motor grader (Task 26 deliverable 2): during 'gravel' stage the reported `vehicle` IS the
+    // truck (see queue.ts's STAGE_VEHICLE), so the grader is purely synthesized here trailing the
+    // truck's own work-front position by GRADER_TRAIL_DISTANCE — same trailing-position pattern as
+    // the paved-stage roller above. Reverse (demolish) gravel work doesn't deposit anything, so the
+    // grader has nothing to level; it only appears for forward gravel work.
+    if (e.stage === 'gravel' && !e.demolish && edge) {
+      const graderT = Math.max(0, e.t - GRADER_TRAIL_DISTANCE);
+      const { pos, heading } = sampleAt(edge.samples, graderT);
+      this.applyProgressTarget(slot.grader, e.edgeId, new THREE.Vector3(pos.x, pos.y, pos.z), heading);
+      slot.lastGraderSeenAt = this.clock;
+      slot.grader.stage = 'gravel';
+      slot.grader.demolish = false;
+      slot.grader.onBridge = nearestSampleBridge(edge.samples, graderT);
     }
 
     // Bridge construction theater (deliverable 3/4): 'gravel'-stage progress crossing a bridge run
@@ -1948,10 +2218,14 @@ export class ConstructionRenderer {
     const rollerActive = this.clock - slot.lastRollerSeenAt <= this.IDLE_TIMEOUT;
     this.stepVehicle(slot.roller, dt, rollerActive);
 
+    const graderActive = this.clock - slot.lastGraderSeenAt <= this.IDLE_TIMEOUT;
+    this.stepVehicle(slot.grader, dt, graderActive);
+
     const beaconIntensity = this.beaconIntensity(night);
     for (const kind of PER_CREW_KINDS) {
       slot.rigs[kind].beaconMat.emissiveIntensity = beaconIntensity;
     }
+    slot.grader.rig.beaconMat.emissiveIntensity = beaconIntensity;
 
     const excavatorState = slot.states.get('excavator');
     const excavatorActive =
@@ -1968,11 +2242,19 @@ export class ConstructionRenderer {
     const paverActive = this.clock - (slot.lastSeenAt.get('paver') ?? -Infinity) <= this.IDLE_TIMEOUT;
     this.updatePaverMat(slot, paverState, paverActive, dt);
 
+    const linerState = slot.states.get('liner');
+    const linerActive = this.clock - (slot.lastSeenAt.get('liner') ?? -Infinity) <= this.IDLE_TIMEOUT;
+    this.updateStencil(slot, linerState, linerActive, dt);
+
     this.updateRoller(slot, dt, rollerActive);
+    this.updateGrader(slot, dt, graderActive);
 
     this.updateTireMarks(slot, dt);
     this.updateFloodlight(slot, dt, night);
     this.updateSiteDressing(slot, dt);
+    this.updateStockpileDepletion(slot, dt);
+    this.updateWorkers(slot, dt, excavatorActive || truckActive || paverActive || linerActive);
+    this.updateExhaust(slot, dt);
   }
 
   /**
@@ -2348,6 +2630,232 @@ export class ConstructionRenderer {
   }
 
   /**
+   * Motor grader (Task 26 deliverable 2): purely cosmetic, trailing the truck's gravel drops
+   * GRADER_TRAIL_DISTANCE behind the work front (position/heading synthesized in `onProgress`
+   * above). No independent animation beyond the shared `stepVehicle` damping/wheel-spin/slope
+   * alignment every other vehicle gets — the blade is modeled permanently lowered (fixed geometry,
+   * see `buildGrader`), so all this method needs to do is gate the periodic scrape-audio timer that
+   * `ambient.ts` can't derive on its own (it only sees sim-reported vehicle positions, not this
+   * render-synthesized trailing one).
+   */
+  private updateGrader(slot: CrewSlot, dt: number, active: boolean): void {
+    if (!active) {
+      slot.graderScrapeTimer = 0;
+      return;
+    }
+    slot.graderScrapeTimer += dt;
+    if (slot.graderScrapeTimer >= slot.graderScrapeGap) {
+      slot.graderScrapeTimer = 0;
+      slot.graderScrapeGap = 6 + Math.random() * (10 - 6);
+      // Audio cue: a soft scrape one-shot tied to grader passes (deliverable 6). Emitting a DOM
+      // CustomEvent rather than threading a new EventBus contract through both files keeps the sim's
+      // event surface (core/events.ts) untouched for a purely cosmetic audio tie-in — ambient.ts
+      // listens for it directly (see AmbientAudio's constructor).
+      window.dispatchEvent(new CustomEvent('construction:graderScrape', {
+        detail: { x: slot.grader.curPos.x },
+      }));
+    }
+  }
+
+  /**
+   * Worker figures (Task 26 deliverable 1): a flagger near the cones (slow arm wave), a spotter
+   * that paces the active vehicle from SPOTTER_STANDOFF away (damped walk-steps, small bob while
+   * actually moving), and a stockpile worker with an occasional shovel-lean cycle. All three fade
+   * in/out with the same job-active signal as cones/stockpile (`slot.dressingActive`, set by
+   * `updateSiteDressing` earlier this same frame) rather than tracking their own liveness, so
+   * workers never linger after every vehicle on the crew has gone idle. `anyVehicleActive` is passed
+   * in as a slightly richer signal for the spotter's target (needs an actual vehicle to face).
+   */
+  private updateWorkers(slot: CrewSlot, dt: number, anyVehicleActive: boolean): void {
+    const active = slot.dressingActive;
+    slot.workerVisibility = damp(slot.workerVisibility, active ? 1 : 0, WORKER_FADE_LAMBDA, dt);
+    const scale = easeOutCubic(clamp01(slot.workerVisibility));
+    const visible = scale > 0.001;
+
+    // --- Flagger: stationed just behind the cone bracket, facing the road, slow wave cycle ---
+    slot.flagger.group.visible = visible;
+    slot.flagger.group.scale.setScalar(Math.max(0.001, scale));
+    if (active) {
+      const perpX = -Math.sin(slot.dressingHeading);
+      const perpZ = Math.cos(slot.dressingHeading);
+      const fx = slot.dressingPos.x + perpX * (ROAD_WIDTH_HALF + 3) - Math.cos(slot.dressingHeading) * 4;
+      const fz = slot.dressingPos.z + perpZ * (ROAD_WIDTH_HALF + 3) - Math.sin(slot.dressingHeading) * 4;
+      const fy = this.hf.heightAt(fx, fz);
+      slot.flagger.group.position.set(fx, fy, fz);
+      slot.flagger.group.rotation.y = -slot.dressingHeading + Math.PI / 2;
+      slot.flaggerPhase += dt;
+      const waveAngle = Math.sin(2 * Math.PI * FLAGGER_WAVE_HZ * slot.flaggerPhase) * FLAGGER_WAVE_AMOUNT;
+      slot.flagger.arm.rotation.z = -0.3 + waveAngle;
+    }
+
+    // --- Spotter: stands ~SPOTTER_STANDOFF from the active vehicle, facing it, damped walk-steps
+    // as the work front advances (slower lambda than the vehicle itself so it visibly "keeps up"
+    // rather than teleporting alongside it). ---
+    slot.spotter.group.visible = visible;
+    slot.spotter.group.scale.setScalar(Math.max(0.001, scale));
+    if (active && anyVehicleActive) {
+      const anchor = slot.dressingPos;
+      const perpX = -Math.sin(slot.dressingHeading);
+      const perpZ = Math.cos(slot.dressingHeading);
+      const targetX = anchor.x + perpX * SPOTTER_STANDOFF - Math.cos(slot.dressingHeading) * 2;
+      const targetZ = anchor.z + perpZ * SPOTTER_STANDOFF - Math.sin(slot.dressingHeading) * 2;
+
+      // First-ever placement: snap directly rather than damping in from the (0,0) default — a
+      // freshly-idle crew's spotter has never been positioned, so damping would read as "walking in
+      // from the map origin" on the very first frame it appears.
+      if (!slot.spotter.group.visible && slot.spotterPos.x === 0 && slot.spotterPos.z === 0) {
+        slot.spotterPos.set(targetX, 0, targetZ);
+      }
+      const prevX = slot.spotterPos.x;
+      const prevZ = slot.spotterPos.z;
+      slot.spotterPos.x = damp(prevX, targetX, SPOTTER_LAMBDA, dt);
+      slot.spotterPos.z = damp(prevZ, targetZ, SPOTTER_LAMBDA, dt);
+      const spotterY = this.hf.heightAt(slot.spotterPos.x, slot.spotterPos.z);
+
+      const moveDist = Math.hypot(slot.spotterPos.x - prevX, slot.spotterPos.z - prevZ);
+      const moveSpeed = dt > 0 ? moveDist / dt : 0;
+      let bobY = 0;
+      if (moveSpeed > SPOTTER_MOVE_EPS) {
+        slot.spotterStepPhase += dt * SPOTTER_STEP_HZ;
+        bobY = Math.abs(Math.sin(2 * Math.PI * slot.spotterStepPhase)) * SPOTTER_BOB_AMOUNT;
+      }
+
+      // Face the vehicle it's spotting for.
+      const toVehicle = Math.atan2(anchor.z - slot.spotterPos.z, anchor.x - slot.spotterPos.x);
+      slot.spotterHeading = slot.spotterHeading + Math.atan2(Math.sin(toVehicle - slot.spotterHeading), Math.cos(toVehicle - slot.spotterHeading)) * (1 - Math.exp(-ROT_LAMBDA * dt));
+
+      slot.spotter.group.position.set(slot.spotterPos.x, spotterY + bobY, slot.spotterPos.z);
+      slot.spotter.group.rotation.y = -slot.spotterHeading;
+      // arm relaxed at the side, only the flagger/shovel workers gesture
+      slot.spotter.arm.rotation.z = damp(slot.spotter.arm.rotation.z, 0, 6, dt);
+    }
+
+    // --- Stockpile worker: idles beside the stockpile, occasional shovel-lean cycle ---
+    slot.stockpileWorker.group.visible = visible;
+    slot.stockpileWorker.group.scale.setScalar(Math.max(0.001, scale));
+    if (active) {
+      const sp = slot.stockpile.group.position;
+      const wx = sp.x - 1.4;
+      const wz = sp.z + 1.6;
+      const wy = this.hf.heightAt(wx, wz);
+      slot.stockpileWorker.group.position.set(wx, wy, wz);
+      slot.stockpileWorker.group.rotation.y = slot.dressingHeading;
+
+      if (slot.shovelActive) {
+        slot.shovelPhase += dt;
+        const u = clamp01(slot.shovelPhase / SHOVEL_CYCLE_DURATION);
+        // lean forward-and-back: 0 -> lean(1) -> back(0), a single easeOutCubic-in/out hump
+        const lean = Math.sin(u * Math.PI);
+        slot.stockpileWorker.arm.rotation.z = -0.2 - lean * 0.9;
+        slot.stockpileWorker.group.rotation.x = lean * 0.15;
+        if (u >= 1) {
+          slot.shovelActive = false;
+          slot.shovelPhase = 0;
+          slot.shovelIdleGap = SHOVEL_IDLE_GAP_MIN + Math.random() * (SHOVEL_IDLE_GAP_MAX - SHOVEL_IDLE_GAP_MIN);
+        }
+      } else {
+        slot.stockpileWorker.arm.rotation.z = damp(slot.stockpileWorker.arm.rotation.z, -0.2, 6, dt);
+        slot.stockpileWorker.group.rotation.x = damp(slot.stockpileWorker.group.rotation.x, 0, 6, dt);
+        slot.shovelPhase += dt;
+        if (slot.shovelPhase >= slot.shovelIdleGap) {
+          slot.shovelPhase = 0;
+          if (Math.random() < SHOVEL_CYCLE_CHANCE) {
+            slot.shovelActive = true;
+          } else {
+            slot.shovelIdleGap = SHOVEL_IDLE_GAP_MIN + Math.random() * (SHOVEL_IDLE_GAP_MAX - SHOVEL_IDLE_GAP_MIN);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Stockpile depletion (Task 26 deliverable 4): the gravel mound scales down across the job's
+   * stage progression — full (1.0) at survey/graded, tapering to STOCKPILE_MIN_SCALE by painting.
+   * Each job gets its own stockpile at its own start point (existing per-crew behavior, see
+   * `onProgress`'s stockpileEdgeId capture), so this simply reads whichever stage this crew's
+   * active anchor last reported and eases the mound's own scale toward that stage's target.
+   */
+  private updateStockpileDepletion(slot: CrewSlot, dt: number): void {
+    let stage: string | null = null;
+    for (const [kind, state] of slot.states) {
+      const lastSeen = slot.lastSeenAt.get(kind) ?? -Infinity;
+      if (this.clock - lastSeen <= this.IDLE_TIMEOUT && state.hasTarget) {
+        stage = state.stage;
+        break;
+      }
+    }
+    const stageIdx = stage ? Math.max(0, STAGES.indexOf(stage as Stage)) : 0;
+    const stageFrac = STAGES.length > 1 ? stageIdx / (STAGES.length - 1) : 0;
+    const targetScale = THREE.MathUtils.lerp(1, STOCKPILE_MIN_SCALE, stageFrac);
+    slot.stockpileScale = damp(slot.stockpileScale, targetScale, STOCKPILE_SCALE_LAMBDA, dt);
+    slot.stockpile.moundGroup.scale.setScalar(Math.max(0.05, slot.stockpileScale));
+  }
+
+  /**
+   * Paint stencil + wet sheen (Task 26 deliverable 5): the stencil frame prop simply fades in/out
+   * with the liner's own liveness (it's part of the liner rig, see `buildLiner`'s `stencilMesh`) —
+   * no additional per-frame positioning needed since it's parented to the liner's group. Wet-sheen
+   * on the fresh dashes themselves is handled in `roadRenderer.ts` (mirrors the fresh-asphalt
+   * roughness lerp there); this method only owns the stencil prop's opacity fade.
+   */
+  private updateStencil(slot: CrewSlot, state: VehicleState | undefined, active: boolean, dt: number): void {
+    const rig = slot.rigs.liner;
+    const painting = !!state && active && state.stage === 'painted';
+    const targetOpacity = painting ? 0.9 : 0;
+    rig.stencilMat!.opacity = damp(rig.stencilMat!.opacity, targetOpacity, 1 / MAT_FADE_TIME, dt);
+    rig.stencilMesh!.visible = rig.stencilMat!.opacity > 0.01;
+  }
+
+  /**
+   * Exhaust puffs (Task 26 deliverable 3): small dark particles from each active vehicle's exhaust
+   * stack, reusing the ParticlePool mechanism at a subtle rate (~1 puff/EXHAUST_INTERVAL per active
+   * vehicle). Spawned a little above and behind each vehicle's own position/heading so it reads as
+   * coming from a stack rather than the ground. The grader and roller (purely cosmetic trailing
+   * rigs) get puffs too — they're still "working" vehicles for this purpose.
+   */
+  private updateExhaust(slot: CrewSlot, dt: number): void {
+    for (const [kind, state] of slot.states) {
+      const lastSeen = slot.lastSeenAt.get(kind) ?? -Infinity;
+      const active = this.clock - lastSeen <= this.IDLE_TIMEOUT && state.hasTarget && state.scale > 0.5;
+      this.advanceExhaustTimer(slot, kind, state, active, dt);
+    }
+    const rollerActive = this.clock - slot.lastRollerSeenAt <= this.IDLE_TIMEOUT && slot.roller.scale > 0.5;
+    this.advanceExhaustTimer(slot, 'roller', slot.roller, rollerActive, dt);
+    const graderActive = this.clock - slot.lastGraderSeenAt <= this.IDLE_TIMEOUT && slot.grader.scale > 0.5;
+    this.advanceExhaustTimer(slot, 'grader', slot.grader, graderActive, dt);
+  }
+
+  /** Shared per-vehicle exhaust-timer/spawn logic used by `updateExhaust`. `key` is a plain string
+   * (not `VehicleKind`) so the grader — a purely render-synthesized rig with no corresponding
+   * VehicleKind in the sim's event contract — can use its own dedicated map slot ('grader') without
+   * risking a collision with a real per-crew vehicle's timer. */
+  private advanceExhaustTimer(slot: CrewSlot, key: string, state: VehicleState, active: boolean, dt: number): void {
+    if (!active) {
+      slot.exhaustTimer.set(key, 0);
+      return;
+    }
+    const t = (slot.exhaustTimer.get(key) ?? 0) + dt;
+    if (t >= EXHAUST_INTERVAL) {
+      slot.exhaustTimer.set(key, 0);
+      const upX = -Math.sin(state.curHeading) * 0.3;
+      const upZ = Math.cos(state.curHeading) * 0.3;
+      const backX = -Math.cos(state.curHeading) * 0.6;
+      const backZ = -Math.sin(state.curHeading) * 0.6;
+      this.exhaustPool.spawn(
+        state.curPos.x + backX + upX * 0.2,
+        state.curPos.y + 1.1,
+        state.curPos.z + backZ + upZ * 0.2,
+        (Math.random() - 0.5) * 0.15,
+        0.5 + Math.random() * 0.3,
+        (Math.random() - 0.5) * 0.15,
+      );
+    } else {
+      slot.exhaustTimer.set(key, t);
+    }
+  }
+
+  /**
    * Bridge crane theater (Task 22 deliverables 3/4): for every edge currently mid-crossing of a
    * bridge run during 'gravel'-stage work, stations the crane rig at the run's near end, slews its
    * cab to track whichever span is currently descending, and advances that span's descend
@@ -2578,6 +3086,16 @@ export class ConstructionRenderer {
       });
       slot.floodlight.headMat.dispose();
       slot.floodlight.poleMat.dispose();
+
+      for (const w of [slot.flagger, slot.spotter, slot.stockpileWorker]) {
+        this.scene.remove(w.group);
+        w.group.traverse((obj) => {
+          if (obj instanceof THREE.Mesh) obj.geometry.dispose();
+        });
+        for (const m of w.materials) m.dispose();
+      }
+
+      this.disposeRig(slot.grader.rig);
     }
 
     this.disposeRig(this.craneRig);
@@ -2585,11 +3103,13 @@ export class ConstructionRenderer {
     this.scene.remove(this.dustPool.points);
     this.scene.remove(this.steamPool.points);
     this.scene.remove(this.gravelPool.points);
+    this.scene.remove(this.exhaustPool.points);
     this.scene.remove(this.tireMarks.mesh);
     this.scene.remove(this.stakes.mesh);
     this.dustPool.dispose();
     this.steamPool.dispose();
     this.gravelPool.dispose();
+    this.exhaustPool.dispose();
     this.tireMarks.dispose();
     this.stakes.dispose();
 
