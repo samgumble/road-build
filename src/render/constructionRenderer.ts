@@ -123,6 +123,8 @@ const FLOODLIGHT_COLOR = '#ffcf8a';
 const FLOODLIGHT_SPACING = 70; // target arclength (u) between successive tower stations
 const FLOODLIGHT_PERP_OFFSET = ROAD_WIDTH_HALF + 2.2; // ± units from the centerline, per spec
 const FLOODLIGHT_CAP = 6; // per-crew tower budget (mirrors CONE_CAP's cap-then-widen-spacing approach)
+const FLOODLIGHT_STATION_MERGE_DIST = 8; // u; displaced bridge-avoidance stations within this
+                                          // arclength of another chosen station are dropped as duplicates
 const FLOODLIGHT_LIGHT_EASE = 0.8; // seconds to cross-fade the single shared SpotLight between towers
 
 // --- Bridge construction theater (Task 22) -----------------------------------------------------
@@ -1525,7 +1527,18 @@ class FloodlightTowerPool {
   }
 
   /** Computes fixed tower stations along `samples` and uploads them once — idempotent per edge,
-   * same one-shot-per-edge gate as `ConePool.place` (see `onProgress`). */
+   * same one-shot-per-edge gate as `ConePool.place` (see `onProgress`).
+   *
+   * Bridge avoidance (finding fix): a full-height tower plants on the terrain/shore, not the deck
+   * (the deck only extends to the rail, well short of `FLOODLIGHT_PERP_OFFSET`), so any station
+   * whose nearest sample is bridge-flagged gets displaced along the edge to the nearest non-bridge
+   * sample (searching both directions, preferring behind on ties). Displaced stations that land
+   * within `FLOODLIGHT_STATION_MERGE_DIST` of another already-chosen station are dropped as
+   * duplicates. If literally every sample on the edge is a bridge deck (a bridge spanning the
+   * entire road, ends included), there's no shore to clamp to — place exactly two towers at the
+   * two endpoint samples instead (the abutments), using deck y there since those samples remain
+   * bridge samples.
+   */
   place(edgeId: number, samples: RoadSample[], hf: Heightfield): void {
     this.placedEdgeId = edgeId;
     if (samples.length < 2) {
@@ -1540,6 +1553,25 @@ class FloodlightTowerPool {
     }
     const total = dist[dist.length - 1];
 
+    const allBridge = samples.every((s) => s.bridge);
+
+    let idx = 0;
+    if (allBridge) {
+      // No shore anywhere on this edge — stake the two endpoint "abutment" samples regardless.
+      const endpoints = samples.length === 2 ? [0, 1] : [0, samples.length - 1];
+      for (const sIdx of endpoints) {
+        if (idx >= FLOODLIGHT_CAP) break;
+        const a = samples[Math.max(0, sIdx - 1)];
+        const b = samples[Math.min(samples.length - 1, sIdx + 1)];
+        const s = samples[sIdx];
+        this.placeTowerAt(idx, s.x, s.z, s.y, a, b);
+        idx++;
+      }
+      this.liveCount = idx;
+      this.uploadMatrices();
+      return;
+    }
+
     let interiorCount = total > 0 ? Math.floor(total / FLOODLIGHT_SPACING) : 0;
     let stationCount = Math.max(2, interiorCount + 1);
     if (stationCount > FLOODLIGHT_CAP) stationCount = FLOODLIGHT_CAP;
@@ -1553,7 +1585,7 @@ class FloodlightTowerPool {
       }
     }
 
-    let idx = 0;
+    const chosenArclengths: number[] = [];
     let sampleCursor = 0;
     for (const t of stations) {
       if (idx >= FLOODLIGHT_CAP) break;
@@ -1562,26 +1594,75 @@ class FloodlightTowerPool {
       const b = samples[Math.min(sampleCursor + 1, samples.length - 1)];
       const segLen = dist[Math.min(sampleCursor + 1, samples.length - 1)] - dist[sampleCursor];
       const u = segLen > 1e-6 ? clamp01((t - dist[sampleCursor]) / segLen) : 0;
-      const x = a.x + (b.x - a.x) * u;
-      const z = a.z + (b.z - a.z) * u;
       const onBridge = u < 0.5 ? a.bridge : b.bridge;
-      const groundY = onBridge ? a.y + (b.y - a.y) * u : hf.heightAt(x, z);
 
-      const headingRad = Math.atan2(b.z - a.z, b.x - a.x);
-      const perpX = -Math.sin(headingRad);
-      const perpZ = Math.cos(headingRad);
-      // alternate sides per station (unlike cones, which place a pair each station)
-      const side = idx % 2 === 0 ? -1 : 1;
+      let placeIdx: number;
+      let placeArc: number;
+      if (!onBridge) {
+        placeIdx = u < 0.5 ? sampleCursor : Math.min(sampleCursor + 1, samples.length - 1);
+        placeArc = t;
+      } else {
+        // Station landed on a bridge deck — displace to the nearest non-bridge sample along the
+        // edge, searching both directions and preferring "behind" (lower arclength) on ties.
+        const nearestIdx = sampleCursor + (u < 0.5 ? 0 : 1);
+        let behind = -1;
+        for (let i = nearestIdx; i >= 0; i--) {
+          if (!samples[i].bridge) { behind = i; break; }
+        }
+        let ahead = -1;
+        for (let i = nearestIdx; i < samples.length; i++) {
+          if (!samples[i].bridge) { ahead = i; break; }
+        }
+        if (behind < 0 && ahead < 0) {
+          // Shouldn't happen (allBridge is handled above), but guard anyway.
+          continue;
+        }
+        if (behind < 0) {
+          placeIdx = ahead;
+        } else if (ahead < 0) {
+          placeIdx = behind;
+        } else {
+          const behindDist = dist[nearestIdx] - dist[behind];
+          const aheadDist = dist[ahead] - dist[nearestIdx];
+          placeIdx = aheadDist < behindDist ? ahead : behind; // ties favor behind
+        }
+        placeArc = dist[placeIdx];
+      }
 
-      this.posX[idx] = x + perpX * side * FLOODLIGHT_PERP_OFFSET;
-      this.posY[idx] = groundY;
-      this.posZ[idx] = z + perpZ * side * FLOODLIGHT_PERP_OFFSET;
-      // face back toward the road so the emissive head reads as aimed down-road
-      this.heading[idx] = headingRad + (side === -1 ? Math.PI / 2 : -Math.PI / 2);
+      // Drop duplicates: a displaced station that lands within FLOODLIGHT_STATION_MERGE_DIST of
+      // an already-chosen station's arclength is redundant.
+      if (chosenArclengths.some((c) => Math.abs(c - placeArc) < FLOODLIGHT_STATION_MERGE_DIST)) {
+        continue;
+      }
+
+      const s = samples[placeIdx];
+      const a2 = samples[Math.max(0, placeIdx - 1)];
+      const b2 = samples[Math.min(samples.length - 1, placeIdx + 1)];
+      this.placeTowerAt(idx, s.x, s.z, hf.heightAt(s.x, s.z), a2, b2);
+      chosenArclengths.push(placeArc);
       idx++;
     }
     this.liveCount = idx;
     this.uploadMatrices();
+  }
+
+  /** Fills slot `idx` with a tower at world (x, groundY, z), offset laterally by
+   * `FLOODLIGHT_PERP_OFFSET` and alternating sides per slot, using the heading derived from
+   * neighbor samples `a`/`b` (same convention the old inline placement used). */
+  private placeTowerAt(
+    idx: number, x: number, z: number, groundY: number, a: RoadSample, b: RoadSample,
+  ): void {
+    const headingRad = Math.atan2(b.z - a.z, b.x - a.x);
+    const perpX = -Math.sin(headingRad);
+    const perpZ = Math.cos(headingRad);
+    // alternate sides per station (unlike cones, which place a pair each station)
+    const side = idx % 2 === 0 ? -1 : 1;
+
+    this.posX[idx] = x + perpX * side * FLOODLIGHT_PERP_OFFSET;
+    this.posY[idx] = groundY;
+    this.posZ[idx] = z + perpZ * side * FLOODLIGHT_PERP_OFFSET;
+    // face back toward the road so the emissive head reads as aimed down-road
+    this.heading[idx] = headingRad + (side === -1 ? Math.PI / 2 : -Math.PI / 2);
   }
 
   /** Clears any placed towers (job removed/reset without a new placement following immediately). */

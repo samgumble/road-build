@@ -135,4 +135,123 @@ describe('floodlight towers stake down at fixed stations (Task 37)', () => {
     }
     expect(placedDuringDemolish).toBe(true);
   });
+
+  it('skips bridge-deck samples when choosing tower stations, clamping to shore', () => {
+    const bus = new EventBus();
+    const hf = new Heightfield('floodlight-bridge-test', bus);
+    // Flag a middle run of the real sampler's output as a bridge deck (same pattern as
+    // wilderness.test.ts's "does not clear trees near a bridge sample"), so we get realistic
+    // land-based samples on either side of a fake water crossing in the middle third.
+    const bridgeFromT = 60;
+    const bridgeToT = 160;
+    const bridgeSampler = (ctrl: { x: number; z: number }[]) => {
+      const base = makeSampler(hf)(ctrl);
+      let acc = 0;
+      return base.map((s, i) => {
+        if (i > 0) {
+          const p = base[i - 1];
+          acc += Math.hypot(s.x - p.x, s.z - p.z);
+        }
+        return { ...s, bridge: acc >= bridgeFromT && acc <= bridgeToT };
+      });
+    };
+    const graph = new RoadGraph(bus, bridgeSampler);
+    const queue = new BuildQueue(graph, hf, bus);
+    const scene = new THREE.Scene();
+    const roadRenderer = new RoadRenderer(scene, graph, bus, hf);
+    const renderer = new ConstructionRenderer(scene, bus, graph, hf, roadRenderer);
+    const anchor = findAnchor(hf, 220);
+    const [edgeId] = graph.commitChain([anchor, { x: anchor.x + 220, z: anchor.z }]);
+    const edge = graph.edges.get(edgeId)!;
+
+    // Collect the bridge-flagged samples' arclength span so we can check tower XZ doesn't fall
+    // within it (± a few u tolerance).
+    const bridgeSamples = edge.samples.filter((s) => s.bridge);
+    expect(bridgeSamples.length).toBeGreaterThan(0);
+
+    const dt = 1 / 60;
+    let placedCount = -1;
+    for (let i = 0; i < 30; i++) {
+      queue.update(dt);
+      renderer.update(dt, true);
+      if (floodlightPoolEdgeId(renderer, 0) === edgeId) {
+        placedCount = towerSnapshot(renderer, 0).length;
+        break;
+      }
+    }
+    expect(placedCount).toBeGreaterThan(0);
+
+    const positions = towerSnapshot(renderer, 0);
+
+    // Map each tower back to the edge's arclength via the nearest CENTERLINE sample (towers sit
+    // laterally offset by FLOODLIGHT_PERP_OFFSET, so we must compare arclength position, not raw
+    // XZ distance to a bridge sample — a tower can be "on" a bridge station while still being
+    // several units away from any single bridge sample's XZ).
+    const dist = new Float32Array(edge.samples.length);
+    for (let i = 1; i < edge.samples.length; i++) {
+      const a = edge.samples[i - 1], b = edge.samples[i];
+      dist[i] = dist[i - 1] + Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+    }
+    function nearestSample(x: number, z: number): { t: number; bridge: boolean } {
+      let best = 0, bestBridge = false, bestD = Infinity;
+      for (let i = 0; i < edge.samples.length; i++) {
+        const s = edge.samples[i];
+        const d = Math.hypot(s.x - x, s.z - z);
+        if (d < bestD) { bestD = d; best = dist[i]; bestBridge = s.bridge; }
+      }
+      return { t: best, bridge: bestBridge };
+    }
+
+    for (const pos of positions) {
+      const { bridge } = nearestSample(pos.x, pos.z);
+      expect(bridge).toBe(false);
+    }
+
+    // Towers should still exist on both land sides of the bridge run (i.e. some stations land
+    // before bridgeFromT and some after bridgeToT along the edge's arclength).
+    const arclengths = positions.map((p) => nearestSample(p.x, p.z).t);
+    expect(arclengths.some((t) => t < bridgeFromT)).toBe(true);
+    expect(arclengths.some((t) => t > bridgeToT)).toBe(true);
+    expect(bridgeSamples.length).toBeGreaterThan(0); // sanity: the stub sampler actually flagged a run
+  });
+
+  it('places exactly two towers at the endpoints when the entire edge is a bridge run', () => {
+    const bus = new EventBus();
+    const hf = new Heightfield('floodlight-all-bridge-test', bus);
+    const bridgeSampler = (ctrl: { x: number; z: number }[]) => {
+      const base = makeSampler(hf)(ctrl);
+      return base.map((s) => ({ ...s, bridge: true }));
+    };
+    const graph = new RoadGraph(bus, bridgeSampler);
+    const queue = new BuildQueue(graph, hf, bus);
+    const scene = new THREE.Scene();
+    const roadRenderer = new RoadRenderer(scene, graph, bus, hf);
+    const renderer = new ConstructionRenderer(scene, bus, graph, hf, roadRenderer);
+    const anchor = findAnchor(hf, 100);
+    const [edgeId] = graph.commitChain([anchor, { x: anchor.x + 100, z: anchor.z }]);
+    const edge = graph.edges.get(edgeId)!;
+
+    const dt = 1 / 60;
+    let placedCount = -1;
+    let positions: { x: number; y: number; z: number }[] = [];
+    for (let i = 0; i < 30; i++) {
+      queue.update(dt);
+      renderer.update(dt, true);
+      if (floodlightPoolEdgeId(renderer, 0) === edgeId) {
+        positions = towerSnapshot(renderer, 0);
+        placedCount = positions.length;
+        break;
+      }
+    }
+    expect(placedCount).toBe(2);
+    const first = edge.samples[0];
+    const last = edge.samples[edge.samples.length - 1];
+    const endpoints = [first, last];
+    for (const pos of positions) {
+      const nearestEndpointDist = Math.min(
+        ...endpoints.map((e) => Math.hypot(pos.x - e.x, pos.z - e.z)),
+      );
+      expect(nearestEndpointDist).toBeLessThan(10);
+    }
+  });
 });
