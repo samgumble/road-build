@@ -71,7 +71,9 @@ describe('floodlight towers stake down at fixed stations (Task 37)', () => {
       }
     }
     expect(placedCount).toBeGreaterThan(0);
-    expect(placedCount).toBeLessThanOrEqual(6); // FLOODLIGHT_CAP
+    // Task 45: density doubled (FLOODLIGHT_CAP 6 -> 12, FLOODLIGHT_SPACING 70u -> 35u) so a job
+    // site reads as densely lit at night — this cap reflects that spec change, not a regression.
+    expect(placedCount).toBeLessThanOrEqual(12); // FLOODLIGHT_CAP
 
     // Advance the job substantially (well into gravel/graded/paved stages) — the work front moves
     // a long way down the 220u edge in this window.
@@ -89,7 +91,9 @@ describe('floodlight towers stake down at fixed stations (Task 37)', () => {
     }
   });
 
-  it('caps towers at 6 and widens spacing rather than exceeding the per-crew budget on a long edge', () => {
+  it('caps towers at 12 and widens spacing rather than exceeding the per-crew budget on a long edge', () => {
+    // Task 45: 600u / 35u spacing would want ~18 stations, well past the new FLOODLIGHT_CAP=12 —
+    // still exercises the cap-then-widen-spacing path the same way the pre-T45 6-cap test did.
     const { queue, renderer, edgeId } = buildRig('floodlight-cap-test', 600);
 
     const dt = 1 / 60;
@@ -103,7 +107,7 @@ describe('floodlight towers stake down at fixed stations (Task 37)', () => {
       }
     }
     expect(placedCount).toBeGreaterThan(0);
-    expect(placedCount).toBeLessThanOrEqual(6);
+    expect(placedCount).toBeLessThanOrEqual(12);
   });
 
   it('fades towers out with the crew dressing on job completion and re-places on a later demolish job', () => {

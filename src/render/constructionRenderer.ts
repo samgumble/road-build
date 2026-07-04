@@ -118,14 +118,33 @@ const TIRE_MARK_INTERVAL = 0.25; // seconds between mark stamps per active vehic
 const TIRE_MARK_COLOR = '#2a2420';
 
 // --- Floodlight (Task 37: towers stake down at fixed stations, like the T27 cones) -------------
+// Task 45: denser construction lighting at night ("more construction lights") — spacing halved
+// (70u -> 35u) and the per-crew cap doubled (6 -> 12) so a long job reads as a properly lit night
+// site rather than a handful of sparse poles. Same alternating-sides / bridge-avoidance / cap-
+// then-widen-spacing behavior as before, just at 2x the station density.
 const FLOODLIGHT_EASE = 1.2; // seconds to ease in/out with night + job-active state
 const FLOODLIGHT_COLOR = '#ffcf8a';
-const FLOODLIGHT_SPACING = 70; // target arclength (u) between successive tower stations
+const FLOODLIGHT_SPACING = 35; // target arclength (u) between successive tower stations (was 70)
 const FLOODLIGHT_PERP_OFFSET = ROAD_WIDTH_HALF + 2.2; // ± units from the centerline, per spec
-const FLOODLIGHT_CAP = 6; // per-crew tower budget (mirrors CONE_CAP's cap-then-widen-spacing approach)
+const FLOODLIGHT_CAP = 12; // per-crew tower budget (was 6) — mirrors CONE_CAP's cap-then-widen-spacing approach
 const FLOODLIGHT_STATION_MERGE_DIST = 8; // u; displaced bridge-avoidance stations within this
                                           // arclength of another chosen station are dropped as duplicates
 const FLOODLIGHT_LIGHT_EASE = 0.8; // seconds to cross-fade the single shared SpotLight between towers
+
+// --- Task 45: visible cast light per tower (ground pool + downward cone) -----------------------
+// Cheap "visible cast light" trick, same family as carRenderer's headlight glow-quad/beam-cone
+// pair: one InstancedMesh each for the warm ground pool and the downward light cone, shared across
+// ALL crews (not per-crew) since they're purely additive decals with no per-crew material state.
+// Bounded at MAX_CREWS * FLOODLIGHT_CAP instances each (3*12 = 36) regardless of how many towers
+// are actually live at once.
+const FLOODLIGHT_POOL_RADIUS = 7; // u, ground pool ellipse radius
+const FLOODLIGHT_POOL_OPACITY = 0.25;
+const FLOODLIGHT_POOL_COLOR = '#ffb862';
+const FLOODLIGHT_CONE_TOP_RADIUS = 0.55; // u, matches the head's footprint at the top of the cone
+const FLOODLIGHT_CONE_OPACITY = 0.15;
+// Task 45 deliverable 3: emissive head intensity bumped (2.2 -> 3.1) so heads read clearly as the
+// light source at night, not just a lit prop — same multiplier-by-floodlightVisibility eased signal.
+const FLOODLIGHT_HEAD_EMISSIVE = 3.1;
 
 // --- Bridge construction theater (Task 22) -----------------------------------------------------
 const BRIDGE_SPAN_LENGTH = BRIDGE_PYLON_SPACING; // 16u, matches roadRenderer's pylon spacing/deck masking
@@ -1679,6 +1698,13 @@ class FloodlightTowerPool {
     return this.liveCount;
   }
 
+  /** Current eased fade scale (0..1, `easeOutCubic`'d) — same signal driving the pole/head
+   * InstancedMesh scale. Read by `FloodlightGroundLightPool` (Task 45) so ground pools/cones fade
+   * with the exact same crew-dressing curve as the towers themselves, no separate easing state. */
+  get fadeScale(): number {
+    return this.curScale;
+  }
+
   /** World position of tower `i` (valid for `i < count`). */
   towerPos(i: number): { x: number; y: number; z: number } {
     return { x: this.posX[i], y: this.posY[i], z: this.posZ[i] };
@@ -1754,6 +1780,145 @@ class FloodlightTowerPool {
     this.headMesh.geometry.dispose();
     this.poleMat.dispose();
     this.headMat.dispose();
+  }
+}
+
+const groundPoolDummy = new THREE.Object3D();
+const groundConeDummy = new THREE.Object3D();
+const upAxisFloodlight = new THREE.Vector3(0, 1, 0);
+
+/**
+ * Task 45: "visible cast light" per floodlight tower — the same cheap trick `carRenderer` uses for
+ * headlights (an additive, depthWrite:false ground quad standing in for a real light's visible
+ * footprint), applied to every placed-and-visible floodlight tower across ALL crews:
+ *
+ * - a warm ground "pool" ellipse quad flat on the terrain under the tower head, and
+ * - a subtle downward "cone" quad running from the head down to the ground, oriented facing along
+ *   the tower's heading (so it reads as a beam falling toward the road, matching the tower's
+ *   down-road aim) — the vertical analogue of the car beam's horizontal trapezoid.
+ *
+ * Both are ONE InstancedMesh each (2 draw calls total, not per crew) since they're pure additive
+ * decals sharing one material per mesh — exactly the `poleMesh`/`headMesh` "2 draw calls regardless
+ * of tower count" pattern `FloodlightTowerPool` already established, just shared across crews too.
+ * Capacity is bounded at `MAX_CREWS * FLOODLIGHT_CAP` instances each (3*12 = 36) so the draw-call
+ * and vertex budget never depends on how many towers happen to be live.
+ *
+ * Visibility is driven per-instance by the OWNING crew's `floodlightVisibility` (night && job-
+ * active, eased — see `updateFloodlight`) multiplied by that tower's own `FloodlightTowerPool`
+ * fade scale (job-dressing fade — see `FloodlightTowerPool.update`), so a pool/cone only shows when
+ * it's night AND the crew's towers are actually visible, easing in/out with both signals exactly
+ * like the emissive head glow does. Instances beyond what's currently visible are parked off-screen
+ * (scale 0) rather than toggling `mesh.count`, so partial visibility across crews (e.g. one crew's
+ * job just started fading in while another's is fully faded out) composes correctly without needing
+ * a compacting pass.
+ */
+class FloodlightGroundLightPool {
+  readonly poolMesh: THREE.InstancedMesh;
+  readonly coneMesh: THREE.InstancedMesh;
+  private readonly poolMat: THREE.MeshBasicMaterial;
+  private readonly coneMat: THREE.MeshBasicMaterial;
+  private readonly capacity: number;
+
+  constructor(capacity: number) {
+    this.capacity = capacity;
+
+    // Ground pool: a flat circular quad (CircleGeometry), laid flat (rotated to face up) and
+    // lifted a hair above the terrain to avoid z-fighting.
+    const poolGeo = new THREE.CircleGeometry(FLOODLIGHT_POOL_RADIUS, 16);
+    poolGeo.rotateX(-Math.PI / 2);
+    poolGeo.translate(0, 0.04, 0);
+    this.poolMat = new THREE.MeshBasicMaterial({
+      color: FLOODLIGHT_POOL_COLOR,
+      toneMapped: false,
+      transparent: true,
+      opacity: FLOODLIGHT_POOL_OPACITY,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    });
+    this.poolMesh = new THREE.InstancedMesh(poolGeo, this.poolMat, capacity);
+    this.poolMesh.frustumCulled = false;
+    this.poolMesh.count = capacity;
+
+    // Downward cone quad: authored in local space standing at the origin facing local +Z, narrow
+    // at the top (head height, y=6.1 — matches the tower head's mounted height) and spreading to
+    // FLOODLIGHT_POOL_RADIUS at the ground (y=0), same "flat trapezoid" trick as carRenderer's
+    // beam quad but oriented vertically (falling down the tower instead of projecting ahead).
+    const coneGeo = new THREE.BufferGeometry();
+    const cp = new Float32Array([
+      -FLOODLIGHT_CONE_TOP_RADIUS, 6.1, 0,
+      FLOODLIGHT_CONE_TOP_RADIUS, 6.1, 0,
+      FLOODLIGHT_POOL_RADIUS * 0.6, 0.05, 0,
+      -FLOODLIGHT_POOL_RADIUS * 0.6, 0.05, 0,
+    ]);
+    coneGeo.setAttribute('position', new THREE.BufferAttribute(cp, 3));
+    coneGeo.setIndex([0, 1, 2, 0, 2, 3]);
+    this.coneMat = new THREE.MeshBasicMaterial({
+      color: FLOODLIGHT_POOL_COLOR,
+      toneMapped: false,
+      transparent: true,
+      opacity: FLOODLIGHT_CONE_OPACITY,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    });
+    this.coneMesh = new THREE.InstancedMesh(coneGeo, this.coneMat, capacity);
+    this.coneMesh.frustumCulled = false;
+    this.coneMesh.count = capacity;
+  }
+
+  /** Rebuilds every instance's transform from scratch each frame: iterates `towerPools` (one
+   * `FloodlightTowerPool` per crew) and, for each live tower, writes a pool+cone instance scaled by
+   * `nightAmount * tower.fadeScale` (parked at scale 0 when that product is ~0, or when capacity
+   * runs out — silently dropped, same "cap-then-drop" behavior as the towers themselves). `heading`
+   * orients the cone to fall toward the road, matching the tower's own facing. */
+  update(towerPools: ReadonlyArray<{ pool: FloodlightTowerPool; nightAmount: number }>): void {
+    let idx = 0;
+    for (const { pool, nightAmount } of towerPools) {
+      const fade = nightAmount * pool.fadeScale;
+      if (fade <= 0.001) continue;
+      for (let i = 0; i < pool.count; i++) {
+        if (idx >= this.capacity) break;
+        const p = pool.towerPos(i);
+        const heading = pool.towerHeading(i);
+
+        groundPoolDummy.position.set(p.x, p.y, p.z);
+        groundPoolDummy.rotation.set(0, 0, 0);
+        groundPoolDummy.scale.setScalar(fade);
+        groundPoolDummy.updateMatrix();
+        this.poolMesh.setMatrixAt(idx, groundPoolDummy.matrix);
+
+        groundConeDummy.position.set(p.x, p.y, p.z);
+        groundConeDummy.quaternion.setFromAxisAngle(upAxisFloodlight, heading);
+        groundConeDummy.scale.setScalar(fade);
+        groundConeDummy.updateMatrix();
+        this.coneMesh.setMatrixAt(idx, groundConeDummy.matrix);
+
+        idx++;
+      }
+    }
+    for (; idx < this.capacity; idx++) {
+      groundPoolDummy.position.set(0, -9999, 0);
+      groundPoolDummy.rotation.set(0, 0, 0);
+      groundPoolDummy.scale.setScalar(0.001);
+      groundPoolDummy.updateMatrix();
+      this.poolMesh.setMatrixAt(idx, groundPoolDummy.matrix);
+
+      groundConeDummy.position.set(0, -9999, 0);
+      groundConeDummy.rotation.set(0, 0, 0);
+      groundConeDummy.scale.setScalar(0.001);
+      groundConeDummy.updateMatrix();
+      this.coneMesh.setMatrixAt(idx, groundConeDummy.matrix);
+    }
+    this.poolMesh.instanceMatrix.needsUpdate = true;
+    this.coneMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  dispose(): void {
+    this.poolMesh.geometry.dispose();
+    this.coneMesh.geometry.dispose();
+    this.poolMat.dispose();
+    this.coneMat.dispose();
   }
 }
 
@@ -1999,6 +2164,13 @@ export class ConstructionRenderer {
   private quarryPopElapsed = 0; // seconds since placement, drives the pop-in ease
   private quarryPopping = false;
 
+  // --- Task 45: visible cast light per floodlight tower --------------------------------------
+  // One shared pool across ALL crews (not per-crew) — see FloodlightGroundLightPool's class doc.
+  private floodlightGroundLights: FloodlightGroundLightPool;
+  // Scratch array reused every frame by the ground-light update call below, avoiding a fresh
+  // array/object allocation per rendered frame (MAX_CREWS entries, mutated in place).
+  private floodlightGroundLightScratch: { pool: FloodlightTowerPool; nightAmount: number }[] = [];
+
   constructor(
     private scene: THREE.Scene,
     bus: EventBus,
@@ -2044,6 +2216,13 @@ export class ConstructionRenderer {
     this.craneSegment = craneSegmentParts.mesh;
     this.craneSegmentMat = craneSegmentParts.mat;
     this.scene.add(this.craneSegment);
+
+    this.floodlightGroundLights = new FloodlightGroundLightPool(MAX_CREWS * FLOODLIGHT_CAP);
+    this.scene.add(this.floodlightGroundLights.poolMesh);
+    this.scene.add(this.floodlightGroundLights.coneMesh);
+    for (const slot of this.crews) {
+      this.floodlightGroundLightScratch.push({ pool: slot.floodlightTowers, nightAmount: 0 });
+    }
 
     bus.on('construction:progress', (e) => this.onProgress(e));
     // Safety net for stakes: grading normally sweeps every planted stake away as the work front
@@ -2803,6 +2982,16 @@ export class ConstructionRenderer {
     for (let crew = 0; crew < this.crews.length; crew++) {
       this.updateCrew(crew, dt, night, stepDt);
     }
+
+    // Task 45: visible cast light per tower (ground pool + downward cone) — one shared pool across
+    // all crews, rebuilt every frame from each crew's live tower positions. `floodlightVisibility`
+    // is already "night && this crew's job is active, eased" (see updateFloodlight), so reusing it
+    // here means the pools/cones fade in/out in lockstep with the emissive head glow and the real
+    // SpotLight, no separate night-gating logic to keep in sync.
+    for (let crew = 0; crew < this.crews.length; crew++) {
+      this.floodlightGroundLightScratch[crew].nightAmount = this.crews[crew].floodlightVisibility;
+    }
+    this.floodlightGroundLights.update(this.floodlightGroundLightScratch);
 
     // Shared per-frame updates (Task 25: pools/marks/stakes are shared capacity pools, not
     // per-crew — every crew stamps/spawns into the same ones).
@@ -3767,7 +3956,7 @@ export class ConstructionRenderer {
     // beam is swinging to the next tower", not "the light teleported").
     const mixEase = slot.floodlightAnchorTower >= 0 ? easeOutCubic(slot.floodlightLightMix) : 1;
     slot.floodlightLight.intensity = slot.floodlightVisibility * 6 * (0.4 + 0.6 * mixEase);
-    towers.setHeadEmissive(slot.floodlightVisibility * 2.2);
+    towers.setHeadEmissive(slot.floodlightVisibility * FLOODLIGHT_HEAD_EMISSIVE);
   }
 
   private disposeRig(rig: VehicleRig): void {
@@ -3831,5 +4020,9 @@ export class ConstructionRenderer {
     this.scene.remove(this.craneSegment);
     this.craneSegment.geometry.dispose();
     this.craneSegmentMat.dispose();
+
+    this.scene.remove(this.floodlightGroundLights.poolMesh);
+    this.scene.remove(this.floodlightGroundLights.coneMesh);
+    this.floodlightGroundLights.dispose();
   }
 }
