@@ -74,6 +74,11 @@ const WATER_FRAGMENT_SHADER = /* glsl */ `
   uniform vec3 uDeepColor;
   uniform float uOpacity;
   uniform float uFoamAnimAmount; // 0 on low tier (static band), 1 on high (animated)
+  // Task 38: eased 0..1 daylight signal from Atmosphere (1.0 midday, floors ~0.25 deep night).
+  // Scales foam visibility and base water brightness so lakes dim at night along with the rest of
+  // the lit scene, instead of glowing at a constant brightness while terrain dims around them.
+  // uDaylight == 1.0 must reduce every term below to exactly its pre-Task-38 value (day unchanged).
+  uniform float uDaylight;
   uniform vec3 fogColor;
   uniform float fogNear;
   uniform float fogFar;
@@ -106,7 +111,18 @@ const WATER_FRAGMENT_SHADER = /* glsl */ `
     float foam = 1.0 - smoothstep(0.0, 0.09, animatedShore);
     float sparkle = waterNoise(vWorldXZ * 0.6 + uTime * 0.4 * uFoamAnimAmount);
     foam *= 0.75 + 0.25 * sparkle;
+    // Task 38: foam scales down with daylight - white shore-foam sparkle is a daylight phenomenon
+    // (sun glint/whitecaps) and reads as an unnatural glow when it stays full-bright at night.
+    // uDaylight == 1.0 (midday) leaves foam untouched, so day rendering is unchanged.
+    foam *= uDaylight;
     col = mix(col, vec3(0.95, 0.98, 1.0), foam);
+
+    // Task 38: scale overall water brightness by daylight so lakes dim at night along with lit
+    // terrain instead of holding a constant (relatively bright) tint that reads as glowing once
+    // the surrounding scene has gone dark. uDaylight == 1.0 is an exact no-op (col unchanged);
+    // it floors at DAYLIGHT_NIGHT_FLOOR (~0.25, see atmosphere.ts) so night water stays a barely-
+    // readable dark mirror rather than crushing to pure black.
+    col *= uDaylight;
 
     float alpha = mix(uOpacity, min(1.0, uOpacity + foam * 0.3), foam);
 
@@ -207,6 +223,7 @@ export class TerrainRenderer {
           uRippleAmp: { value: WATER_RIPPLE_AMP },
           uRippleSpeed: { value: WATER_RIPPLE_SPEED },
           uFoamAnimAmount: { value: WATER_FOAM_ANIM },
+          uDaylight: { value: 1 },
         },
       ]),
       transparent: true,
@@ -277,10 +294,17 @@ export class TerrainRenderer {
     waterGeo.setAttribute('aEdgeFade', new THREE.BufferAttribute(edgeFadeArr, 1));
   }
 
-  /** Advances the water ripple/foam time uniform. Called every render frame from main.ts. */
-  update(dt: number): void {
+  /**
+   * Advances the water ripple/foam time uniform and feeds Atmosphere's eased daylight signal
+   * into the water shader (Task 38: night water dims instead of glowing — see uDaylight comments
+   * in WATER_FRAGMENT_SHADER). `daylight` defaults to 1 (full day / no-op) so callers that don't
+   * pass it — none currently, but kept safe for tests constructing this in isolation — keep the
+   * pre-Task-38 look. Called every render frame from main.ts.
+   */
+  update(dt: number, daylight = 1): void {
     this.waterTime += dt;
     this.waterMaterial.uniforms.uTime.value = this.waterTime;
+    this.waterMaterial.uniforms.uDaylight.value = daylight;
   }
 
   private colorForVertex(i: number, j: number, y: number): THREE.Color {

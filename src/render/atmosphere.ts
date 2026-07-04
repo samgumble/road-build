@@ -76,6 +76,14 @@ const RAIN_MAX_DURATION = 60;
 
 const NIGHT_HYSTERESIS = 0.02;
 
+// Task 38: eased 0..1 daylight signal for anything downstream (water shader) that needs to scale
+// its own brightness with the day/night cycle. Reuses the exact same sun-elevation easing curve
+// already driving hemi intensity (`elevation01` in applyTimeOfDay) rather than introducing a
+// second keyframe/easing system — DAYLIGHT_NIGHT_FLOOR mirrors the "clear night, not a moonless
+// pit" floor established in Task 23 (see SKY_STOPS/hemi comments) so water stays barely readable
+// rather than going fully black.
+const DAYLIGHT_NIGHT_FLOOR = 0.25;
+
 const EXPOSURE_DAY = 1.0;
 // Task 23: raised from 0.65 so ACES tone mapping doesn't crush night scenes to near-black;
 // 0.75 keeps a clear day/night exposure difference while making terrain silhouettes readable.
@@ -106,6 +114,7 @@ export class Atmosphere {
   private baseFogFar: number;
   private sky: Sky;
   private sunDirScratch = new THREE.Vector3();
+  private daylightValue = 1;
 
   constructor(
     private scene: THREE.Scene,
@@ -158,6 +167,12 @@ export class Atmosphere {
 
   get night(): boolean {
     return this.wasNight;
+  }
+
+  /** Eased 0..1 daylight signal: 1.0 at midday, floors at DAYLIGHT_NIGHT_FLOOR (~0.25) in deep
+   * night. Derived from the same sun-elevation easing as hemi intensity — see applyTimeOfDay. */
+  get daylight(): number {
+    return this.daylightValue;
   }
 
   private buildClouds(): void {
@@ -341,6 +356,10 @@ export class Atmosphere {
     // part of the night still has enough ambient skyglow to read terrain silhouettes, without
     // raising the daytime end (keeps day/night contrast, i.e. the "mood", intact).
     this.hemi.intensity = THREE.MathUtils.lerp(0.24, 0.55, elevation01);
+
+    // Task 38: eased daylight signal for the water shader, same elevation01 curve as hemi above.
+    // At elevation01=1 (midday) this is exactly 1.0, a no-op vs. pre-Task-38 water rendering.
+    this.daylightValue = THREE.MathUtils.lerp(DAYLIGHT_NIGHT_FLOOR, 1.0, elevation01);
 
     // Sky dome consumes the same horizon color driving fog/background, plus the sun's true
     // (unclamped-y) direction for its disc/glow — using the un-clamped elevationRaw for the disc's

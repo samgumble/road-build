@@ -231,7 +231,9 @@ function main(): void {
       // scheduling (bird/cricket timers, pad chord crossfades), not to advance the day cycle —
       // `timeOfDay` is read from `atmosphere.timeOfDay`, which is already correctly scaled above.
       audio.update(dt, atmosphere.timeOfDay, camera.position.x);
-      terrain.update(dt);
+      // Task 38: feed Atmosphere's eased daylight signal into the water shader so lakes/ponds dim
+      // at night along with the rest of the lit scene instead of glowing at a constant brightness.
+      terrain.update(dt, atmosphere.daylight);
       renderFrame();
     },
   );
