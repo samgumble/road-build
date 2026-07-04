@@ -10,6 +10,13 @@ import { easeOutCubic, clamp01 } from './easing';
 const REBUILD_THROTTLE = 0.15; // seconds, per edge, during progress events
 const SHEEN_DURATION = 25; // seconds for fresh-asphalt roughness lerp
 
+// --- Wet-sheen centerline dashes (Groundwork Task 26 deliverable 5) -----------------------------
+// Mirrors the fresh-asphalt roughness lerp above, but scoped to the painted centerline dash mesh
+// specifically and on its own (shorter) timer, since paint dries faster than asphalt cures.
+const WET_SHEEN_DURATION = 15; // seconds, roughness lerp WET_SHEEN_START -> WET_SHEEN_END
+const WET_SHEEN_START = 0.3;
+const WET_SHEEN_END = 0.85;
+
 export const STAGE_COLOR: Record<Stage, string> = {
   surveyed: '#e8641b',
   graded: '#8a6f4d',
@@ -468,6 +475,7 @@ interface EdgeVisual {
   lastRebuildAt: number;
   pending: PendingProgress | null;
   freshAsphaltAt: number | null; // performance.now()/1000-style seconds when 'paved' stage began, or null
+  wetPaintAt: number | null; // clockSeconds when 'painted' stage began, or null (Task 26 deliverable 5)
   gradedT: number; // latest reported graded-stage arclength (drives pylon rise); 0 if never graded
   gradedDemolish: boolean; // latest graded progress event's demolish flag (sinks pylons in reverse)
   bridgeMaskTo: number | null; // arclength (edge-absolute) the deck/rails may draw up to within bridge
@@ -513,6 +521,14 @@ export class RoadRenderer {
     if (stage === 'paved') {
       const vv = this.ensureVisual(edge);
       vv.freshAsphaltAt = this.clockSeconds;
+    }
+    if (stage === 'painted') {
+      // Wet-sheen dashes (Task 26 deliverable 5): retrigger the paint-specific timer independent of
+      // `freshAsphaltAt` — by the time painting starts, the asphalt sheen may already have finished
+      // (SHEEN_DURATION=25s vs. the paved->painted stage transition), but the dashes are always
+      // freshly laid right now.
+      const vv = this.ensureVisual(edge);
+      vv.wetPaintAt = this.clockSeconds;
     }
     // Bug fix (Task 22 critical finding): `ensureVisual`'s `gradedT` seed
     // (`edge.stage === 'surveyed' ? 0 : edge.length`) can never actually fire from anything but 0,
@@ -569,6 +585,7 @@ export class RoadRenderer {
         lastRebuildAt: -Infinity,
         pending: null,
         freshAsphaltAt: edge.stage === 'paved' || edge.stage === 'painted' ? this.clockSeconds : null,
+        wetPaintAt: edge.stage === 'painted' ? this.clockSeconds : null,
         gradedT: edge.stage === 'surveyed' ? 0 : edge.length, // already past graded => pylons fully risen
         gradedDemolish: false,
         bridgeMaskTo: null,
@@ -740,7 +757,12 @@ export class RoadRenderer {
     if (stage === 'painted') {
       const dashGeo = buildDashedRibbonGeometry(samples, CENTERLINE_WIDTH, CENTERLINE_YLIFT, from, to, 2);
       const dashMat = makeStandardMaterial(CENTERLINE_COLOR, 1, 'stripe');
-      this.addMesh(v, dashGeo, dashMat);
+      // Wet-sheen (Task 26 deliverable 5): fresh center dashes get a brief gloss right after
+      // painting, mirroring the fresh-asphalt roughness lerp above but on their own shorter timer
+      // (see WET_SHEEN_DURATION) — paint dries faster than asphalt cures.
+      dashMat.roughness = WET_SHEEN_START;
+      const dashMesh = this.addMesh(v, dashGeo, dashMat);
+      dashMesh.userData.wetPaint = true;
     }
   }
 
@@ -946,6 +968,18 @@ export class RoadRenderer {
           (m.material as THREE.MeshStandardMaterial).roughness = roughness;
         }
         if (u >= 1) v.freshAsphaltAt = null;
+      }
+
+      // advance wet-sheen roughness lerp on the painted centerline dashes (Task 26 deliverable 5)
+      if (v.wetPaintAt !== null) {
+        const elapsed = this.clockSeconds - v.wetPaintAt;
+        const u = Math.max(0, Math.min(1, elapsed / WET_SHEEN_DURATION));
+        const roughness = WET_SHEEN_START + (WET_SHEEN_END - WET_SHEEN_START) * u;
+        for (const m of v.meshes) {
+          if (!m.userData.wetPaint) continue;
+          (m.material as THREE.MeshStandardMaterial).roughness = roughness;
+        }
+        if (u >= 1) v.wetPaintAt = null;
       }
     }
 
