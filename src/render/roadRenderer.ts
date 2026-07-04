@@ -59,12 +59,6 @@ const BRIDGE_PYLON_RADIUS = 0.9;
 // each defining their own "span length" that could silently drift out of sync.
 export const BRIDGE_PYLON_SPACING = 16;
 
-/** Previous stage in the construction order; 'surveyed' has no previous stage. */
-function prevStage(stage: Stage): Stage | null {
-  const i = STAGES.indexOf(stage);
-  return i > 0 ? STAGES[i - 1] : null;
-}
-
 interface SamplePoint {
   x: number;
   y: number;
@@ -433,9 +427,22 @@ function makeStandardMaterial(
   });
 }
 
-interface PendingProgress {
-  stage: Stage;
-  t: number;
+/**
+ * Task 36: with the pipelined stage train, up to 4 buildable-stage fronts can be concurrently
+ * in-flight on one edge (graded/gravel/paved/painted), each reporting its OWN arclength `t` via
+ * its own `construction:progress` event — so a single `{stage, t}` "the one in-progress boundary"
+ * (the pre-Task-36 shape) can no longer represent an edge's live state. `FrontProgress` instead
+ * tracks the latest reported `t` for EVERY buildable stage at once (`null` = no live progress ever
+ * reported for that stage this job; the render falls back to `edge.stage`-derived defaults — see
+ * `rebuild()`). Persists across ticks (never cleared on its own) so a stage that's since gone idle
+ * (e.g. a front already finished, now waiting idle as its own leader-gate) keeps rendering at its
+ * last known position rather than snapping back to 0.
+ */
+interface FrontProgress {
+  graded: number | null;
+  gravel: number | null;
+  paved: number | null;
+  painted: number | null;
 }
 
 // --- Bridge construction theater (Task 22) ---------------------------------------------------
@@ -473,7 +480,15 @@ interface EdgeVisual {
   group: THREE.Group;
   meshes: THREE.Mesh[];
   lastRebuildAt: number;
-  pending: PendingProgress | null;
+  /** Task 36: `null` while no live (non-stage-event) progress has ever been reported for this
+   * edge's current job — same "full-stage event supersedes any partial progress" convention the
+   * pre-Task-36 single `pending` field used (see `onStage`). Once non-null, tracks every buildable
+   * stage's latest front `t` independently (see `FrontProgress`). */
+  pending: FrontProgress | null;
+  /** The survey pass's own arclength (unaffected by Task 36 — survey remains a single discrete
+   * boundary, never multiple concurrent "fronts"); `null` once survey has handed off to the train
+   * (or was never reached, e.g. a resumed job). See `onProgress`'s `stage === 'surveyed'` branch. */
+  surveyPending: number | null;
   freshAsphaltAt: number | null; // performance.now()/1000-style seconds when 'paved' stage began, or null
   wetPaintAt: number | null; // clockSeconds when 'painted' stage began, or null (Task 26 deliverable 5)
   gradedT: number; // latest reported graded-stage arclength (drives pylon rise); 0 if never graded
@@ -517,7 +532,15 @@ export class RoadRenderer {
     const edge = this.graph.edges.get(edgeId);
     if (!edge) return;
     const v = this.visuals.get(edgeId);
-    if (v) v.pending = null; // full-stage event supersedes any partial progress
+    if (v) {
+      // Task 36: a full-stage event supersedes ANY partial progress for that stage — clear its
+      // front entry (not the whole map) so a sibling front still genuinely in-flight (e.g. gravel
+      // completing while paved is still working its own stretch behind it) keeps rendering its own
+      // live boundary. `stage` here is always a buildable stage (never 'surveyed' — see the class
+      // doc; survey never fires a stage transition), so it's always a valid `FrontProgress` key.
+      if (v.pending) v.pending[stage as Exclude<Stage, 'surveyed'>] = null;
+      v.surveyPending = null;
+    }
     if (stage === 'paved') {
       const vv = this.ensureVisual(edge);
       vv.freshAsphaltAt = this.clockSeconds;
@@ -564,7 +587,22 @@ export class RoadRenderer {
     const edge = this.graph.edges.get(edgeId);
     if (!edge) return;
     const v = this.ensureVisual(edge);
-    v.pending = { stage, t };
+    if (stage === 'surveyed') {
+      // Survey remains a discrete first pass (binding spec) — unaffected by Task 36's multi-band
+      // train rendering below. Reuse the same single-boundary shape (`FrontProgress` isn't
+      // meaningful yet since no buildable-stage front exists during survey), keyed onto `graded`
+      // internally isn't right either — instead stash it in a dedicated slot so `rebuild()` can
+      // tell "surveying in progress" apart from "a train front is live", and clear the moment a
+      // train front actually starts (`pending` below takes over from then on for this job).
+      v.surveyPending = t;
+      v.pending = null;
+      return;
+    }
+    v.surveyPending = null;
+    if (!v.pending) {
+      v.pending = { graded: null, gravel: null, paved: null, painted: null };
+    }
+    v.pending[stage] = t;
     if (stage === 'graded') {
       // Pylon rise (deliverable 2) is driven by the graded-stage work front specifically, tracked
       // independent of `pending` so it isn't cleared/reset by a later stage's progress events.
@@ -584,6 +622,7 @@ export class RoadRenderer {
         meshes: [],
         lastRebuildAt: -Infinity,
         pending: null,
+        surveyPending: null,
         freshAsphaltAt: edge.stage === 'paved' || edge.stage === 'painted' ? this.clockSeconds : null,
         wetPaintAt: edge.stage === 'painted' ? this.clockSeconds : null,
         gradedT: edge.stage === 'surveyed' ? 0 : edge.length, // already past graded => pylons fully risen
@@ -660,40 +699,70 @@ export class RoadRenderer {
     const samples = edge.samples;
     const length = edge.length;
 
+    let highestLiveStage: Stage | null = null;
+
     if (v.pending) {
-      const { stage, t } = v.pending;
-      const prev = prevStage(stage);
-      const clampedT = Math.max(0, Math.min(length, t));
-      this.buildStageSegment(v, samples, stage, 0, clampedT, /* advancing */ true);
-      if (prev) this.buildStageSegment(v, samples, prev, clampedT, length);
-      else this.buildStageSegment(v, samples, 'surveyed', clampedT, length);
+      // Task 36: up to 5 bands along arclength, one per buildable stage's front plus a trailing
+      // surveyed-dash band, reusing the SAME from/to ribbon builder each stage always used — only
+      // the boundary bookkeeping is new. `frontT(stage)` is that stage's latest live front `t` if
+      // one has ever been reported this job, falling back to `length` (already fully completed —
+      // `edge.stage` is at or past it) or `0` (not started yet) otherwise. Fronts complete in order
+      // (queue.ts's spacing rule guarantees front i can't finish before front i-1), so
+      // painted_t <= paved_t <= gravel_t <= graded_t <= length always holds; each band is simply
+      // "this stage's own front position, back to the next stage in") the front ahead of it.
+      const frontT = (stage: Exclude<Stage, 'surveyed'>): number => {
+        const reported = v.pending![stage];
+        if (reported !== null) return Math.max(0, Math.min(length, reported));
+        return STAGES.indexOf(edge.stage) >= STAGES.indexOf(stage) ? length : 0;
+      };
+      const paintedT = frontT('painted');
+      const pavedT = frontT('paved');
+      const gravelT = frontT('gravel');
+      const gradedT = frontT('graded');
+
+      this.buildStageSegment(v, samples, 'painted', 0, paintedT);
+      this.buildStageSegment(v, samples, 'paved', paintedT, pavedT, /* advancing */ pavedT < length);
+      this.buildStageSegment(v, samples, 'gravel', pavedT, gravelT);
+      this.buildStageSegment(v, samples, 'graded', gravelT, gradedT);
+      this.buildStageSegment(v, samples, 'surveyed', gradedT, length);
+
+      if (paintedT > 0) highestLiveStage = 'painted';
+      else if (pavedT > 0) highestLiveStage = 'paved';
+      else if (gravelT > 0) highestLiveStage = 'gravel';
+      else if (gradedT > 0) highestLiveStage = 'graded';
+    } else if (v.surveyPending !== null) {
+      // Survey remains a discrete single boundary (binding spec) — unaffected by the train's
+      // multi-band split above, exactly the pre-Task-36 shape.
+      const clampedT = Math.max(0, Math.min(length, v.surveyPending));
+      this.buildStageSegment(v, samples, 'surveyed', 0, clampedT, /* advancing */ true);
+      this.buildStageSegment(v, samples, 'surveyed', clampedT, length);
     } else {
       this.buildStageSegment(v, samples, edge.stage, 0, length);
     }
 
     // Deliverable 4/5 gating: rails/pylons must never appear before this edge's construction has
     // actually reached a stage where a deck could plausibly exist. `edge.stage` is the graph's own
-    // persisted "fully completed through" marker; `v.pending`'s stage (if any) is the *currently
-    // in-progress* stage, which for a live 'gravel' job on a bridge run is exactly when the crane
-    // choreography (bridgeMaskTo) is the authority instead. A `'surveyed'`/`'graded'` edge with no
-    // pending progress at gravel-or-later has no deck at all yet, so nothing should render (a fresh
-    // `commitChain` immediately calling `rebuild()` was previously showing full-height rails/pylons
-    // on a brand-new, not-yet-built bridge — this flag fixes that).
-    const pendingStage = v.pending?.stage;
+    // persisted "fully completed through" marker; `highestLiveStage` (if any) is the highest
+    // buildable stage with an actual live front reported this job — for a live 'gravel' job on a
+    // bridge run this is exactly when the crane choreography (bridgeMaskTo) is the authority
+    // instead. A `'surveyed'`/`'graded'` edge with no live front at gravel-or-later has no deck at
+    // all yet, so nothing should render (a fresh `commitChain` immediately calling `rebuild()` was
+    // previously showing full-height rails/pylons on a brand-new, not-yet-built bridge — this flag
+    // fixes that).
     const deckStageReached =
       STAGES.indexOf(edge.stage) >= STAGES.indexOf('gravel') ||
-      (pendingStage !== undefined && STAGES.indexOf(pendingStage) >= STAGES.indexOf('gravel'));
+      (highestLiveStage !== null && STAGES.indexOf(highestLiveStage) >= STAGES.indexOf('gravel'));
     this.buildBridgeParts(v, samples, edge.id, deckStageReached);
   }
 
   /**
    * Renders the appearance for `stage` across arclength [from, to] on this edge. `advancing` is
-   * true only for the actively-growing partial segment of an in-progress job (i.e. the [0,
-   * clampedT] call from `rebuild()`'s `v.pending` branch) — for 'paved', this additionally splits
-   * the segment at the roller's trailing position so already-compacted asphalt reads slightly
-   * darker than the freshly-laid strip still ahead of the roller. A fully-`paved` edge with no
-   * pending progress (the `else` branch in `rebuild()`) always renders uniformly, since there's no
-   * roller actively working it anymore.
+   * true only for the actively-growing 'paved' band (Task 36: `rebuild()`'s multi-band pass passes
+   * this whenever the paved front is still genuinely in-flight, i.e. `pavedT < length`) — this
+   * additionally splits the segment at the roller's trailing position so already-compacted asphalt
+   * reads slightly darker than the freshly-laid strip still ahead of the roller. A fully-`paved`
+   * band with no live front (the `else` branch in `rebuild()`, or once the paved front has
+   * completed) always renders uniformly, since there's no roller actively working it anymore.
    *
    * Bridge deck masking (Task 22 deliverable 4): for stage 'gravel' or later (the stages that
    * represent an actual deck surface, as opposed to 'graded' dirt/formwork), any sub-range that
@@ -952,8 +1021,9 @@ export class RoadRenderer {
     this.clockSeconds += dt;
 
     for (const [edgeId, v] of this.visuals) {
-      // throttled rebuild of buffered progress
-      if (v.pending && this.clockSeconds - v.lastRebuildAt >= REBUILD_THROTTLE) {
+      // throttled rebuild of buffered progress (Task 36: either the survey pass's own single
+      // boundary, or the train's multi-band progress — both rebuild together, same throttle)
+      if ((v.pending || v.surveyPending !== null) && this.clockSeconds - v.lastRebuildAt >= REBUILD_THROTTLE) {
         const edge = this.graph.edges.get(edgeId);
         if (edge) this.rebuild(edge);
       }
