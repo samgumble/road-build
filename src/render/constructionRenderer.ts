@@ -197,6 +197,18 @@ const STOCKPILE_SCALE_LAMBDA = 3; // damping so depletion eases rather than snap
 const STENCIL_TRAIL = 1.6; // u behind the liner's nozzle
 const CENTERLINE_STENCIL_HALF_WIDTH = 0.35; // u, matches roadRenderer's CENTERLINE_WIDTH/2 (0.5/2 + slack)
 
+// Plate compactor (deliverable 2, second prop — the Addendum B line item deferred from the
+// original Task 26 pass): a walk-behind rig working the shoulder beside the freshest center
+// dashes, trailing the liner. Pure render theater like the grader — no VehicleKind, queue.ts
+// untouched.
+const COMPACTOR_TRAIL_DISTANCE = 5; // u behind the liner's nozzle, clear of the flagger cluster
+const COMPACTOR_SIDE_OFFSET = ROAD_WIDTH_HALF + 0.9; // parked on the shoulder, off the fresh dashes
+const COMPACTOR_BRIDGE_SIDE_OFFSET = ROAD_WIDTH_HALF - 0.5; // over water: pulled in onto the deck
+const COMPACTOR_LAMBDA = 4; // damped repositioning at walk-behind pace (same feel as SPOTTER_LAMBDA)
+const COMPACTOR_VIBE_HZ = 9; // plate-vibration bob rate while working
+const COMPACTOR_VIBE_AMOUNT = 0.02; // u, barely-there — zen constraint
+const COMPACTOR_COLOR = '#d0721f';
+
 function flatMat(color: string, emissive?: string): THREE.MeshStandardMaterial {
   return new THREE.MeshStandardMaterial({
     color,
@@ -1783,6 +1795,49 @@ class FloodlightTowerPool {
   }
 }
 
+/** Plate-compactor prop (Task 26 deliverable 2, second prop): a walk-behind rig of 5 primitives
+ * (base plate, engine block, exhaust stub, handle arm, grip crossbar), well inside the workers'
+ * ≤6-prim budget. Like the grader it's pure render-side theater with no VehicleKind in the sim's
+ * event contract — it works the shoulder beside paint the sim has already laid, so nothing in
+ * sim/queue.ts needs to know it exists. */
+interface CompactorRig {
+  group: THREE.Group;
+  materials: THREE.MeshStandardMaterial[];
+}
+
+function buildCompactor(): CompactorRig {
+  const group = new THREE.Group();
+  const materials: THREE.MeshStandardMaterial[] = [];
+  const bodyMat = flatMat(COMPACTOR_COLOR);
+  const plateMat = flatMat('#4a4a4a');
+  const handleMat = flatMat('#2f2f2f');
+  materials.push(bodyMat, plateMat, handleMat);
+
+  const plate = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.12, 0.6), plateMat);
+  plate.position.y = 0.06;
+  group.add(plate);
+
+  const engine = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.4, 0.45), bodyMat);
+  engine.position.set(0.05, 0.34, 0);
+  group.add(engine);
+
+  const exhaust = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.05, 0.22, 6), handleMat);
+  exhaust.position.set(-0.12, 0.63, 0.12);
+  group.add(exhaust);
+
+  // handle arm rises up and back from the engine block (forward is +x, like every rig here)
+  const arm = new THREE.Mesh(new THREE.BoxGeometry(1.05, 0.06, 0.06), handleMat);
+  arm.position.set(-0.55, 0.62, 0);
+  arm.rotation.z = -0.6;
+  group.add(arm);
+
+  const grip = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.5), handleMat);
+  grip.position.set(-0.98, 0.9, 0);
+  group.add(grip);
+
+  return { group, materials };
+}
+
 const groundPoolDummy = new THREE.Object3D();
 const groundConeDummy = new THREE.Object3D();
 const upAxisFloodlight = new THREE.Vector3(0, 1, 0);
@@ -2004,6 +2059,17 @@ interface CrewSlot {
   lastGraderSeenAt: number;
   graderScrapeTimer: number; // seconds until the next scrape one-shot (audio, driven from here)
   graderScrapeGap: number;
+
+  // --- Task 26: plate compactor (Addendum B follow-up) ----------------------------------------
+  compactor: CompactorRig;
+  compactorVisibility: number; // eased 0..1 — dressing fade, gated on painted-stage liveness
+  compactorPos: THREE.Vector3; // damped shoulder position trailing the liner
+  compactorHeading: number;
+  compactorTarget: THREE.Vector3; // last synthesized shoulder target (y = road sample height)
+  compactorTargetHeading: number;
+  compactorOnBridge: boolean; // trail point is on a bridge deck (use its y, not terrain height)
+  compactorVibePhase: number; // plate-vibration bob clock, only advances while working
+  lastCompactorSeenAt: number; // clock of the last painted-stage progress event (liveness)
 
   // --- Task 26: exhaust puffs ----------------------------------------------------------------
   exhaustTimer: Map<string, number>;
@@ -2331,6 +2397,13 @@ export class ConstructionRenderer {
     this.scene.add(graderRig.group);
     const grader = this.makeState(graderRig);
 
+    // Plate compactor (deliverable 2, second prop): standalone per-crew prop like the grader,
+    // parked near fresh paint — built once, hidden until this crew's job reaches painting.
+    const compactor = buildCompactor();
+    compactor.group.visible = false;
+    compactor.group.scale.setScalar(0.001);
+    this.scene.add(compactor.group);
+
     return {
       rigs,
       states: new Map(),
@@ -2369,6 +2442,15 @@ export class ConstructionRenderer {
       lastGraderSeenAt: -Infinity,
       graderScrapeTimer: 0,
       graderScrapeGap: 6 + Math.random() * (10 - 6),
+      compactor,
+      compactorVisibility: 0,
+      compactorPos: new THREE.Vector3(),
+      compactorHeading: 0,
+      compactorTarget: new THREE.Vector3(),
+      compactorTargetHeading: 0,
+      compactorOnBridge: false,
+      compactorVibePhase: 0,
+      lastCompactorSeenAt: -Infinity,
       exhaustTimer: new Map(),
       onBreak: false,
       lastBreakSeenAt: -Infinity,
@@ -2678,6 +2760,26 @@ export class ConstructionRenderer {
       slot.grader.stage = 'gravel';
       slot.grader.demolish = false;
       slot.grader.onBridge = nearestSampleBridge(edge.samples, graderT);
+    }
+
+    // Plate compactor (Task 26 deliverable 2, second prop): during 'painted' work the reported
+    // vehicle IS the liner, so the compactor is synthesized trailing its nozzle on the shoulder
+    // beside the dashes it just painted — same render-only synthesis as the grader above.
+    // Demolish work strips paint rather than laying it, so there's nothing fresh to work beside.
+    if (e.stage === 'painted' && !e.demolish && edge) {
+      const compactorT = Math.max(0, e.t - COMPACTOR_TRAIL_DISTANCE);
+      const { pos, heading } = sampleAt(edge.samples, compactorT);
+      const onBridge = nearestSampleBridge(edge.samples, compactorT);
+      // over water there's no shoulder to park on — pull it in onto the deck edge instead
+      const side = onBridge ? COMPACTOR_BRIDGE_SIDE_OFFSET : COMPACTOR_SIDE_OFFSET;
+      slot.compactorTarget.set(
+        pos.x - Math.sin(heading) * side,
+        pos.y,
+        pos.z + Math.cos(heading) * side,
+      );
+      slot.compactorTargetHeading = heading;
+      slot.compactorOnBridge = onBridge;
+      slot.lastCompactorSeenAt = this.clock;
     }
 
     // Bridge construction theater (deliverable 3/4): 'gravel'-stage progress crossing a bridge run
@@ -3067,6 +3169,7 @@ export class ConstructionRenderer {
     this.updateSiteDressing(slot, dt);
     this.updateStockpileDepletion(slot, dt);
     this.updateWorkers(slot, dt, excavatorActive || truckActive || paverActive || linerActive);
+    this.updateCompactor(slot, dt);
     this.updateExhaust(slot, dt);
   }
 
@@ -3481,6 +3584,58 @@ export class ConstructionRenderer {
         }));
       }
     }
+  }
+
+  /**
+   * Plate compactor (Task 26 deliverable 2, second prop — the Addendum B line item deferred from
+   * the original Task 26 pass): parked on the shoulder beside the freshest dashes, trailing the
+   * liner (target synthesized in `onProgress`, same pattern as the grader). Fades with the crew's
+   * dressing signal (`slot.dressingActive`, same WORKER_FADE_LAMBDA ease as the workers, set by
+   * `updateSiteDressing` earlier this same frame) but additionally gated on painted-stage liveness
+   * so it only ever appears near fresh paint, per spec — pure dressing fade would have it standing
+   * around from survey onward. While working it plays a faint plate-vibration bob; on break the
+   * bob is suppressed (same rule as the roller/grader cycles) so it reads as parked.
+   */
+  private updateCompactor(slot: CrewSlot, dt: number): void {
+    const compacting =
+      slot.dressingActive && this.clock - slot.lastCompactorSeenAt <= this.IDLE_TIMEOUT;
+
+    // Snap into place whenever it starts fading in from fully hidden — the first placement of a
+    // session and every re-appearance on a later job both read as "already parked" rather than
+    // sliding in from wherever the previous job left it (same intent as the spotter's
+    // first-placement snap).
+    if (compacting && slot.compactorVisibility < 0.001) {
+      slot.compactorPos.set(slot.compactorTarget.x, 0, slot.compactorTarget.z);
+      slot.compactorHeading = slot.compactorTargetHeading;
+    }
+
+    slot.compactorVisibility = damp(slot.compactorVisibility, compacting ? 1 : 0, WORKER_FADE_LAMBDA, dt);
+    const scale = easeOutCubic(clamp01(slot.compactorVisibility));
+    slot.compactor.group.visible = scale > 0.001;
+    slot.compactor.group.scale.setScalar(Math.max(0.001, scale));
+    if (!compacting) return; // hold the last pose through the fade-out, same as the workers
+
+    slot.compactorPos.x = damp(slot.compactorPos.x, slot.compactorTarget.x, COMPACTOR_LAMBDA, dt);
+    slot.compactorPos.z = damp(slot.compactorPos.z, slot.compactorTarget.z, COMPACTOR_LAMBDA, dt);
+    // over a bridge the road sample's own height IS the deck; everywhere else follow the terrain
+    // under the damped position (the shoulder sits off the road surface, at terrain height).
+    const baseY = slot.compactorOnBridge
+      ? slot.compactorTarget.y
+      : this.hf.heightAt(slot.compactorPos.x, slot.compactorPos.z);
+
+    let vibeY = 0;
+    if (!slot.onBreak) {
+      slot.compactorVibePhase += dt;
+      vibeY =
+        Math.abs(Math.sin(2 * Math.PI * COMPACTOR_VIBE_HZ * slot.compactorVibePhase)) *
+        COMPACTOR_VIBE_AMOUNT * scale;
+    }
+    slot.compactor.group.position.set(slot.compactorPos.x, baseY + vibeY, slot.compactorPos.z);
+
+    let delta = slot.compactorTargetHeading - slot.compactorHeading;
+    delta = Math.atan2(Math.sin(delta), Math.cos(delta));
+    slot.compactorHeading += delta * (1 - Math.exp(-ROT_LAMBDA * dt));
+    slot.compactor.group.rotation.y = -slot.compactorHeading;
   }
 
   /**
@@ -4000,6 +4155,12 @@ export class ConstructionRenderer {
       }
 
       this.disposeRig(slot.grader.rig);
+
+      this.scene.remove(slot.compactor.group);
+      slot.compactor.group.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) obj.geometry.dispose();
+      });
+      for (const m of slot.compactor.materials) m.dispose();
     }
 
     this.disposeRig(this.craneRig);
