@@ -19,6 +19,15 @@ const FADE_DURATION = 0.3; // seconds
 // cursor that's a bit off an existing junction/mid-edge point (grid cells are 8u) without pulling
 // in unrelated nodes across a normal street spacing.
 const MAGNET_RADIUS = 6;
+// Close-the-loop snap radius (Task 41: "can't create a road in a complete loop") — same radius as
+// MAGNET_RADIUS, but this one snaps onto the ACTIVE chain's own first point, which `graph.
+// magnetSnap` has no way to see (it only knows about already-committed nodes/edges). Without this,
+// closing a loop by eye relies on landing exactly on the same 8u grid cell as the start stake;
+// this makes it forgiving the same way snapping onto an existing junction is.
+const LOOP_CLOSE_RADIUS = 6;
+// A chain needs at least this many points before "closing the loop" is meaningful (matches
+// RoadGraph.commitClosedLoop's own minimum of 3 distinct points for a non-degenerate loop).
+const LOOP_CLOSE_MIN_POINTS = 3;
 
 const STAKE_DUST_COUNT = 200; // pool capacity — plenty for rapid-fire stake planting during a drag
 const STAKE_DUST_BURST = 5; // particles spawned per planted stake
@@ -258,7 +267,7 @@ export class DrawTool {
 
       const hit = this.groundPointAt(e.clientX, e.clientY);
       if (!hit) return;
-      const p = this.graph.magnetSnap(hit.x, hit.z, MAGNET_RADIUS);
+      const p = this.applyLoopCloseSnap(this.graph.magnetSnap(hit.x, hit.z, MAGNET_RADIUS));
       const last = this.chain[this.chain.length - 1];
       if (last && last.x === p.x && last.z === p.z) return;
       this.chain.push(p);
@@ -340,11 +349,28 @@ export class DrawTool {
       this.hoverRing.visible = false;
       return;
     }
-    const p = this.graph.magnetSnap(hit.x, hit.z, MAGNET_RADIUS);
+    const p = this.applyLoopCloseSnap(this.graph.magnetSnap(hit.x, hit.z, MAGNET_RADIUS));
     const y = this.hf.heightAt(p.x, p.z) + HOVER_YLIFT;
     this.hoverBase.set(p.x, y, p.z);
     this.hoverRing.material = this.hoverRingMat;
     this.hoverVisible = true;
+  }
+
+  /**
+   * Close-the-loop magnetism (Task 41): while a chain with >= LOOP_CLOSE_MIN_POINTS points is
+   * active, if `p` (already resolved through `graph.magnetSnap`) lands within LOOP_CLOSE_RADIUS of
+   * the chain's OWN first point, snap onto that exact first point instead. `RoadGraph.magnetSnap`
+   * can't see this — the chain isn't committed yet, so the first point isn't a node/edge-interior
+   * point the graph knows about. Without this, closing a loop requires landing on the exact same
+   * 8u grid cell as the start stake; this makes it as forgiving as snapping onto an existing
+   * junction. No-op (returns `p` unchanged) when there's no active chain or it's too short — this
+   * is deliberately only relevant while `dragging` is true, since `this.chain` is empty otherwise.
+   */
+  private applyLoopCloseSnap(p: P2): P2 {
+    if (this.chain.length < LOOP_CLOSE_MIN_POINTS) return p;
+    const start = this.chain[0];
+    const d = Math.hypot(start.x - p.x, start.z - p.z);
+    return d <= LOOP_CLOSE_RADIUS ? { x: start.x, z: start.z } : p;
   }
 
   /** Raycasts road groups (tagged `userData.edgeId`) under the pointer, walking up `.parent`. */
