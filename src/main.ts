@@ -179,7 +179,10 @@ function main(): void {
 
   const loop = new Loop(
     (dt) => {
-      buildQueue.update(dt);
+      // Task 33: night slowdown reads Atmosphere's `night` flag (render-side state) but the sim
+      // itself stays a pure function of its inputs — same dt/night sequence always yields the
+      // same result, exactly like traffic's timeOfDay input just below.
+      buildQueue.update(dt, atmosphere.night);
       // Task 32: commute pulse reads Atmosphere's timeOfDay (render-side state) but the sim itself
       // stays a pure function of its inputs — same dt/timeOfDay sequence always yields the same
       // result.

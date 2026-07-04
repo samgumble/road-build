@@ -5,6 +5,7 @@ import { RoadGraph } from '../roads/graph';
 import { sampleAt, sampleHeadingAt } from '../roads/path';
 import { Heightfield } from '../terrain/heightfield';
 import { EventBus } from '../../core/events';
+import { createRng } from '../../core/rng';
 
 // --- Terrain clamp radii (Task 24: "grass/ground still rendering above the road", second
 // occurrence after T18) ----------------------------------------------------------------------
@@ -67,6 +68,18 @@ const SURVEY_SPEED = 20;
 // comfortably covers the paved ribbon.
 const GRADE_RADIUS = ROAD_WIDTH / 2;
 
+// --- Task 33: work rhythm (breaks) -----------------------------------------------------------
+// Every crew takes a short break every 3-5 sim-minutes of ACTIVE work (survey exempt — see
+// `surveying` guard at the call site). The window is deliberately wide (180-300s) and re-rolled
+// (seeded) after every break so the cadence never looks metronomic across a long play session.
+const BREAK_INTERVAL_MIN = 180; // 3 sim-minutes
+const BREAK_INTERVAL_MAX = 300; // 5 sim-minutes
+const BREAK_DURATION = 6; // seconds, stationary
+
+// Task 33: floodlit night crews work a touch slower — applied to every buildable stage's speed,
+// never to the survey pass (surveying is exempt per the binding spec).
+const NIGHT_SPEED_MULTIPLIER = 0.85;
+
 type BuildableStage = Exclude<Stage, 'surveyed'>;
 
 interface Job {
@@ -84,11 +97,26 @@ interface ActiveJob extends Job {
    * stageIndex/t as already set. Always false for demolish jobs and for resumed jobs (they start
    * at/after 'graded', i.e. already past the point a survey pass would cover). */
   surveying: boolean;
+
+  // --- Task 33: work rhythm ------------------------------------------------------------------
+  /** Seconds of ACTIVE (non-survey, non-break) work until the next break fires; re-rolled from
+   * `[BREAK_INTERVAL_MIN, BREAK_INTERVAL_MAX]` (seeded) every time a break starts. Survey time
+   * never counts down this timer (see `surveying` early-return in `updateCrew`). */
+  breakClock: number;
+  /** Seconds remaining in the CURRENT break; > 0 while on break. `t`/terrain/vehicle progress is
+   * fully frozen while this is > 0 — only `construction:progress` keeps firing (stationary
+   * pos/heading) so renderers can react via the additive `onBreak` field. */
+  breakRemaining: number;
 }
 
 /** Task 25: number of concurrent crew slots. FIFO assignment fills every free slot each time
  * `maybeStartNext` runs, so up to this many edges build/demolish simultaneously. */
 export const MAX_CREWS = 3;
+
+/** Task 33: a crew's "last job site" — the end position of its last completed/removed job, used
+ * to pick the nearest free crew for a newly-queued job. Defaults to map-center for every crew
+ * that hasn't finished a job yet, per the binding spec. */
+const MAP_CENTER = { x: 0, z: 0 };
 
 /**
  * Owns the construction crews: up to `MAX_CREWS` concurrent job slots, backed by a single FIFO
@@ -103,12 +131,24 @@ export const MAX_CREWS = 3;
 export class BuildQueue {
   private queue: Job[] = [];
   private crews: (ActiveJob | null)[] = new Array(MAX_CREWS).fill(null);
+  private rng: () => number;
+
+  /** Task 33: nearest-crew assignment. Each crew's last job site — map-center until that crew
+   * finishes (or has one converted to removal for) its first job. Updated whenever a crew's job
+   * completes (`painted`) or is fully removed (demolish reaching `removed`); NOT updated when a
+   * job is merely dropped/reassigned externally (`clearPending`, edge disappearing out from under
+   * a crew) since those aren't real completions. */
+  private crewLastSite: { x: number; z: number }[] = new Array(MAX_CREWS).fill(null).map(() => ({ ...MAP_CENTER }));
 
   constructor(
     private graph: RoadGraph,
     private hf: Heightfield,
     private bus: EventBus,
+    /** Optional seeded rng (deterministic by default) — drives break cadence jitter. Sim-time
+     * based, never wall-clock, so replays/tests stay reproducible. */
+    rng?: () => number,
   ) {
+    this.rng = rng ?? createRng('build-queue');
     // Important 2: `splitEdge` (see graph.ts) inherits the split edge's stage into both halves —
     // splitting a painted (or otherwise partially-built) road happens whenever a newly-drawn chain
     // crosses/branches off an existing road, via `commitChain`. Unconditionally enqueuing a fresh
@@ -232,19 +272,56 @@ export class BuildQueue {
   }
 
   /**
+   * Picks which free crew slot should take the next queued job (Task 33): among the currently
+   * FREE slots (indices into `this.crews` that are `null`), returns the one whose `crewLastSite`
+   * is nearest to `startPos` (the job's own start point — see call site). Ties (including the
+   * "every crew still at map-center" starting case) resolve to the LOWEST crew index, matching
+   * `findIndex`'s natural left-to-right scan order — this is what keeps the existing
+   * multi-crew tests (which never differentiate crew sites) passing unchanged: with all
+   * `crewLastSite`s equal, nearest-crew degenerates back to "first free slot in index order".
+   */
+  private nearestFreeCrew(startPos: { x: number; z: number }): number {
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < this.crews.length; i++) {
+      if (this.crews[i] !== null) continue;
+      const site = this.crewLastSite[i];
+      const dist = Math.hypot(site.x - startPos.x, site.z - startPos.z);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  /** The point a queued `job` will start work from — a build/resume job starts at the edge's
+   * first sample, a demolish job starts (walking backward) from the edge's last sample. Used only
+   * to pick the nearest free crew (Task 33); falls back to map-center if the edge or its samples
+   * are somehow missing (caller already re-checks `edge` existence before using the assigned
+   * crew). */
+  private jobStartPos(job: Job, edge: { samples: { x: number; z: number }[] }): { x: number; z: number } {
+    const samples = edge.samples;
+    if (samples.length === 0) return { ...MAP_CENTER };
+    return job.demolish ? samples[samples.length - 1] : samples[0];
+  }
+
+  /**
    * Fills every free crew slot from the front of the FIFO queue (Task 25: up to MAX_CREWS jobs run
-   * concurrently, not just one). Each iteration finds the next free slot and the next runnable
-   * queue entry; a queue entry whose edge has since disappeared (externally removed) or whose
-   * demolish target has nothing built yet is dropped without consuming a slot, exactly as the
-   * single-crew version dropped it before retrying the loop.
+   * concurrently, not just one). Each iteration finds the next runnable queue entry (FIFO order
+   * preserved — see class doc) and assigns it to the nearest FREE crew (Task 33), not simply the
+   * first free slot in index order. A queue entry whose edge has since disappeared (externally
+   * removed) or whose demolish target has nothing built yet is dropped without consuming a slot,
+   * exactly as the single-crew version dropped it before retrying the loop.
    */
   private maybeStartNext(): void {
     for (;;) {
-      const freeIdx = this.crews.findIndex((c) => c === null);
-      if (freeIdx === -1 || this.queue.length === 0) return;
+      if (this.crews.every((c) => c !== null) || this.queue.length === 0) return;
       const job = this.queue.shift()!;
       const edge = this.graph.edges.get(job.edgeId);
       if (!edge) continue; // externally removed before we got to it
+      const freeIdx = this.nearestFreeCrew(this.jobStartPos(job, edge));
+      if (freeIdx === -1) continue; // shouldn't happen (loop guard above already checked), defensive
       if (job.demolish) {
         const stageIndex = STAGES.indexOf(edge.stage);
         if (stageIndex <= 0) {
@@ -252,15 +329,27 @@ export class BuildQueue {
           // enqueueDemolish drops pending builds instead of queuing a demolish job for them).
           continue;
         }
-        this.crews[freeIdx] = { edgeId: job.edgeId, demolish: true, stageIndex, t: edge.length, surveying: false };
+        this.crews[freeIdx] = {
+          edgeId: job.edgeId, demolish: true, stageIndex, t: edge.length, surveying: false,
+          breakClock: this.rollBreakInterval(), breakRemaining: 0,
+        };
       } else {
         const stageIndex = job.resumeAt ?? STAGES.indexOf('graded');
         // Only a genuinely fresh build (no `resumeAt`) gets a survey pass — a resumed job by
         // definition starts at/after 'graded', i.e. the edge is already past 'surveyed'.
         const surveying = job.resumeAt === undefined;
-        this.crews[freeIdx] = { edgeId: job.edgeId, demolish: false, stageIndex, t: 0, surveying };
+        this.crews[freeIdx] = {
+          edgeId: job.edgeId, demolish: false, stageIndex, t: 0, surveying,
+          breakClock: this.rollBreakInterval(), breakRemaining: 0,
+        };
       }
     }
+  }
+
+  /** Rolls a fresh (seeded) break interval within [BREAK_INTERVAL_MIN, BREAK_INTERVAL_MAX] sim-
+   * seconds of ACTIVE work. Re-rolled on job start and after every break fires. */
+  private rollBreakInterval(): number {
+    return BREAK_INTERVAL_MIN + this.rng() * (BREAK_INTERVAL_MAX - BREAK_INTERVAL_MIN);
   }
 
   /**
@@ -269,15 +358,19 @@ export class BuildQueue {
    * for the other crews). Iterates crew slots in order so `crew` attribution on emitted events is
    * stable and low crew indices are filled first as slots free up, matching the FIFO/"fills the
    * first free slot" assignment `maybeStartNext` already performs.
+   *
+   * `night` (Task 33) is an opaque render-side input, exactly like traffic's `timeOfDay` — the sim
+   * stays a pure function of its inputs. Defaults false so every pre-existing call site/test that
+   * doesn't care about day/night keeps working unchanged.
    */
-  update(dt: number): void {
+  update(dt: number, night = false): void {
     for (let crew = 0; crew < this.crews.length; crew++) {
       const job = this.crews[crew];
-      if (job) this.updateCrew(crew, job, dt);
+      if (job) this.updateCrew(crew, job, dt, night);
     }
   }
 
-  private updateCrew(crew: number, job: ActiveJob, dt: number): void {
+  private updateCrew(crew: number, job: ActiveJob, dt: number, night: boolean): void {
     const edge = this.graph.edges.get(job.edgeId);
     if (!edge) {
       // Edge disappeared out from under us (externally removed) — drop and move on.
@@ -299,6 +392,7 @@ export class BuildQueue {
         vehicle: 'surveyor',
         demolish: false,
         crew,
+        onBreak: false, // Task 33: survey is exempt from breaks
       });
       if (job.t >= edge.length) {
         // Survey pass complete — no stage transition (the edge is already 'surveyed'); hand off
@@ -309,14 +403,54 @@ export class BuildQueue {
       return;
     }
 
+    // --- Task 33: work rhythm (breaks) --------------------------------------------------------
+    // Survey is already handled (and returned) above, so anything reaching here is real staged
+    // work — eligible for breaks. A break in progress freezes `t`/terrain progress entirely;
+    // `construction:progress` still fires every tick with the CURRENT stationary pos/heading (via
+    // the normal path below, since we fall through rather than returning) so renderers can react
+    // via the additive `onBreak` field, but stage advancement/grading/emission of NEW terrain
+    // deformation is skipped for the duration.
+    if (job.breakRemaining > 0) {
+      job.breakRemaining = Math.max(0, job.breakRemaining - dt);
+      const stage = STAGES[job.stageIndex] as BuildableStage;
+      const vehicle: VehicleKind = job.demolish ? 'excavator' : STAGE_VEHICLE[stage];
+      const clampedT = Math.max(0, Math.min(edge.length, job.t));
+      let { pos, heading } = sampleAt(edge.samples, clampedT);
+      if (job.demolish) heading += Math.PI;
+      this.bus.emit('construction:progress', {
+        edgeId: job.edgeId,
+        stage,
+        t: clampedT,
+        pos,
+        heading,
+        vehicle,
+        demolish: job.demolish,
+        crew,
+        onBreak: true,
+      });
+      if (job.breakRemaining <= 0) {
+        job.breakClock = this.rollBreakInterval();
+      }
+      return;
+    }
+
     const stage = STAGES[job.stageIndex] as BuildableStage;
-    const speed = STAGE_SPEED[stage];
+    const baseSpeed = STAGE_SPEED[stage];
+    const speed = night ? baseSpeed * NIGHT_SPEED_MULTIPLIER : baseSpeed;
     const vehicle: VehicleKind = job.demolish ? 'excavator' : STAGE_VEHICLE[stage];
 
     if (job.demolish) {
       job.t -= speed * dt;
     } else {
       job.t += speed * dt;
+    }
+
+    // Break cadence: ticked down by actual elapsed active-work time (dt), same units the interval
+    // is rolled in. Once it lapses, the NEXT tick starts the break (rather than mid-stride this
+    // tick) — simple and keeps this tick's progress emission below unaffected.
+    job.breakClock -= dt;
+    if (job.breakClock <= 0) {
+      job.breakRemaining = BREAK_DURATION;
     }
 
     const clampedT = Math.max(0, Math.min(edge.length, job.t));
@@ -387,6 +521,7 @@ export class BuildQueue {
       vehicle,
       demolish: job.demolish,
       crew,
+      onBreak: false,
     });
 
     if (!job.demolish && job.t >= edge.length) {
@@ -412,6 +547,10 @@ export class BuildQueue {
       this.bus.emit('construction:stage', { edgeId: job.edgeId, stage, crew });
       if (stage === 'painted') {
         this.bus.emit('roads:changed', {});
+        // Task 33: record this crew's last job site (the edge's end — where the crew finished)
+        // for future nearest-crew assignment.
+        const last = edge.samples[edge.samples.length - 1];
+        this.crewLastSite[crew] = { x: last.x, z: last.z };
         this.crews[crew] = null;
         this.maybeStartNext();
       } else {
@@ -429,6 +568,10 @@ export class BuildQueue {
       const wasPainted = edge.stage === 'painted';
       const prevIndex = job.stageIndex - 1;
       if (prevIndex < STAGES.indexOf('graded')) {
+        // Task 33: capture the crew's last site (the edge's start — where the demolition crew
+        // ends up) BEFORE removing the edge out from under `samples`.
+        const first = edge.samples[0];
+        this.crewLastSite[crew] = { x: first.x, z: first.z };
         this.graph.removeEdge(job.edgeId);
         this.bus.emit('construction:stage', { edgeId: job.edgeId, stage: 'removed', crew });
         this.crews[crew] = null;

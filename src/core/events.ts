@@ -5,7 +5,11 @@ export interface GameEvents {
   'roads:edgeAdded': { edgeId: number };
   'roads:edgeRemoved': { edgeId: number };
   'construction:stage': { edgeId: number; stage: Stage | 'removed'; crew: number };
-  'construction:progress': { edgeId: number; stage: Stage; t: number; pos: V3; heading: number; vehicle: VehicleKind; demolish: boolean; crew: number };
+  // `onBreak` (Task 33, additive): true while this crew is on its periodic work-rhythm break —
+  // `t`/pos are stationary (frozen) for the break's duration; renderers can react (workers huddle
+  // near the stockpile, vehicles idle) via this flag rather than inferring it from a lack of
+  // position change.
+  'construction:progress': { edgeId: number; stage: Stage; t: number; pos: V3; heading: number; vehicle: VehicleKind; demolish: boolean; crew: number; onBreak: boolean };
   'terrain:deformed': { minI: number; minJ: number; maxI: number; maxJ: number };
   'growth:spawn': { kind: 'tree' | 'field' | 'house' | 'building'; x: number; z: number; rot: number };
   'atmosphere:phase': { night: boolean };

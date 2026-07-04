@@ -414,4 +414,170 @@ describe('BuildQueue', () => {
       expect(graph.edges.has(activeEdge)).toBe(false);
     });
   });
+
+  // --- Task 33: nearest-crew assignment -----------------------------------------------------
+  describe('nearest-crew assignment', () => {
+    it('a new job goes to the free crew whose last job site is nearest to the new edge (ties -> lowest index)', () => {
+      const bus = new EventBus();
+      const hf = new Heightfield('q-test-nearest-crew', bus);
+      const graph = new RoadGraph(bus, makeSampler(hf));
+      const queue = new BuildQueue(graph, hf, bus);
+
+      // Complete two independent jobs on two different crews so each crew's `crewLastSite`
+      // diverges from map-center (0,0) — the third crew is left untouched, still at map-center.
+      const anchors = findParallelAnchors(hf, 32, 2);
+      const edgeIds = anchors.map((a) => graph.commitChain([a, { x: a.x + 32, z: a.z }])[0]);
+
+      const crewByEdge = new Map<number, number>();
+      bus.on('construction:progress', (e) => {
+        if (edgeIds.includes(e.edgeId) && !crewByEdge.has(e.edgeId)) crewByEdge.set(e.edgeId, e.crew);
+      });
+      run(queue, 120); // fully build both to painted
+      for (const id of edgeIds) expect(graph.edges.get(id)!.stage).toBe('painted');
+      expect(queue.busy).toBe(false); // both crews now free again
+
+      const crewA = crewByEdge.get(edgeIds[0])!;
+      const crewB = crewByEdge.get(edgeIds[1])!;
+      // Sanity: the two jobs really did run on two distinct crews (parallel anchors, 2 free slots).
+      expect(crewA).not.toBe(crewB);
+
+      // crewA's last site is anchors[0]+32 (edge end); crewB's is anchors[1]+32. A fresh job whose
+      // start sits right on top of anchors[0] (crewA's finishing spot) should go to crewA even
+      // though it's a higher crew index than the still-map-center-default third crew, proving
+      // real distance-based selection (not just "any free crew").
+      const anchorA = anchors[0];
+      const newAnchor = { x: anchorA.x + 32 + 8, z: anchorA.z }; // just past crewA's last site, far from crewB's and from map-center
+      const [newEdgeId] = graph.commitChain([newAnchor, { x: newAnchor.x + 16, z: newAnchor.z }]);
+
+      let assignedCrew = -1;
+      bus.on('construction:progress', (e) => {
+        if (e.edgeId === newEdgeId && assignedCrew === -1) assignedCrew = e.crew;
+      });
+      queue.update(1 / 60);
+      expect(assignedCrew).toBe(crewA);
+    });
+
+    it('ties (all free crews at the same last-site, e.g. every crew still at map-center default) resolve to the lowest crew index', () => {
+      const { bus, queue, edgeId } = setup();
+      // Fresh queue: every crew still defaults to map-center, so the very first job (already
+      // committed by `setup()`) must land on crew 0 — exactly the existing FIFO/index-order
+      // behavior this refactor must preserve when there's no real distance signal yet.
+      let assignedCrew = -1;
+      bus.on('construction:progress', (e) => {
+        if (e.edgeId === edgeId && assignedCrew === -1) assignedCrew = e.crew;
+      });
+      queue.update(1 / 60);
+      expect(assignedCrew).toBe(0);
+    });
+  });
+
+  // --- Task 33: work rhythm (breaks + night slowdown) ---------------------------------------
+  describe('work rhythm', () => {
+    it('break pauses t-advance then resumes (t frozen during the break window, progress continues after)', () => {
+      const bus = new EventBus();
+      const hf = new Heightfield('q-test-break-freeze', bus);
+      const graph = new RoadGraph(bus, makeSampler(hf));
+      const queue = new BuildQueue(graph, hf, bus);
+      const anchor = findAnchor(hf, 400);
+      // A long edge so the crew is still mid-'graded' well past the guaranteed-break point
+      // (180 sim-seconds of active work) without finishing and rotating off to another job.
+      const [edgeId] = graph.commitChain([anchor, { x: anchor.x + 400, z: anchor.z }]);
+
+      const ts: { t: number; onBreak: boolean }[] = [];
+      bus.on('construction:progress', (e) => {
+        if (e.edgeId === edgeId) ts.push({ t: e.t, onBreak: e.onBreak });
+      });
+
+      run(queue, 260); // > total active work time to comfortably cross BREAK_INTERVAL_MIN (180s)
+
+      const breakSamples = ts.filter((s) => s.onBreak);
+      expect(breakSamples.length).toBeGreaterThan(0); // a break actually happened
+
+      // While on break, t must stay exactly constant across consecutive onBreak samples.
+      const distinctTsDuringBreak = new Set(breakSamples.map((s) => s.t));
+      expect(distinctTsDuringBreak.size).toBe(1);
+
+      // After the break window (last onBreak sample), t must resume advancing again.
+      const lastBreakIdx = ts.findIndex((s) => s === breakSamples[breakSamples.length - 1]);
+      const afterBreak = ts.slice(lastBreakIdx + 1).filter((s) => !s.onBreak);
+      expect(afterBreak.length).toBeGreaterThan(0);
+      expect(afterBreak[afterBreak.length - 1].t).toBeGreaterThan(breakSamples[0].t);
+    });
+
+    it('break cadence falls within the [180, 300] sim-second active-work window', () => {
+      const bus = new EventBus();
+      const hf = new Heightfield('q-test-break-cadence', bus);
+      const graph = new RoadGraph(bus, makeSampler(hf));
+      const queue = new BuildQueue(graph, hf, bus);
+      const anchor = findAnchor(hf, 400);
+      const [edgeId] = graph.commitChain([anchor, { x: anchor.x + 400, z: anchor.z }]);
+
+      let activeElapsed = 0;
+      let firstBreakAt = -1;
+      let wasOnBreak = false;
+      let sawNonSurveyProgress = false;
+      bus.on('construction:progress', (e) => {
+        if (e.edgeId !== edgeId) return;
+        if (e.vehicle === 'surveyor') return; // survey time doesn't count toward break cadence
+        sawNonSurveyProgress = true;
+        if (e.onBreak && firstBreakAt < 0) firstBreakAt = activeElapsed;
+        wasOnBreak = e.onBreak;
+      });
+      const dt = 1 / 60;
+      for (let i = 0; i < 320 * 60 && firstBreakAt < 0; i++) {
+        queue.update(dt);
+        if (sawNonSurveyProgress && !wasOnBreak) activeElapsed += dt;
+      }
+      expect(firstBreakAt).toBeGreaterThanOrEqual(180 - 1); // small tolerance for step granularity
+      expect(firstBreakAt).toBeLessThanOrEqual(300 + 1);
+    });
+
+    it('the survey phase never triggers a break (no onBreak:true events while vehicle is the surveyor)', () => {
+      const { bus, queue, edgeId } = setup();
+      let sawSurveyorBreak = false;
+      bus.on('construction:progress', (e) => {
+        if (e.edgeId === edgeId && e.vehicle === 'surveyor' && e.onBreak) sawSurveyorBreak = true;
+      });
+      run(queue, 3); // covers the whole ~1.6s survey pass plus a margin
+      expect(sawSurveyorBreak).toBe(false);
+    });
+
+    it('night applies a stage-speed slowdown: the same edge takes ~1/0.85 (~17.6%) longer to reach painted', () => {
+      const dayBus = new EventBus();
+      const dayHf = new Heightfield('q-test-night-day', dayBus);
+      const dayGraph = new RoadGraph(dayBus, makeSampler(dayHf));
+      const dayQueue = new BuildQueue(dayGraph, dayHf, dayBus);
+      const anchor1 = findAnchor(dayHf, 32);
+      const [dayEdgeId] = dayGraph.commitChain([anchor1, { x: anchor1.x + 32, z: anchor1.z }]);
+
+      let dayTicks = 0;
+      while (dayGraph.edges.get(dayEdgeId)!.stage !== 'painted' && dayTicks < 100 * 60) {
+        dayQueue.update(1 / 60, false);
+        dayTicks++;
+      }
+      expect(dayGraph.edges.get(dayEdgeId)!.stage).toBe('painted');
+
+      const nightBus = new EventBus();
+      const nightHf = new Heightfield('q-test-night-night', nightBus);
+      const nightGraph = new RoadGraph(nightBus, makeSampler(nightHf));
+      const nightQueue = new BuildQueue(nightGraph, nightHf, nightBus);
+      const anchor2 = findAnchor(nightHf, 32);
+      const [nightEdgeId] = nightGraph.commitChain([anchor2, { x: anchor2.x + 32, z: anchor2.z }]);
+
+      let nightTicks = 0;
+      while (nightGraph.edges.get(nightEdgeId)!.stage !== 'painted' && nightTicks < 100 * 60) {
+        nightQueue.update(1 / 60, true);
+        nightTicks++;
+      }
+      expect(nightGraph.edges.get(nightEdgeId)!.stage).toBe('painted');
+
+      // Both builds are short (well under BREAK_INTERVAL_MIN=180s of active work), so neither
+      // triggers a break — the entire tick-count difference is attributable to the night
+      // multiplier. Survey time (SURVEY_SPEED, unaffected by night) is identical in both runs, so
+      // it doesn't skew the ratio meaningfully once folded into the total.
+      const ratio = nightTicks / dayTicks;
+      expect(ratio).toBeGreaterThan(1.1);
+      expect(ratio).toBeLessThan(1.25); // ~1/0.85 = 1.176, generous tolerance either side
+    });
+  });
 });

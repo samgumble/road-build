@@ -59,7 +59,7 @@ describe('roller compaction darkening', () => {
     bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
     bus.emit('construction:progress', {
       edgeId, stage: 'graded', t: 10,
-      pos: { x: 10, y: 1, z: 0 }, heading: 0, vehicle: 'truck', demolish: false, crew: 0,
+      pos: { x: 10, y: 1, z: 0 }, heading: 0, vehicle: 'truck', demolish: false, crew: 0, onBreak: false,
     });
     renderer.update(0.2); // flush the 0.15s rebuild throttle
     expect(meshColors()).not.toContain(compactedHex);
@@ -70,7 +70,7 @@ describe('roller compaction darkening', () => {
     bus.emit('construction:stage', { edgeId, stage: 'paved', crew: 0 });
     bus.emit('construction:progress', {
       edgeId, stage: 'paved', t: 30,
-      pos: { x: 30, y: 1, z: 0 }, heading: 0, vehicle: 'roller', demolish: false, crew: 0,
+      pos: { x: 30, y: 1, z: 0 }, heading: 0, vehicle: 'roller', demolish: false, crew: 0, onBreak: false,
     });
     renderer.update(0.2); // advance clock past REBUILD_THROTTLE (0.15s) to flush pending progress
 
