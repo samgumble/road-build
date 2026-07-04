@@ -2,6 +2,7 @@ import type { P2 } from '../../core/types';
 import { EventBus } from '../../core/events';
 import { RoadGraph } from '../roads/graph';
 import { Heightfield } from '../terrain/heightfield';
+import { sampleHeadingAt } from '../roads/path';
 import { GRID_SIZE, CELL, WORLD_SIZE, ROAD_WIDTH } from '../../core/constants';
 
 const HALF = WORLD_SIZE / 2;
@@ -44,6 +45,25 @@ const JITTER = 2.2; // u — wide enough relative to CELL (4u) that neighboring 
 // flattenCircle's falloff curve or shrink FLATTEN_RADIUS, which is a shared function used by road
 // grading too and out of scope for this pass.
 const MIN_ROAD_CLEARANCE = 6.5;
+
+// Task 30: houses/buildings sit in a band this far from the nearest road-sample centerline
+// (still respecting MIN_ROAD_CLEARANCE as the absolute floor), so frontages read as a consistent
+// street setback rather than a radial scatter. A little play across the band (rather than a fixed
+// distance) plus along-road jitter keeps neighboring houses from lining up on a single ring.
+const SETBACK_MIN = 8;
+const SETBACK_MAX = 10;
+// rad — random wobble applied on top of the "face the road" heading so a street doesn't read as
+// perfectly regimented.
+const FACING_JITTER = 0.15;
+// u — small jitter applied along the road's tangent direction after projecting to the setback
+// band, so houses along the same stretch of road don't all land in a perfect line abreast of one
+// another.
+const ALONG_ROAD_JITTER = 1.5;
+
+// Fields prefer a cell within this radius of an existing house record (farmstead grouping).
+const FIELD_HOUSE_SEARCH_RADIUS = 14;
+// rad — wobble applied to a field's road-aligned rotation.
+const FIELD_ROT_JITTER = 0.1;
 
 // A cell crossing the 'tree' threshold spawns trees only with this probability; every qualifying
 // cell along a corridor would otherwise plant 2-3 trees every 4u (CELL), which at typical canopy
@@ -228,32 +248,154 @@ export class GrowthSim {
 
   /** Pushes (x,z) away from the nearest road sample if it lands within MIN_ROAD_CLEARANCE. */
   private clearOfRoads(x: number, z: number): { x: number; z: number } {
-    let nearestDist = Infinity;
-    let nearestX = x, nearestZ = z;
-    for (const edge of this.graph.edges.values()) {
-      for (const s of edge.samples) {
-        const d = Math.hypot(s.x - x, s.z - z);
-        if (d < nearestDist) {
-          nearestDist = d;
-          nearestX = s.x;
-          nearestZ = s.z;
-        }
-      }
-    }
-    if (nearestDist >= MIN_ROAD_CLEARANCE || nearestDist === Infinity) return { x, z };
+    const near = this.nearestRoadInfo(x, z);
+    if (near.dist >= MIN_ROAD_CLEARANCE || near.dist === Infinity) return { x, z };
     // push (x,z) directly away from the nearest sample out to MIN_ROAD_CLEARANCE
-    let dx = x - nearestX, dz = z - nearestZ;
+    let dx = x - near.x, dz = z - near.z;
     const len = Math.hypot(dx, dz) || 1;
     dx /= len;
     dz /= len;
-    return { x: nearestX + dx * MIN_ROAD_CLEARANCE, z: nearestZ + dz * MIN_ROAD_CLEARANCE };
+    return { x: near.x + dx * MIN_ROAD_CLEARANCE, z: near.z + dz * MIN_ROAD_CLEARANCE };
+  }
+
+  /**
+   * Finds the nearest painted-road sample to (x, z) across every edge, along with that sample's
+   * road heading (via `sampleHeadingAt`) so callers can both set back from the centerline and
+   * orient buildings/fields relative to the road's direction. Returns `dist: Infinity` (heading 0)
+   * when there are no painted roads at all.
+   */
+  private nearestRoadInfo(x: number, z: number): { x: number; z: number; dist: number; heading: number } {
+    let best = { x, z, dist: Infinity, heading: 0 };
+    for (const edge of this.graph.edges.values()) {
+      for (let i = 0; i < edge.samples.length; i++) {
+        const s = edge.samples[i];
+        const d = Math.hypot(s.x - x, s.z - z);
+        if (d < best.dist) {
+          best = { x: s.x, z: s.z, dist: d, heading: sampleHeadingAt(edge.samples, i) };
+        }
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Places a house/building so it faces the nearest road at a consistent [SETBACK_MIN,
+   * SETBACK_MAX] distance from the road centerline sample, replacing the old radial push. The
+   * "facing" direction is the vector from the building to the road sample — matching
+   * sceneryRenderer.ts's existing convention for a house/building's front (see its window-quad
+   * placement, which offsets by `(cos(rot), sin(rot))` from the instance): `rot` there IS the
+   * direction the front/door faces, so setting `rot = atan2(toRoad.z, toRoad.x)` makes the door
+   * point at the road. Falls back to `clearOfRoads`'s hard-clearance push (random rot) when there
+   * are no painted roads yet, matching pre-Task-30 behavior for that edge case.
+   */
+  private placeFacingRoad(cx: number, cz: number): { x: number; z: number; rot: number } {
+    const near = this.nearestRoadInfo(cx, cz);
+    if (near.dist === Infinity) {
+      const { x, z } = this.clearOfRoads(cx, cz);
+      return { x, z, rot: this.rng() * Math.PI * 2 };
+    }
+
+    // Direction from the road sample outward to the original spawn point decides which side of
+    // the road this building sits on; project onto that direction at a distance drawn from the
+    // setback band (with a little jitter along the road's tangent so buildings don't all land in
+    // a perfect line abreast of each other).
+    let outX = cx - near.x, outZ = cz - near.z;
+    const outLen = Math.hypot(outX, outZ);
+    if (outLen < 1e-6) {
+      // spawn point coincides with the road sample (degenerate/very rare) — pick an arbitrary
+      // perpendicular-to-road side deterministically from rng rather than dividing by zero.
+      const perp = near.heading + Math.PI / 2;
+      outX = Math.cos(perp);
+      outZ = Math.sin(perp);
+    } else {
+      outX /= outLen;
+      outZ /= outLen;
+    }
+
+    const setback = SETBACK_MIN + this.rng() * (SETBACK_MAX - SETBACK_MIN);
+    const along = (this.rng() * 2 - 1) * ALONG_ROAD_JITTER;
+    const tanX = Math.cos(near.heading), tanZ = Math.sin(near.heading);
+
+    let x = near.x + outX * setback + tanX * along;
+    let z = near.z + outZ * setback + tanZ * along;
+
+    // The sample nearest to `(cx, cz)` isn't necessarily the sample nearest to the moved-out
+    // candidate `(x, z)` (moving `setback` + `along` u away can bring a different, closer sample
+    // along the road's curve into range) — re-query from the candidate and re-project along ITS
+    // perpendicular so the actual nearest-sample distance settles inside the setback band and the
+    // facing direction is computed against the true nearest sample, not a stale one. A few
+    // iterations converge quickly since each re-projection only has to correct for how much the
+    // nearest sample moved, which shrinks fast (sample spacing ~2u vs an 8-10u setback).
+    let finalNear = near;
+    for (let iter = 0; iter < 4; iter++) {
+      const settled = this.nearestRoadInfo(x, z);
+      if (settled.dist === Infinity) break;
+      finalNear = settled;
+      if (Math.abs(settled.dist - setback) <= 0.01) break;
+      let sx = x - settled.x, sz = z - settled.z;
+      const sLen = Math.hypot(sx, sz) || 1;
+      sx /= sLen;
+      sz /= sLen;
+      x = settled.x + sx * setback;
+      z = settled.z + sz * setback;
+    }
+
+    // Face the road: direction from the (final) building position back to the road sample,
+    // + small jitter so a straight street doesn't read as perfectly regimented.
+    const toRoad = Math.atan2(finalNear.z - z, finalNear.x - x);
+    const rot = toRoad + (this.rng() * 2 - 1) * FACING_JITTER;
+    return { x, z, rot };
+  }
+
+  /**
+   * Places a field aligned to the road direction, preferring a spot within
+   * FIELD_HOUSE_SEARCH_RADIUS of an existing house record (farmstead grouping: fields snug beside
+   * a farmhouse). Falls back to the previous clearOfRoads-based placement with road-aligned
+   * rotation when no house is nearby yet.
+   */
+  private placeField(cx: number, cz: number): { x: number; z: number; rot: number } {
+    const near = this.nearestRoadInfo(cx, cz);
+    const heading = near.dist === Infinity ? this.rng() * Math.PI * 2 : near.heading;
+    const rot = heading + (this.rng() * 2 - 1) * FIELD_ROT_JITTER;
+
+    let nearestHouse: { x: number; z: number } | null = null;
+    let nearestHouseDist = FIELD_HOUSE_SEARCH_RADIUS;
+    for (const r of this.records) {
+      if (r.kind !== 'house') continue;
+      const d = Math.hypot(r.x - cx, r.z - cz);
+      if (d < nearestHouseDist) {
+        nearestHouseDist = d;
+        nearestHouse = r;
+      }
+    }
+
+    if (!nearestHouse) {
+      const { x, z } = this.clearOfRoads(cx, cz);
+      return { x, z, rot };
+    }
+
+    // Nudge the field toward the house, staying clear of the road, so it reads as sitting beside
+    // the farmhouse rather than at the raw cell center.
+    const toward = { x: (cx + nearestHouse.x) / 2, z: (cz + nearestHouse.z) / 2 };
+    const { x, z } = this.clearOfRoads(toward.x, toward.z);
+    return { x, z, rot };
   }
 
   private spawn(kind: GrowthKind, cx: number, cz: number): void {
     const jx = (this.rng() * 2 - 1) * JITTER;
     const jz = (this.rng() * 2 - 1) * JITTER;
-    const { x, z } = this.clearOfRoads(cx + jx, cz + jz);
-    const rot = this.rng() * Math.PI * 2;
+
+    let x: number, z: number, rot: number;
+    if (kind === 'house' || kind === 'building') {
+      ({ x, z, rot } = this.placeFacingRoad(cx + jx, cz + jz));
+    } else if (kind === 'field') {
+      ({ x, z, rot } = this.placeField(cx + jx, cz + jz));
+    } else {
+      // trees: unchanged — clearOfRoads + random rotation.
+      ({ x, z } = this.clearOfRoads(cx + jx, cz + jz));
+      rot = this.rng() * Math.PI * 2;
+    }
+
     this.records.push({ kind, x, z, rot });
     this.bus.emit('growth:spawn', { kind, x, z, rot });
     if (kind === 'house') this.houses++;
