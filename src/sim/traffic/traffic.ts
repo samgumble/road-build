@@ -50,6 +50,33 @@ const STALE_SPEED_EPS = 0.05; // u/s, "essentially stationary" threshold
 const STALE_BACKOFF_MIN = 0.5; // seconds
 const STALE_BACKOFF_MAX = 2; // seconds
 
+// Task 47 (Groundwork fast-follow): "lock-free ring-saturation freeze" safety net. T44's own "don't
+// block the box" rule (part 2 above, `exitLaneClear`) created a NEW residual freeze mode it didn't
+// anticipate: on a saturated ring where every lane's queue backs up to within BOX_CLEARANCE of s=0,
+// every front car eventually reaches `releaseAt` in its OWN current lane and releases its held lock
+// (the lane-scaled release fires at `releaseAt(lane)` <= 4u regardless of what's happening ahead) —
+// but then can NEVER acquire the NEXT junction's lock, because `exitLaneClear` permanently fails
+// (the next lane is itself jam-packed within BOX_CLEARANCE of s=0, and never clears because ITS
+// front car is in the exact same situation). Once every car in the cycle has released its own lock
+// this way, `junctionLocks` is completely empty — nobody holds anything — so T44's existing
+// stale-lock safety net (which only arms while `c.heldNodeId !== null`) never engages for anyone,
+// and the ring freezes permanently with zero locks held (distinct from T44's original leaked-lock
+// deadlock, where at least one lock was always held by a phantom/live car).
+//
+// Fix: track how long a car has been stationary AND specifically box-blocked (i.e. every OTHER
+// acquisition condition holds — it doesn't already hold a different lock, no backoff is pending —
+// but `exitLaneClear` is what's failing) even though it holds NO lock at all. After
+// `BOX_BLOCKED_TIMEOUT` sim-seconds of that, a small per-car seeded jittered override lets it
+// acquire the lock and proceed anyway, DESPITE `exitLaneClear` failing — one car creeping forward
+// is enough to open a gap and break the cycle for everyone behind it. Deliberately mirrors T44's
+// existing stale-lock safety net in spirit (same timeout scale, same seeded-rng jitter so replays
+// stay deterministic, never despawns/teleports) but is a genuinely separate mechanism/field since
+// it must arm precisely when NO lock is held, which is the case T44's `stalledHeldSeconds` net
+// structurally cannot cover.
+const BOX_BLOCKED_TIMEOUT = 8; // sim-seconds
+const BOX_BLOCKED_BACKOFF_MIN = 0.5; // seconds — re-applied after the override so this car doesn't
+const BOX_BLOCKED_BACKOFF_MAX = 2; // seconds   immediately re-trigger every following tick either.
+
 // Task 32: trip-endpoint weighting toward settlement nodes. Weight map recompute is throttled the
 // same way GrowthSim throttles its road-distance recompute (see growth.ts's RECOMPUTE_INTERVAL
 // doc comment) so a flurry of growth:spawn events during active development doesn't repeatedly
@@ -112,6 +139,12 @@ interface Car {
   // acquire a NEW junction lock, set after the safety net force-releases a stale lock so the same
   // car doesn't immediately re-win the same contested lock every tick. 0 = no back-off pending.
   lockBackoffUntil: number;
+  // Task 47 (lock-free ring-saturation freeze fix): sim-seconds this car has continuously been
+  // stationary AND blocked specifically by the `exitLaneClear` box-clearance check (i.e. it holds
+  // NO lock, every other acquisition condition already holds) — see BOX_BLOCKED_TIMEOUT's doc
+  // comment. Reset to 0 whenever the car moves, acquires a lock, or is blocked for any OTHER
+  // reason. Distinct from `stalledHeldSeconds` (T44), which only tracks time spent HOLDING a lock.
+  boxBlockedSeconds: number;
 }
 
 export interface TrafficCar {
@@ -416,6 +449,7 @@ export class TrafficSim {
       heldNodeId: null,
       stalledHeldSeconds: 0,
       lockBackoffUntil: 0,
+      boxBlockedSeconds: 0,
     };
     this.cs.push(car);
   }
@@ -502,6 +536,13 @@ export class TrafficSim {
       // lane (i.e. not the final lane of the route), the car must hold the lock on `lane.to`
       // to be allowed to proceed past the approach point.
       let blockedByJunction = false;
+      // Task 47: set inside the acquisition branch below when this car's ONLY obstacle to
+      // acquiring the next junction's lock is `exitLaneClear` failing — read just after this block
+      // to accumulate/reset `c.boxBlockedSeconds`. Declared out here (rather than only inside the
+      // `if`) so a car that ISN'T even within JUNCTION_APPROACH this tick (the common case) also
+      // correctly resets its streak below, same as `stalledHeldSeconds` already does for the
+      // "no lock held" case.
+      let boxBlockedOnly = false;
       if (!isLastLane && distToLaneEnd <= JUNCTION_APPROACH) {
         const nodeId = lane.to;
         const holder = this.junctionLocks.get(nodeId);
@@ -530,13 +571,30 @@ export class TrafficSim {
           // (see below) so a car that was just force-released doesn't immediately re-win the same
           // contested lock on the very next tick.
           const nextLane = c.route[c.routeIndex + 1];
-          const canAcquire =
-            c.heldNodeId === null &&
-            c.lockBackoffUntil <= this.simTime &&
-            (!nextLane || this.exitLaneClear(nextLane.id));
+          const notHoldingAnother = c.heldNodeId === null;
+          const backoffClear = c.lockBackoffUntil <= this.simTime;
+          const exitClear = !nextLane || this.exitLaneClear(nextLane.id);
+          // Task 47 (lock-free ring-saturation freeze fix): this car is "box-blocked-only" when
+          // every OTHER acquisition condition already holds and `exitLaneClear` is the SOLE
+          // reason it can't acquire — i.e. exactly the state that can never resolve on its own on
+          // a saturated ring (see BOX_BLOCKED_TIMEOUT's doc comment). A car failing for any OTHER
+          // reason (already holding a different lock, or still in its post-stale-release backoff)
+          // is a different situation with its own resolution path (T44's release/backoff cycle),
+          // so it does NOT accumulate box-blocked time here.
+          boxBlockedOnly = notHoldingAnother && backoffClear && !exitClear;
+          const forceOverride = boxBlockedOnly && c.boxBlockedSeconds >= BOX_BLOCKED_TIMEOUT;
+          const canAcquire = notHoldingAnother && backoffClear && (exitClear || forceOverride);
           if (canAcquire) {
             this.junctionLocks.set(nodeId, c.id);
             c.heldNodeId = nodeId;
+            c.boxBlockedSeconds = 0;
+            if (forceOverride) {
+              // Same jittered-backoff shape as T44's stale-lock net: this car got a one-time
+              // override, not a standing exemption — give it a small seeded cooldown before it can
+              // trigger ANOTHER override, so a single persistently-congested car doesn't just
+              // repeatedly re-trigger the override every tick once the timeout is first crossed.
+              c.lockBackoffUntil = this.simTime + BOX_BLOCKED_BACKOFF_MIN + this.rng() * (BOX_BLOCKED_BACKOFF_MAX - BOX_BLOCKED_BACKOFF_MIN);
+            }
           } else {
             blockedByJunction = true;
           }
@@ -566,6 +624,22 @@ export class TrafficSim {
         } else {
           c.stalledHeldSeconds = 0;
         }
+      }
+
+      // Task 47 (lock-free ring-saturation freeze fix), safety net: track how long this car has
+      // been stationary AND box-blocked-only (see `boxBlockedOnly` above) — i.e. holding NO lock,
+      // with `exitLaneClear` the sole reason it can't acquire the next one. This is the state T44's
+      // own `stalledHeldSeconds` net structurally cannot cover (that net only arms while
+      // `heldNodeId !== null`). Once every car in a saturated ring's cycle reaches this state
+      // simultaneously, `junctionLocks` is completely empty and nobody can ever acquire again
+      // without an outside nudge — `forceOverride` (computed above, inside the acquisition branch)
+      // is that nudge, applied the very next time this same car reaches the acquisition check
+      // (next tick) once its streak crosses BOX_BLOCKED_TIMEOUT. Reset whenever the car moves,
+      // isn't box-blocked-only this tick, or successfully acquires (handled above).
+      if (boxBlockedOnly && c.speed < STALE_SPEED_EPS) {
+        c.boxBlockedSeconds += dt;
+      } else if (!boxBlockedOnly) {
+        c.boxBlockedSeconds = 0;
       }
 
       const gap = this.gapAhead(c);

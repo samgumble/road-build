@@ -485,4 +485,147 @@ describe('TrafficSim', () => {
       expect(maxStationaryStreak).toBeLessThan(MAX_STATIONARY_SECONDS);
     });
   });
+
+  // Task 47 item 1: T44's "don't block the box" rule (exitLaneClear gate before lock acquisition)
+  // created a NEW residual freeze mode it didn't anticipate. On a saturated ring where EVERY
+  // lane's queue backs up to within BOX_CLEARANCE of s=0, every front car eventually reaches
+  // `releaseAt` in its own current lane and releases its held lock (lane-scaled release fires
+  // regardless of what's ahead) — but can then never acquire the NEXT junction's lock, because
+  // `exitLaneClear` permanently fails (the next lane is itself jammed the same way, forever).
+  // Once every car in the cycle has released this way, `junctionLocks` is completely EMPTY — so
+  // T44's own stale-lock safety net (which only arms while `heldNodeId !== null`) never engages for
+  // anyone, and the ring freezes permanently with zero locks held. See traffic.ts's
+  // BOX_BLOCKED_TIMEOUT doc comment for the fix (a seeded jittered override once a car has been
+  // stationary AND box-blocked-only for long enough).
+  describe('lock-free ring-saturation freeze (Task 47 item 1)', () => {
+    /** Same 6-node ring topology as the Task 44 deadlock describe block above (kept local/
+     * self-contained rather than reaching into that block's scope). */
+    function ringWorld() {
+      const bus = new EventBus();
+      const g = new RoadGraph(bus, flatSampler);
+      g.commitChain([{ x: 0, z: 0 }, { x: 8, z: 0 }]);
+      g.commitChain([{ x: 8, z: 0 }, { x: 8, z: 8 }]);
+      g.commitChain([{ x: 8, z: 8 }, { x: 8, z: 24 }]);
+      g.commitChain([{ x: 8, z: 24 }, { x: 0, z: 24 }]);
+      g.commitChain([{ x: 0, z: 24 }, { x: 0, z: 8 }]);
+      g.commitChain([{ x: 0, z: 8 }, { x: 0, z: 0 }]);
+      for (const e of g.edges.values()) e.stage = 'painted';
+      bus.emit('roads:changed', {});
+      const sim = new TrafficSim(g, bus, createRng('deadlock-ring'));
+      return { sim };
+    }
+
+    /**
+     * Directly injects a saturated, one-directional population onto the ring (bypassing the
+     * normal spawn gate entirely, per the task brief's "spawn directly if needed" — the ring's
+     * `spawnPointClear` self-limits normal spawning long before real saturation is reached, so a
+     * `targetPopulation` bump alone never reproduces this). Every forward-direction lane is packed
+     * with cars every 4u starting at s=0.5, each following a long multi-lap route around the ring
+     * in the SAME rotational direction (genuine queueing/contention at every junction, not just
+     * isolated single-lane packing) — this is the exact saturated-ring state the bug describes.
+     */
+    function saturateRing(sim: any) {
+      sim.targetPopulation = 0; // real spawning would only interfere with the direct injection
+      const lg = sim.lg;
+      const lanes = [...lg.lanes.values()];
+      const outgoing: Map<number, number[]> = lg.outgoing;
+
+      function nextLaneInRing(lane: any): any {
+        const candidates = (outgoing.get(lane.to) || []).map((id: number) => lg.lanes.get(id));
+        const forward = candidates.filter((l: any) => !(l.from === lane.to && l.to === lane.from));
+        return forward[0] ?? candidates[0];
+      }
+      // Build one long one-directional route around the ring (several laps, so no car's route
+      // ever runs out mid-test).
+      let route: any[] = [];
+      let cur = lanes.find((l: any) => l.from === 1 && l.to === 2);
+      for (let lap = 0; lap < 8; lap++) {
+        for (let k = 0; k < 6; k++) {
+          route.push(cur);
+          cur = nextLaneInRing(cur);
+        }
+      }
+      const forwardLanes = lanes.filter((l: any) => route.some((rl) => rl.id === l.id));
+
+      const cs: any[] = [];
+      let nextId = 1;
+      for (const lane of forwardLanes) {
+        let s = 0.5;
+        while (s < lane.length) {
+          const idxInRoute = route.findIndex((rl) => rl.id === lane.id);
+          const carRoute = idxInRoute >= 0 ? route.slice(idxInRoute) : route;
+          cs.push({
+            id: nextId++,
+            route: carRoute,
+            routeIndex: 0,
+            laneId: lane.id,
+            s,
+            speed: 0,
+            color: 0,
+            heldNodeId: null,
+            stalledHeldSeconds: 0,
+            lockBackoffUntil: 0,
+            boxBlockedSeconds: 0,
+          });
+          s += 4;
+        }
+      }
+      sim.cs = cs;
+      return cs.length;
+    }
+
+    it('RED-would-be: a saturated ring reaches an all-frozen, zero-locks-held state (pre-fix reproduction)', () => {
+      const { sim } = ringWorld();
+      const injectedCount = saturateRing(sim as any);
+      expect(injectedCount).toBeGreaterThan(10); // sanity: the ring is genuinely saturated
+
+      const dt = 1 / 60;
+      let maxFrozenStreak = 0;
+      let frozenStreak = 0;
+      let maxNoLockFrozenStreak = 0;
+      let noLockFrozenStreak = 0;
+
+      for (let i = 0; i < (60 * 60) / dt; i++) {
+        sim.update(dt);
+        const cars = sim.cars;
+        const allFrozen = cars.length > 0 && cars.every((c) => c.speed < 0.05);
+        frozenStreak = allFrozen ? frozenStreak + dt : 0;
+        maxFrozenStreak = Math.max(maxFrozenStreak, frozenStreak);
+        const locks: Map<number, number> = (sim as any).junctionLocks;
+        const noLockFrozen = allFrozen && locks.size === 0;
+        noLockFrozenStreak = noLockFrozen ? noLockFrozenStreak + dt : 0;
+        maxNoLockFrozenStreak = Math.max(maxNoLockFrozenStreak, noLockFrozenStreak);
+      }
+
+      // Documents that this exact saturated-ring construction WOULD freeze permanently with zero
+      // locks held on pre-T47 code (confirmed via a stashed-fix run during development — see
+      // task-47-report.md). Post-fix, flow must resume well within the run: neither the frozen
+      // streak nor the specifically-zero-locks-held streak should ever approach the full hour.
+      expect(maxFrozenStreak).toBeLessThan(30);
+      expect(maxNoLockFrozenStreak).toBeLessThan(30);
+    });
+
+    it('GREEN: flow resumes on a saturated ring — cars keep completing laps rather than freezing forever', () => {
+      const { sim } = ringWorld();
+      const injectedCount = saturateRing(sim as any);
+      expect(injectedCount).toBeGreaterThan(10);
+
+      const dt = 1 / 60;
+      let maxFrozenStreak = 0;
+      let frozenStreak = 0;
+      let anyCarEverMoved = false;
+
+      for (let i = 0; i < (10 * 60) / dt; i++) {
+        sim.update(dt);
+        const cars = sim.cars;
+        const allFrozen = cars.length > 0 && cars.every((c) => c.speed < 0.05);
+        frozenStreak = allFrozen ? frozenStreak + dt : 0;
+        maxFrozenStreak = Math.max(maxFrozenStreak, frozenStreak);
+        if (cars.some((c) => c.speed > 0.5)) anyCarEverMoved = true;
+      }
+
+      expect(anyCarEverMoved).toBe(true);
+      expect(maxFrozenStreak).toBeLessThan(30);
+    });
+  });
 });
