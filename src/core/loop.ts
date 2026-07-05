@@ -36,9 +36,14 @@ export class Loop {
       // (e.g. 16x only ever running 8 of the 16 steps/frame it needs at 60Hz).
       const cap = Math.ceil(8 * Math.max(1, this.timeScale));
       const { steps, remainder } = stepAccumulator(this.acc, SIM_DT, cap);
-      if (steps > 0) this.onBatchStart?.();
-      for (let i = 0; i < steps; i++) this.update(SIM_DT);
-      if (steps > 0) this.onBatchEnd?.();
+      if (steps > 0) {
+        this.onBatchStart?.();
+        try {
+          for (let i = 0; i < steps; i++) this.update(SIM_DT);
+        } finally {
+          this.onBatchEnd?.();
+        }
+      }
       this.acc = remainder;
       this.render(this.acc / SIM_DT);
       this.raf = requestAnimationFrame(tick);

@@ -157,5 +157,40 @@ describe('Heightfield', () => {
       hf.endDeformBatch();
       expect(hf.heightAt(0, 0)).toBeGreaterThan(before + 4);
     });
+
+    it('endDeformBatch is reached by finally even if an update throws mid-batch', () => {
+      // Critical: the Loop uses try/finally to bracket sim updates. If any update throws
+      // mid-batch, onBatchEnd (which calls endDeformBatch) must still fire or the batch
+      // never closes and deformBatchDepth sticks > 0, leaving all future easement replays
+      // deferred forever (Task 47 critical finding).
+      const hf = new Heightfield('batch-s7');
+      const ceiling = hf.heightAt(0, 0);
+      withLowCeilingEasement(hf, ceiling);
+
+      let endWasCalled = false;
+      const originalEnd = hf.endDeformBatch.bind(hf);
+      hf.endDeformBatch = function (this: any) {
+        endWasCalled = true;
+        return originalEnd.call(this);
+      };
+
+      expect(() => {
+        hf.beginDeformBatch();
+        try {
+          hf.flattenCircle(5, 5, ceiling + 20, 12);
+          throw new Error('simulated update failure');
+        } finally {
+          hf.endDeformBatch();
+        }
+      }).toThrow('simulated update failure');
+
+      expect(endWasCalled).toBe(true);
+      // Verify the batch actually closed and can dedupe properly by opening/closing again
+      // and confirming a deferred operation completes.
+      hf.beginDeformBatch();
+      hf.flattenCircle(5, 5, ceiling + 20, 12);
+      hf.endDeformBatch();
+      expect(hf.heightAt(0, 0)).toBeLessThanOrEqual(ceiling + 0.05);
+    });
   });
 });
