@@ -71,4 +71,91 @@ describe('Heightfield', () => {
       expect(rect).not.toBeNull();
     });
   });
+
+  // Task 47 item 2 ("combined easement x grading load"): beginDeformBatch()/endDeformBatch() defer
+  // and dedupe flattenCircle's per-call easement replay to once per batch. See
+  // perfEasementGrading.test.ts for the integration-level perf evidence; these are focused
+  // Heightfield-level unit tests for the bracket's own semantics.
+  describe('deform batching (Task 47 item 2)', () => {
+    /** Registers a single easement sample at (0,0) with a low ceiling, so any flattenCircle that
+     * raises terrain there gets pulled back down whenever the easement is (re-)replayed. */
+    function withLowCeilingEasement(hf: Heightfield, ceiling: number) {
+      hf.registerRoadEasement(
+        1,
+        [{ x: 0, z: 0, y: ceiling, bridge: false }],
+        () => 0,
+        12, 12, 12, 12,
+      );
+    }
+
+    it('outside a batch, flattenCircle still replays the easement immediately (unchanged behavior)', () => {
+      const hf = new Heightfield('batch-s1');
+      const ceiling = hf.heightAt(0, 0);
+      withLowCeilingEasement(hf, ceiling);
+      hf.flattenCircle(5, 5, ceiling + 20, 12); // overlaps (0,0)'s easement footprint
+      expect(hf.heightAt(0, 0)).toBeLessThanOrEqual(ceiling + 0.05);
+    });
+
+    it('within an open batch, the easement replay is deferred but the underlying deform still applies immediately', () => {
+      const hf = new Heightfield('batch-s2');
+      const ceiling = hf.heightAt(0, 0);
+      withLowCeilingEasement(hf, ceiling);
+      hf.beginDeformBatch();
+      hf.flattenCircle(5, 5, ceiling + 20, 12);
+      // The raw flattenCircle blend itself should already show through near ITS OWN center (5,5)
+      // — this test only asserts the EASEMENT's re-clamp at (0,0) is what's deferred, not that
+      // flattenCircle no-ops.
+      expect(hf.heightAt(5, 5)).toBeGreaterThan(ceiling + 4);
+      // The easement's ceiling at (0,0) has NOT been re-enforced yet — terrain there is free to
+      // sit above `ceiling` until the batch closes.
+      expect(hf.heightAt(0, 0)).toBeGreaterThan(ceiling + 0.05);
+      hf.endDeformBatch();
+      // Now that the batch closed, the deferred replay has run.
+      expect(hf.heightAt(0, 0)).toBeLessThanOrEqual(ceiling + 0.05);
+    });
+
+    it('replays each touched easement sample only once per batch, regardless of how many flattenCircle calls touched it', () => {
+      const hf = new Heightfield('batch-s3');
+      const ceiling = hf.heightAt(0, 0);
+      let replayCalls = 0;
+      const originalApply = (hf as any).applyClampBelow.bind(hf);
+      (hf as any).applyClampBelow = (...args: unknown[]) => {
+        replayCalls++;
+        return originalApply(...args);
+      };
+      withLowCeilingEasement(hf, ceiling);
+      hf.beginDeformBatch();
+      for (let i = 0; i < 10; i++) hf.flattenCircle(5, 5, ceiling + 20, 12); // 10 calls, same footprint
+      expect(replayCalls).toBe(0); // deferred — none replayed yet mid-batch
+      hf.endDeformBatch();
+      expect(replayCalls).toBe(1); // exactly one replay for the one registered sample
+    });
+
+    it('nested begin/end pairs only flush at the outermost end (defensive)', () => {
+      const hf = new Heightfield('batch-s4');
+      const ceiling = hf.heightAt(0, 0);
+      withLowCeilingEasement(hf, ceiling);
+      hf.beginDeformBatch();
+      hf.beginDeformBatch();
+      hf.flattenCircle(5, 5, ceiling + 20, 12);
+      hf.endDeformBatch(); // inner close — should NOT flush yet
+      expect(hf.heightAt(0, 0)).toBeGreaterThan(ceiling + 0.05);
+      hf.endDeformBatch(); // outer close — flushes now
+      expect(hf.heightAt(0, 0)).toBeLessThanOrEqual(ceiling + 0.05);
+    });
+
+    it('endDeformBatch is a safe no-op when called without a matching begin', () => {
+      const hf = new Heightfield('batch-s5');
+      expect(() => hf.endDeformBatch()).not.toThrow();
+    });
+
+    it('a batch with zero registered easements is a cheap no-op (does not affect ordinary flattenCircle behavior)', () => {
+      const hf = new Heightfield('batch-s6');
+      const before = hf.heightAt(0, 0);
+      hf.beginDeformBatch();
+      hf.flattenCircle(0, 0, before + 5, 12);
+      hf.endDeformBatch();
+      expect(hf.heightAt(0, 0)).toBeGreaterThan(before + 4);
+    });
+  });
 });

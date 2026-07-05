@@ -42,6 +42,71 @@ export class Heightfield {
   // sample on the map (which could be in the thousands on a fully built-out island).
   private readonly easementBuckets = new Map<string, { edgeId: number; idx: number }[]>();
 
+  // --- Deform batching (Task 47 item 2: "combined easement x grading load") -------------------
+  // Perf evidence (see task-47-report.md): with a built-out map (20+ registered easements) and
+  // several crews grading adjacent edges at 16x HUD speed, `Loop` batches up to 128 fixed sim-steps
+  // into a single rendered frame — every one of those steps that lands on a grading front calls
+  // `gradeTerrainAt` -> 3x `flattenCircle`, each of which independently calls
+  // `reapplyEasementsNear` and re-replays every registered easement sample whose footprint overlaps
+  // the touched region, every single call. Measured worst case: ~154ms/batch (avg ~108ms), because
+  // the SAME easement samples get replayed dozens of times per batch — once per `flattenCircle`
+  // call that happens to touch their bucket, not once per batch.
+  //
+  // `beginDeformBatch()`/`endDeformBatch()` bracket a batch of sim steps (called once per rendered
+  // frame, around the whole fixed-step loop — see main.ts/Loop): while a batch is open,
+  // `flattenCircle` still mutates height data immediately every call (so grading itself still
+  // looks/behaves correctly step-by-step — nothing about the deform math changes), but instead of
+  // calling `reapplyEasementsNear` synchronously, it collects the touched easement-sample refs into
+  // `pendingEasementReplays` (a Map keyed by `edgeId:idx` — the same dedupe key
+  // `reapplyEasementsNear` already uses per-call). `endDeformBatch()` replays each unique touched
+  // sample exactly ONCE, after every step in the batch has run.
+  //
+  // This is safe per T43's own review note (`applyClampBelow` never recurses into
+  // `reapplyEasementsNear`, so there's no ordering cascade to worry about) plus this task's brief:
+  // the replay's RESULT is order-independent/commutative — each replay is a hard clamp-down
+  // (`applyClampBelow` only ever pulls a vertex DOWN to its ceiling, never raises it), so replaying
+  // the same fixed set of samples once at the end of a batch, instead of after every intermediate
+  // deform, converges to the identical final heightfield state: any vertex any of those samples
+  // would clamp is clamped to the same ceiling regardless of how many intermediate (pre-replay)
+  // states it passed through in between. Batching only the REPLAY, never the underlying
+  // `flattenCircle`/`clampBelow` deforms themselves (which still apply every call, immediately, in
+  // order) keeps the sim's own step-by-step determinism completely untouched.
+  //
+  // Depth-counted so nested begin/end pairs (defensive — no current caller nests them) collapse to
+  // a single flush at the outermost `endDeformBatch()`, rather than flushing early mid-nest.
+  private deformBatchDepth = 0;
+  private pendingEasementReplays: Map<string, { edgeId: number; idx: number }> | null = null;
+
+  /** Opens a deform batch (see the class-level doc comment above `deformBatchDepth`): while open,
+   * `flattenCircle`'s easement-replay work is deferred and deduped until `endDeformBatch()` flushes
+   * it once. Call once per rendered frame around a batch of fixed sim-steps (e.g. `Loop`'s
+   * accumulator loop), not per individual sim step. Safe to call even with zero registered
+   * easements (the common case for most of the game) — `endDeformBatch` is then a cheap no-op. */
+  beginDeformBatch(): void {
+    if (this.deformBatchDepth === 0) this.pendingEasementReplays = new Map();
+    this.deformBatchDepth++;
+  }
+
+  /** Closes a deform batch opened by `beginDeformBatch()`, replaying every touched easement sample
+   * exactly once (only at the OUTERMOST close, for nested begin/end pairs). No-op if called without
+   * a matching `beginDeformBatch()` (defensive — every `flattenCircle` call already replays
+   * immediately whenever no batch is open, so this only ever matters if begin/end become
+   * unbalanced). */
+  endDeformBatch(): void {
+    if (this.deformBatchDepth === 0) return;
+    this.deformBatchDepth--;
+    if (this.deformBatchDepth > 0) return;
+    const pending = this.pendingEasementReplays;
+    this.pendingEasementReplays = null;
+    if (!pending || pending.size === 0) return;
+    for (const ref of pending.values()) {
+      const list = this.easements.get(ref.edgeId);
+      const es = list?.[ref.idx];
+      if (!es) continue;
+      this.applyClampBelow(es.x, es.z, es.y, es.radius, es.flatRadius, es.heading, es.alongRadius, es.alongFlatRadius);
+    }
+  }
+
   constructor(public readonly seed: string, private bus?: EventBus) {
     const noise = createNoise2D(createRng(seed));
     const half = WORLD_SIZE / 2;
@@ -185,6 +250,13 @@ export class Heightfield {
    * bucket index to gather only nearby easement samples rather than scanning every registered
    * sample on the map, so this stays cheap even with hundreds of graded edges. Safe/cheap no-op
    * when nothing is registered yet (the common case for most of the game before any road exists).
+   *
+   * Task 47 item 2: when a deform batch is open (`beginDeformBatch()`/`endDeformBatch()`), touched
+   * easement-sample refs are collected into `pendingEasementReplays` instead of being replayed
+   * immediately — the SAME dedupe key (`edgeId:idx`) this method already used per-call now dedupes
+   * across the WHOLE batch instead, so a sample touched by many `flattenCircle` calls within one
+   * batch gets replayed once at `endDeformBatch()`, not once per call. Outside a batch, behavior is
+   * byte-for-byte unchanged from before this task (replays immediately, same as always).
    */
   private reapplyEasementsNear(minI: number, minJ: number, maxI: number, maxJ: number): void {
     if (this.easements.size === 0) return;
@@ -205,6 +277,14 @@ export class Heightfield {
           const dedupeKey = `${ref.edgeId}:${ref.idx}`;
           if (seen.has(dedupeKey)) continue;
           seen.add(dedupeKey);
+          if (this.pendingEasementReplays) {
+            // Batching: defer to endDeformBatch(), deduped across the whole batch (a Map keyed by
+            // the same dedupeKey naturally collapses repeat touches from later calls this batch).
+            if (!this.pendingEasementReplays.has(dedupeKey)) {
+              this.pendingEasementReplays.set(dedupeKey, { edgeId: ref.edgeId, idx: ref.idx });
+            }
+            continue;
+          }
           const list = this.easements.get(ref.edgeId);
           const es = list?.[ref.idx];
           if (!es) continue;

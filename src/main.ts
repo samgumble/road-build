@@ -318,6 +318,16 @@ function main(): void {
     if (document.visibilityState === 'hidden') save();
   });
 
+  // Task 47 item 2 ("combined easement x grading load"): bracket each rendered frame's WHOLE batch
+  // of fixed sim-steps (up to ~128 at 16x HUD speed) so `Heightfield`'s per-`flattenCircle`
+  // easement replay (Task 43) is deferred and deduped once per batch rather than once per
+  // grading tick — see task-47-report.md for the measured perf numbers this fixes. Sim-deterministic
+  // (the replay's result is order-independent — see `Heightfield`'s doc comment on
+  // `beginDeformBatch`), so this only changes WHEN the replay happens, never the sim's own
+  // step-by-step outcome.
+  loop.onBatchStart = () => hf.beginDeformBatch();
+  loop.onBatchEnd = () => hf.endDeformBatch();
+
   loop.start();
 }
 
