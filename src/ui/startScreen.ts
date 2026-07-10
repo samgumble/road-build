@@ -94,6 +94,8 @@ const START_SCREEN_CSS = `
   }
   #gw-start-screen .gw-start-card {
     width: min(475px, 100%);
+    min-width: 0;
+    box-sizing: border-box;
     padding: clamp(24px, 4vw, 42px);
     background: linear-gradient(145deg, rgba(18,24,26,.94), rgba(18,24,26,.78));
     border: 1px solid var(--gw-border);
@@ -197,13 +199,21 @@ const START_SCREEN_CSS = `
     }
     #gw-start-screen .gw-start-card {
       width: 100%;
+      min-width: 0;
       padding: 24px 20px 22px;
       backdrop-filter: blur(10px);
     }
-    #gw-start-screen h1 { font-size: clamp(47px, 17vw, 70px); }
+    #gw-start-screen h1 {
+      min-width: 0;
+      font-size: clamp(42px, 13.2vw, 56px);
+      letter-spacing: -.055em;
+    }
     #gw-start-screen .gw-start-tagline { margin: 17px 0 20px; }
-    #gw-start-screen .gw-start-actions { display: grid; grid-template-columns: 1fr 1fr; }
-    #gw-start-screen .gw-start-primary { min-width: 0; }
+    #gw-start-screen .gw-start-actions {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }
+    #gw-start-screen .gw-start-actions button { min-width: 0; padding-inline: 10px; }
   }
   @media (prefers-reduced-motion: reduce) {
     #gw-start-screen, #gw-start-screen .gw-start-art, #gw-start-screen .gw-start-card { animation: none; transition-duration: .01ms; }
