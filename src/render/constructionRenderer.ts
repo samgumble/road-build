@@ -118,15 +118,14 @@ const TIRE_MARK_INTERVAL = 0.25; // seconds between mark stamps per active vehic
 const TIRE_MARK_COLOR = '#2a2420';
 
 // --- Floodlight (Task 37: towers stake down at fixed stations, like the T27 cones) -------------
-// Task 45: denser construction lighting at night ("more construction lights") — spacing halved
-// (70u -> 35u) and the per-crew cap doubled (6 -> 12) so a long job reads as a properly lit night
-// site rather than a handful of sparse poles. Same alternating-sides / bridge-avoidance / cap-
-// then-widen-spacing behavior as before, just at 2x the station density.
+// Construction lighting density has been expanded twice: the original 70u/6-tower budget became
+// 35u/12 in Task 45 and is now 17.5u/24 per crew. The alternating-sides, bridge-avoidance, and
+// cap-then-widen behavior remains unchanged; the real-light budget stays one SpotLight per crew.
 const FLOODLIGHT_EASE = 1.2; // seconds to ease in/out with night + job-active state
 const FLOODLIGHT_COLOR = '#ffcf8a';
-const FLOODLIGHT_SPACING = 35; // target arclength (u) between successive tower stations (was 70)
+const FLOODLIGHT_SPACING = 17.5; // target arclength (u) between successive tower stations (was 35)
 const FLOODLIGHT_PERP_OFFSET = ROAD_WIDTH_HALF + 2.2; // ± units from the centerline, per spec
-const FLOODLIGHT_CAP = 12; // per-crew tower budget (was 6) — mirrors CONE_CAP's cap-then-widen-spacing approach
+const FLOODLIGHT_CAP = 24; // per-crew tower budget (was 12) — mirrors CONE_CAP's cap-then-widen-spacing approach
 const FLOODLIGHT_STATION_MERGE_DIST = 8; // u; displaced bridge-avoidance stations within this
                                           // arclength of another chosen station are dropped as duplicates
 const FLOODLIGHT_LIGHT_EASE = 0.8; // seconds to cross-fade the single shared SpotLight between towers
@@ -135,7 +134,7 @@ const FLOODLIGHT_LIGHT_EASE = 0.8; // seconds to cross-fade the single shared Sp
 // Cheap "visible cast light" trick, same family as carRenderer's headlight glow-quad/beam-cone
 // pair: one InstancedMesh each for the warm ground pool and the downward light cone, shared across
 // ALL crews (not per-crew) since they're purely additive decals with no per-crew material state.
-// Bounded at MAX_CREWS * FLOODLIGHT_CAP instances each (3*12 = 36) regardless of how many towers
+// Bounded at MAX_CREWS * FLOODLIGHT_CAP instances each (3*24 = 72) regardless of how many towers
 // are actually live at once.
 const FLOODLIGHT_POOL_RADIUS = 7; // u, ground pool ellipse radius
 const FLOODLIGHT_POOL_OPACITY = 0.25;
@@ -1855,7 +1854,7 @@ const upAxisFloodlight = new THREE.Vector3(0, 1, 0);
  * Both are ONE InstancedMesh each (2 draw calls total, not per crew) since they're pure additive
  * decals sharing one material per mesh — exactly the `poleMesh`/`headMesh` "2 draw calls regardless
  * of tower count" pattern `FloodlightTowerPool` already established, just shared across crews too.
- * Capacity is bounded at `MAX_CREWS * FLOODLIGHT_CAP` instances each (3*12 = 36) so the draw-call
+ * Capacity is bounded at `MAX_CREWS * FLOODLIGHT_CAP` instances each (3*24 = 72) so the draw-call
  * and vertex budget never depends on how many towers happen to be live.
  *
  * Visibility is driven per-instance by the OWNING crew's `floodlightVisibility` (night && job-

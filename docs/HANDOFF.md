@@ -48,10 +48,12 @@ assuming a green build means the page is live.
 
 - Draw, demolish, intersections, and closed-loop roads; construction is pipelined across up to
   three crews.
-- Static cones and night-only construction lighting fade with a worksite; vegetation/scenery in a
-  build corridor clears quickly and roads clamp terrain beneath their ribbon.
+- Static cones and dense night-only construction lighting (up to 24 fixed towers per crew) fade
+  with a worksite; vegetation/scenery in a build corridor clears quickly and roads clamp terrain
+  beneath their ribbon.
 - Settlements, wilderness, quarry logistics, traffic routing, saves, mobile gestures, quality
-  tiers, day/night water, ambient music, and real photo capture.
+  tiers, a two-thirds-day/one-third-night cycle, night-dimmed water, ambient music, and real photo
+  capture.
 - Site command UI: Draw/Demolish, speed controls, Pause/Resume (`Space`), and a live Guide
   (`H`/`?`) showing network, jobs, town, traffic, and simulation state.
 

@@ -4,6 +4,7 @@ import { EventBus } from '../core/events';
 import { DAY_LENGTH, WORLD_SIZE } from '../core/constants';
 import { clamp01 } from './easing';
 import { Sky } from './sky';
+import { solarTimeOfDay, sunElevation } from './solarTime';
 
 /** A single keyframe stop, at a given point in the 0..1 day cycle. */
 interface Stop {
@@ -18,12 +19,12 @@ interface Stop {
 // black" to "clear night with ambient skyglow" without flattening the day/night contrast.
 const SKY_STOPS: Stop[] = [
   { t: 0.0, color: new THREE.Color('#151b30') }, // deep night
-  { t: 0.22, color: new THREE.Color('#151b30') }, // still night just before dawn
-  { t: 0.28, color: new THREE.Color('#f5a35c') }, // dawn
-  { t: 0.4, color: new THREE.Color('#bfd9e8') }, // day
-  { t: 0.72, color: new THREE.Color('#bfd9e8') }, // day
-  { t: 0.82, color: new THREE.Color('#e07a3f') }, // dusk
-  { t: 0.92, color: new THREE.Color('#151b30') }, // night
+  { t: 0.10, color: new THREE.Color('#151b30') }, // still night just before the shorter dawn
+  { t: 1 / 6, color: new THREE.Color('#f5a35c') }, // sunrise
+  { t: 0.25, color: new THREE.Color('#bfd9e8') }, // full day
+  { t: 0.75, color: new THREE.Color('#bfd9e8') }, // full day
+  { t: 5 / 6, color: new THREE.Color('#e07a3f') }, // sunset
+  { t: 0.90, color: new THREE.Color('#151b30') }, // short night
   { t: 1.0, color: new THREE.Color('#151b30') },
 ];
 
@@ -41,12 +42,6 @@ function sampleStops(stops: Stop[], t: number): THREE.Color {
     }
   }
   return stops[stops.length - 1].color.clone();
-}
-
-/** Sun elevation as sin(2*pi*(timeOfDay - 0.25)), so it peaks at noon (t=0.5) and is most
- * negative at midnight (t=0). Returned in -1..1. */
-function sunElevation(timeOfDay: number): number {
-  return Math.sin(2 * Math.PI * (timeOfDay - 0.25));
 }
 
 const CLOUD_GROUP_COUNT = 9;
@@ -343,7 +338,7 @@ export class Atmosphere {
     this.sun.color.copy(SUN_WARM);
 
     // Sun orbit: elevation drives height, azimuth drifts slowly across the day.
-    const azimuth = this.timeOfDay * Math.PI * 2;
+    const azimuth = solarTimeOfDay(this.timeOfDay) * Math.PI * 2;
     const radius = 260;
     this.sun.position.set(
       Math.cos(azimuth) * radius,

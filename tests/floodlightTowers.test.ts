@@ -17,10 +17,14 @@ function findAnchor(hf: Heightfield, span: number): { x: number; z: number } {
 
 /** Wires up a real BuildQueue -> ConstructionRenderer pipeline (same event-bus contract main.ts
  * uses), mirroring staleDemolishBand.test.ts / constructionConvoy.test.ts. */
-function buildRig(seed: string, span: number) {
+function buildRig(seed: string, span: number, forceNonBridge = false) {
   const bus = new EventBus();
   const hf = new Heightfield(seed, bus);
-  const graph = new RoadGraph(bus, makeSampler(hf));
+  const baseSampler = makeSampler(hf);
+  const graph = new RoadGraph(bus, (ctrl) => {
+    const samples = baseSampler(ctrl);
+    return forceNonBridge ? samples.map((sample) => ({ ...sample, bridge: false })) : samples;
+  });
   const queue = new BuildQueue(graph, hf, bus);
   const scene = new THREE.Scene();
   const roadRenderer = new RoadRenderer(scene, graph, bus, hf);
@@ -55,7 +59,7 @@ function floodlightPoolEdgeId(renderer: ConstructionRenderer, crew: number): num
 
 describe('floodlight towers stake down at fixed stations (Task 37)', () => {
   it('places towers once at job start and never moves them as the work front advances', () => {
-    const { queue, renderer, edgeId, graph } = buildRig('floodlight-fixed-test', 220);
+    const { queue, renderer, edgeId, graph } = buildRig('floodlight-fixed-test', 220, true);
 
     const dt = 1 / 60;
     // Run a few frames so the first construction:progress event lands and towers get placed.
@@ -71,9 +75,10 @@ describe('floodlight towers stake down at fixed stations (Task 37)', () => {
       }
     }
     expect(placedCount).toBeGreaterThan(0);
-    // Task 45: density doubled (FLOODLIGHT_CAP 6 -> 12, FLOODLIGHT_SPACING 70u -> 35u) so a job
-    // site reads as densely lit at night — this cap reflects that spec change, not a regression.
-    expect(placedCount).toBeLessThanOrEqual(12); // FLOODLIGHT_CAP
+    // The expanded work-light pass doubles Task 45's density again: a 220u site should now carry
+    // at least 13 fixed stations rather than the previous ~8, while remaining under the pool cap.
+    expect(placedCount).toBeGreaterThanOrEqual(13);
+    expect(placedCount).toBeLessThanOrEqual(24); // FLOODLIGHT_CAP
 
     // Advance the job substantially (well into gravel/graded/paved stages) — the work front moves
     // a long way down the 220u edge in this window.
@@ -91,10 +96,10 @@ describe('floodlight towers stake down at fixed stations (Task 37)', () => {
     }
   });
 
-  it('caps towers at 12 and widens spacing rather than exceeding the per-crew budget on a long edge', () => {
-    // Task 45: 600u / 35u spacing would want ~18 stations, well past the new FLOODLIGHT_CAP=12 —
-    // still exercises the cap-then-widen-spacing path the same way the pre-T45 6-cap test did.
-    const { queue, renderer, edgeId } = buildRig('floodlight-cap-test', 600);
+  it('caps towers at 24 and widens spacing rather than exceeding the per-crew budget on a long edge', () => {
+    // 600u / 17.5u spacing wants well over 24 stations, exercising cap-then-widen at the doubled
+    // budget. Exact equality makes this a density regression test, not merely an upper bound.
+    const { queue, renderer, edgeId } = buildRig('floodlight-cap-test', 600, true);
 
     const dt = 1 / 60;
     let placedCount = -1;
@@ -107,7 +112,7 @@ describe('floodlight towers stake down at fixed stations (Task 37)', () => {
       }
     }
     expect(placedCount).toBeGreaterThan(0);
-    expect(placedCount).toBeLessThanOrEqual(12);
+    expect(placedCount).toBe(24);
   });
 
   it('fades towers out with the crew dressing on job completion and re-places on a later demolish job', () => {
