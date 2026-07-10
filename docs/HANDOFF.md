@@ -86,9 +86,11 @@ These are deliberately uncommitted product directions, not known blockers:
 4. Add camera bookmarks / focus-active-crew shortcuts for larger settlements.
 5. Profile an optimized production build on a real mobile device and a built-out 16× map before
    raising visual density further.
-6. Manually spot-check the crew progress bars, notices, guide backdrop/focus, and wet roads in a
-   real browser at desktop and 375px-wide mobile sizes. The implementation has focused tests and
-   a production build, but Codex browser automation is policy-blocked from the localhost URL.
+6. Manually spot-check wet roads on a built-out save during rain. The deployed HUD and guide were
+   visually checked on 2026-07-10 at desktop and 375×812 mobile sizes: no horizontal overflow,
+   visible controls remained at least 44px tall, the modal stayed inside the viewport, and close
+   focus/backdrop behavior was correct. Localhost automation was policy-blocked, so that check used
+   the published GitHub Pages build after its workflow passed.
 
 ## Review checklist
 
