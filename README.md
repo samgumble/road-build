@@ -17,8 +17,9 @@ same slate, paper, and safety-orange visual language through construction status
 
 | Input | Action |
 |---|---|
-| LMB drag (on terrain) | Survey a new road — release to commit it, or let go somewhere invalid and the preview fades |
+| LMB drag (on terrain) | Survey a new road — release to commit it, or let go somewhere invalid and the preview fades with a short notice saying why (too short, off-island, or a water endpoint) |
 | LMB click (Demolish mode) | Remove the road under the cursor; the crew tears it up in reverse |
+| Undo Survey chip, or Z | For 8 seconds after committing a survey, withdraw it — an untouched survey vanishes instantly; one the crew already started is torn back down |
 | RMB drag | Orbit the camera |
 | Q / E | Rotate the camera left / right |
 | MMB drag, or W/A/S/D | Pan the camera |
@@ -30,6 +31,7 @@ same slate, paper, and safety-orange visual language through construction status
 | Toolbar: Hide Controls / Show Controls | Collapse the site-command bar to a single restore button; the preference persists across reloads |
 | Toolbar: Guide, or H / ? | Open the live site overview and control reference |
 | Toolbar: New World | Start a fresh island from a seed |
+| Toolbar: Share | Copy a `?seed=` link to this island to the clipboard |
 | Toolbar: Photo | Save a PNG screenshot of the current view |
 | Toolbar: Music | Toggle the ambient music rotation independently of sound effects |
 | Toolbar: Mute | Toggle audio |

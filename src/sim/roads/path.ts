@@ -133,11 +133,27 @@ export function makeSampler(hf: Heightfield) {
   };
 }
 
-export function validateChain(ctrl: P2[], hf: Heightfield): boolean {
-  if (ctrl.length < 2) return false;
+/**
+ * Why a chain can't be committed, as a short player-facing HUD notice (already in the ticker's
+ * uppercase field-office voice) — or null when the chain is valid. `validateChain` is this
+ * function's boolean shadow; keep every rule in exactly one of the two by defining it here.
+ * Checks run in the same order the player experiences them: a barely-there drag first, then
+ * world bounds, then the land-endpoint rule (mid-chain water is fine — that's a bridge).
+ */
+export function explainChainRejection(ctrl: P2[], hf: Heightfield): string | null {
+  if (ctrl.length < 2) return 'DRAG FURTHER TO SURVEY A ROAD';
   const lim = WORLD_SIZE / 2 - SNAP;
-  for (const p of ctrl) if (Math.abs(p.x) > lim || Math.abs(p.z) > lim) return false;
-  return hf.isLand(ctrl[0].x, ctrl[0].z) && hf.isLand(ctrl[ctrl.length - 1].x, ctrl[ctrl.length - 1].z);
+  for (const p of ctrl) {
+    if (Math.abs(p.x) > lim || Math.abs(p.z) > lim) return 'TOO CLOSE TO THE ISLAND EDGE';
+  }
+  if (!hf.isLand(ctrl[0].x, ctrl[0].z) || !hf.isLand(ctrl[ctrl.length - 1].x, ctrl[ctrl.length - 1].z)) {
+    return 'ROADS MUST START AND END ON LAND';
+  }
+  return null;
+}
+
+export function validateChain(ctrl: P2[], hf: Heightfield): boolean {
+  return explainChainRejection(ctrl, hf) === null;
 }
 
 /** Heading (radians) at `samples[i]`, via a forward/backward difference against its immediate

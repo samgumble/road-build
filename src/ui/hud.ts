@@ -71,6 +71,57 @@ export function formatConstructionNotice(stage: Stage | 'removed', crew: number)
   return null;
 }
 
+/** Canonical share link for the current island: the page's own origin+path with exactly one
+ * query param, `?seed=` — any existing query/hash (an old seed, a tracking fragment) is replaced,
+ * so the copied link always reboots into this island regardless of how the page was reached. */
+export function islandShareUrl(href: string, seed: string): string {
+  const url = new URL(href);
+  url.hash = '';
+  url.search = `?${new URLSearchParams({ seed })}`;
+  return url.toString();
+}
+
+/** How long the post-commit undo window stays open. Wall-clock (like notices) rather than
+ * sim-time: it's an input-affordance window, not sim state — pausing the sim shouldn't strand a
+ * player unable to undo, and undoing is itself just another deterministic input to the sim. */
+export const UNDO_WINDOW_MS = 8000;
+
+/**
+ * Pure state for the "undo last survey" affordance: opened with the edge ids `commitChain`
+ * returned, consumable exactly once while un-expired. Time is injected (ms) so the timing rules
+ * are unit-testable without fake timers; the Hud feeds it `performance.now()` and owns the DOM
+ * chip that mirrors `isOpen`.
+ */
+export class UndoWindow {
+  private edgeIds: number[] = [];
+  private deadline = -Infinity;
+
+  /** Replaces any previous window — undo always targets the MOST RECENT survey only. */
+  open(edgeIds: number[], nowMs: number): void {
+    this.edgeIds = edgeIds.slice();
+    this.deadline = nowMs + UNDO_WINDOW_MS;
+  }
+
+  isOpen(nowMs: number): boolean {
+    return this.edgeIds.length > 0 && nowMs < this.deadline;
+  }
+
+  /** Returns the committed edge ids exactly once (empty when closed/expired) and closes. */
+  consume(nowMs: number): number[] {
+    if (!this.isOpen(nowMs)) {
+      this.edgeIds = [];
+      return [];
+    }
+    const ids = this.edgeIds;
+    this.edgeIds = [];
+    return ids;
+  }
+
+  close(): void {
+    this.edgeIds = [];
+  }
+}
+
 export interface GrowthControlCopy {
   full: string;
   compact: string;
@@ -352,6 +403,10 @@ interface HudDeps {
   getGrowthPaused: () => boolean;
   setGrowthPaused: (paused: boolean) => void;
   onNewWorld: (seed: string) => void;
+  /** Withdraws the given just-committed survey edges (wired to BuildQueue.enqueueDemolish in
+   * main.ts, which also filters ids that no longer exist). Optional so tests can build a Hud
+   * without sim plumbing. */
+  onUndoSurvey?: (edgeIds: number[]) => void;
 }
 
 interface CrewHudState {
@@ -469,6 +524,11 @@ export class Hud {
   private tickerFramePending = false;
   private noticeContainer!: HTMLElement;
 
+  // Undo-last-survey affordance (backlog item 1): pure timing state + the chip that mirrors it.
+  private undoWindow = new UndoWindow();
+  private undoBtn!: HTMLButtonElement;
+  private undoHideTimer: number | null = null;
+
   constructor(private deps: HudDeps) {
     const hud = document.getElementById('hud');
     if (!hud) throw new Error('#hud container not found');
@@ -532,6 +592,17 @@ export class Hud {
     );
     panel.appendChild(this.tickerContainer);
 
+    // Undo chip: appears under the ticker for UNDO_WINDOW_MS after each survey commit. The panel
+    // itself is pointerEvents:none (it's a status readout), so the chip opts back in explicitly.
+    // minHeight matches the mobile touch-target floor everywhere — it's an occasional, transient
+    // control, so the extra height costs nothing on desktop.
+    this.undoBtn = el('button', { type: 'button', textContent: 'UNDO SURVEY · Z', className: 'gw-undo-btn' }, {
+      ...baseButtonStyle(), display: 'none', marginTop: '8px', pointerEvents: 'auto',
+      minHeight: '44px', borderLeft: `3px solid ${ACCENT}`,
+    }) as HTMLButtonElement;
+    this.undoBtn.addEventListener('click', () => this.triggerUndo());
+    panel.appendChild(this.undoBtn);
+
     this.root.appendChild(panel);
 
     this.hintEl = el('div', { id: 'gw-hint', textContent: 'DRAG TO SURVEY A ROAD' }, {
@@ -566,6 +637,7 @@ export class Hud {
     controls.appendChild(this.buildDivider());
     controls.appendChild(this.buildNewWorldGroup());
     controls.appendChild(this.buildGuideButton());
+    controls.appendChild(this.buildShareButton());
     controls.appendChild(this.buildPhotoButton());
     controls.appendChild(this.buildMusicButton());
     controls.appendChild(this.buildMuteButton());
@@ -727,6 +799,25 @@ export class Hud {
     return btn;
   }
 
+  private buildShareButton(): HTMLButtonElement {
+    const btn = el('button', { type: 'button' }, {
+      ...baseButtonStyle(),
+      borderBottom: '2px solid transparent',
+    });
+    setResponsiveLabel(btn, 'Share', 'SHARE');
+    btn.title = 'Copy a link to this island';
+    btn.addEventListener('click', () => {
+      const link = islandShareUrl(window.location.href, this.deps.seed);
+      // Clipboard access can be denied (permissions policy, non-secure context in odd embeds);
+      // fall back to showing the link itself so the player can still copy it by hand.
+      navigator.clipboard?.writeText(link).then(
+        () => this.showNotice('ISLAND LINK COPIED'),
+        () => this.showNotice(link),
+      ) ?? this.showNotice(link);
+    });
+    return btn;
+  }
+
   private buildGuideOverlay(): void {
     const backdrop = el('div', { id: 'gw-guide-backdrop' }, {
       display: 'none', position: 'fixed', inset: '0', background: 'rgba(10, 12, 13, 0.58)',
@@ -761,9 +852,9 @@ export class Hud {
     panel.appendChild(overview);
 
     const sections: Array<[string, string[]]> = [
-      ['BUILD', ['DRAG TO SURVEY A ROAD', 'DRAW BACK TO THE START TO CLOSE A LOOP', 'DEMOLISH MODE REMOVES A SELECTED ROAD']],
+      ['BUILD', ['DRAG TO SURVEY A ROAD', 'DRAW BACK TO THE START TO CLOSE A LOOP', 'DEMOLISH MODE REMOVES A SELECTED ROAD', 'Z (OR THE CHIP) UNDOES THE LAST SURVEY FOR 8s']],
       ['CAMERA', ['RIGHT DRAG OR Q/E ORBITS · MIDDLE DRAG / WASD PANS', 'WHEEL ZOOMS · TWO FINGERS PAN / PINCH / TWIST']],
-      ['COMMAND', ['SPACE PAUSES OR RESUMES THE SIM', '1 / 4 / 6 SELECT 1× / 4× / 16× SPEED', 'H OR ? OPENS THIS GUIDE']],
+      ['COMMAND', ['SPACE PAUSES OR RESUMES THE SIM', '1 / 4 / 6 SELECT 1× / 4× / 16× SPEED', 'H OR ? OPENS THIS GUIDE', 'SHARE COPIES A LINK TO THIS ISLAND']],
     ];
     for (const [title, lines] of sections) {
       panel.appendChild(el('div', { textContent: title }, { ...labelStyle(), color: TEXT_DIM, marginTop: '14px', marginBottom: '5px' }));
@@ -1031,7 +1122,9 @@ export class Hud {
     this.idleLineEl.style.display = activeCrews.length === 0 ? '' : 'none';
   }
 
-  private showNotice(message: string): void {
+  /** Public so main.ts can surface non-event feedback (e.g. DrawTool's chain-rejection reasons)
+   * through the same single notice channel every sim-driven milestone already uses. */
+  showNotice(message: string): void {
     while (this.noticeContainer.childElementCount >= 3) {
       this.noticeContainer.firstElementChild?.remove();
     }
@@ -1050,6 +1143,32 @@ export class Hud {
       notice.style.transform = 'translateY(-5px)';
       window.setTimeout(() => notice.remove(), 220);
     }, 2800);
+  }
+
+  /** Opens (or re-opens, replacing the previous) the undo window for a just-committed survey.
+   * Called from main.ts via DrawTool.onCommitted with the edge ids `commitChain` returned. */
+  openUndoWindow(edgeIds: number[]): void {
+    if (edgeIds.length === 0) return;
+    this.undoWindow.open(edgeIds, performance.now());
+    this.undoBtn.style.display = '';
+    if (this.undoHideTimer !== null) window.clearTimeout(this.undoHideTimer);
+    this.undoHideTimer = window.setTimeout(() => {
+      this.undoWindow.close();
+      this.undoBtn.style.display = 'none';
+      this.undoHideTimer = null;
+    }, UNDO_WINDOW_MS);
+  }
+
+  private triggerUndo(): void {
+    const edgeIds = this.undoWindow.consume(performance.now());
+    this.undoBtn.style.display = 'none';
+    if (this.undoHideTimer !== null) {
+      window.clearTimeout(this.undoHideTimer);
+      this.undoHideTimer = null;
+    }
+    if (edgeIds.length === 0) return;
+    this.deps.onUndoSurvey?.(edgeIds);
+    this.showNotice('SURVEY WITHDRAWN');
   }
 
   private dismissHint(): void {
@@ -1090,6 +1209,11 @@ export class Hud {
     if (event.key === '?' || event.key.toLowerCase() === 'h') {
       event.preventDefault();
       this.toggleGuide();
+      return true;
+    }
+    if (event.key.toLowerCase() === 'z' && this.undoWindow.isOpen(performance.now())) {
+      event.preventDefault();
+      this.triggerUndo();
       return true;
     }
     const speeds: Record<string, number> = { '1': 1, '4': 4, '6': 16 };

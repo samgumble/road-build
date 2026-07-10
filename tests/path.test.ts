@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { makeSampler, validateChain, sampleAt, smoothRoadCenterline } from '../src/sim/roads/path';
+import { makeSampler, validateChain, explainChainRejection, sampleAt, smoothRoadCenterline } from '../src/sim/roads/path';
 import { Heightfield } from '../src/sim/terrain/heightfield';
 import { MAX_ROAD_GRADE, WATER_LEVEL } from '../src/core/constants';
 
@@ -9,6 +9,12 @@ function landPoint(): { x: number; z: number } {
   for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
     if (hf.isLand(x, z) && hf.isLand(x + 48, z)) return { x, z };
   throw new Error('no land');
+}
+// find a guaranteed-water point (open sea well away from the island)
+function waterPoint(): { x: number; z: number } {
+  for (let x = -220; x <= 220; x += 8) for (let z = -220; z <= 220; z += 8)
+    if (!hf.isLand(x, z)) return { x, z };
+  throw new Error('no water');
 }
 
 describe('road path sampling', () => {
@@ -71,6 +77,21 @@ describe('road path sampling', () => {
     expect(validateChain([{ x: p.x, z: p.z }], hf)).toBe(false);
     expect(validateChain([{ x: p.x, z: p.z }, { x: 9999, z: 0 }], hf)).toBe(false);
     expect(validateChain([{ x: p.x, z: p.z }, { x: p.x + 48, z: p.z }], hf)).toBe(true);
+  });
+  it('explains chain rejections with a player-facing reason, and returns null for valid chains', () => {
+    const p = landPoint();
+    const w = waterPoint();
+    // too short: fewer than two snapped points
+    expect(explainChainRejection([{ x: p.x, z: p.z }], hf)).toBe('DRAG FURTHER TO SURVEY A ROAD');
+    // out of bounds beats the endpoint check
+    expect(explainChainRejection([{ x: p.x, z: p.z }, { x: 9999, z: 0 }], hf)).toBe('TOO CLOSE TO THE ISLAND EDGE');
+    // an endpoint in open water
+    expect(explainChainRejection([{ x: p.x, z: p.z }, { x: w.x, z: w.z }], hf)).toBe('ROADS MUST START AND END ON LAND');
+    expect(explainChainRejection([{ x: w.x, z: w.z }, { x: p.x, z: p.z }], hf)).toBe('ROADS MUST START AND END ON LAND');
+    // valid chain: no reason
+    expect(explainChainRejection([{ x: p.x, z: p.z }, { x: p.x + 48, z: p.z }], hf)).toBeNull();
+    // validateChain stays consistent with the explainer
+    expect(validateChain([{ x: p.x, z: p.z }, { x: w.x, z: w.z }], hf)).toBe(false);
   });
   it('sampleAt interpolates position and heading along arclength', () => {
     const p = landPoint();
