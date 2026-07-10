@@ -106,9 +106,11 @@ const CRICKET_MIN_INTERVAL = 3;
 const CRICKET_MAX_INTERVAL = 8;
 const CRICKET_GAIN_DB = -24;
 
-// Construction
-const ENGINE_GAIN_DB = -20;
-const ENGINE_GATE_RELEASE = 1.2; // seconds of silence-from-last-progress before the rumble fully closes
+// Construction. The continuous engine-rumble bed (a lowpassed noise loop gated by crew activity)
+// was removed here — it read as a constant background drone whenever any crew was working, which
+// in practice is most of the time. CREW_ACTIVE_RELEASE survives it: the beeper/radio-chatter
+// layers still need the same "this crew is still working" liveness window it defined.
+const CREW_ACTIVE_RELEASE = 1.2; // seconds of silence-from-last-progress before a crew reads as idle
 const BLIP_GAIN_DB = -18;
 const BEEPER_FREQ = 880;
 const BEEPER_HZ = 1.2; // pulses per second
@@ -118,12 +120,12 @@ const BEEPER_DUTY = 0.5;
 const PAN_CLAMP = 0.7;
 const PAN_DIVISOR = 120;
 const CREW_SWITCH_MARGIN = 20; // units a competitor must beat the followed crew by before we switch
-const PAN_EASE_TAU = 0.15; // seconds, damped-lerp time constant for rumble/beeper pan (matches engineGain's gate ease style)
+const PAN_EASE_TAU = 0.15; // seconds, damped-lerp time constant for the beeper pan
 
 // Radio chatter (Groundwork Task 26): occasional filtered-noise blips per active crew, panned to
-// that crew's own position (not the shared followed-crew pan the engine rumble/beeper use — each
-// crew chatters independently since this is meant to read as "a radio somewhere on that crew's
-// site", not a single shared voice).
+// that crew's own position (not the shared followed-crew pan the beeper uses — each crew chatters
+// independently since this is meant to read as "a radio somewhere on that crew's site", not a
+// single shared voice).
 const RADIO_MIN_INTERVAL = 20; // seconds
 const RADIO_MAX_INTERVAL = 45;
 const RADIO_GAIN_DB = -30;
@@ -161,8 +163,9 @@ interface PadVoice {
 /**
  * Generative ambient audio: a slowly shifting pentatonic pad bed, a sparse generative kalimba/bell
  * pluck arpeggio layer (through a ping-pong feedback delay) riding over the same chord roots, an
- * optional day-only high shimmer, day/night birds and crickets, construction sfx (engine rumble,
- * stage-complete blips, demolish reverse-beeper), and (Task 39) a slow-rotating background of real
+ * optional day-only high shimmer, day/night birds and crickets, construction sfx (stage-complete
+ * blips, demolish reverse-beeper, radio chatter — deliberately NO continuous engine rumble; one
+ * existed and was removed as a background drone), and (Task 39) a slow-rotating background of real
  * CC0 ambient music tracks. Built lazily via `start()` on first user gesture (autoplay policy);
  * until then no `AudioContext` or nodes exist. The real tracks themselves are lazy-loaded even
  * later — a few seconds after `start()` — so they never compete with anything at boot; the
@@ -173,8 +176,8 @@ interface PadVoice {
  * `update()`, which is called once per render frame — there is no `setInterval` anywhere in this
  * class except the music track rotation's load-delay/gap timers, which use `window.setTimeout`
  * because they span user-gesture/network-load boundaries rather than per-frame audio scheduling
- * (see `MusicPlayer`). Continuous sound sources (pad voices, pluck delay bus, shimmer osc, engine
- * rumble, cricket burst noise) are created once in `start()`/on first gate-open and reused; only
+ * (see `MusicPlayer`). Continuous sound sources (pad voices, pluck delay bus, shimmer osc,
+ * cricket burst noise) are created once in `start()`/on first gate-open and reused; only
  * true one-shots (bird chirps, blips, beeper pulses, pluck/bell notes) allocate and discard nodes.
  */
 export class AmbientAudio {
@@ -222,10 +225,8 @@ export class AmbientAudio {
   private cricketBurstRemaining = 0;
   private cricketPulsePhase = 0;
 
-  // Construction (Task 25: one rumble voice total, shared across every crew — see
-  // `nearestActiveCrewX` — rather than one per crew, keeping this simple per the binding spec).
-  private engineGain: GainNode | null = null;
-  private enginePanner: StereoPannerNode | null = null;
+  // Construction (Task 25: one followed-crew voice total, shared across every crew — see
+  // `nearestActiveCrew` — rather than one per crew, keeping this simple per the binding spec).
   /** Last-seen progress per crew (0-based index, matching `construction:progress`'s `crew`
    * field): `at` is this crew's own recency clock (so one crew going idle doesn't reset another's),
    * `x`/`demolish` are that crew's most recent reported position/demolish flag. `crew: -1` (the
@@ -233,14 +234,13 @@ export class AmbientAudio {
    * `construction:progress` feeds this map and that event is never emitted with crew -1. */
   private crewProgress: Map<number, { at: number; x: number; demolish: boolean }> = new Map();
   private clockTime = 0; // ctx.currentTime substitute tracked via update(dt), used for gating
-  /** Crew index the shared rumble voice is currently "locked onto" (see `nearestActiveCrew`'s
+  /** Crew index the shared beeper voice is currently "locked onto" (see `nearestActiveCrew`'s
    * hysteresis) — null when no crew has ever been picked or the followed crew went idle with no
    * replacement chosen yet. Persisting this across frames stops a camera parked equidistant
    * between two crews from flip-flopping crew identity (and the stereo image) every frame. */
   private followedCrew: number | null = null;
-  /** Eased pan value shared by the rumble and beeper panners (both always mirror the same crew),
-   * damped per-frame the same way `engineGain` eases its gate in `updateConstruction` rather than
-   * snapping via a bare `setValueAtTime`. */
+  /** Eased pan value for the beeper panner, damped per-frame rather than snapping via a bare
+   * `setValueAtTime`. */
   private panCurrent = 0;
 
   private beeperGain: GainNode | null = null;
@@ -510,29 +510,9 @@ export class AmbientAudio {
   }
 
   private buildConstructionBed(ctx: AudioContext, sfxBus: AudioNode): void {
-    // Engine rumble: continuous filtered-noise loop, gated by gain (never stopped/restarted —
-    // avoids per-job node churn since jobs come and go frequently).
-    const source = ctx.createBufferSource();
-    source.buffer = this.noiseBuffer;
-    source.loop = true;
-
-    const filter = ctx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.frequency.value = 220;
-    filter.Q.value = 0.5;
-
-    const panner = ctx.createStereoPanner();
-    const gain = ctx.createGain();
-    gain.gain.value = 0;
-
-    source.connect(filter);
-    filter.connect(panner);
-    panner.connect(gain);
-    gain.connect(sfxBus);
-    source.start();
-
-    this.enginePanner = panner;
-    this.engineGain = gain;
+    // (The continuous engine-rumble noise loop that used to live here was removed — it read as a
+    // constant background drone. Construction now only speaks through one-shots and the gated
+    // beeper below.)
 
     // Reverse beeper bed: a single oscillator gated on/off in update() to form the square pulse
     // train, rather than scheduling one-shots per pulse.
@@ -1025,11 +1005,11 @@ export class AmbientAudio {
 
   /**
    * Task 25: with up to MAX_CREWS crews potentially active at once, picks whichever crew is
-   * currently BOTH active (reported progress within ENGINE_GATE_RELEASE) AND nearest to the
-   * camera on the x axis, and returns its position/demolish flag — the single shared rumble voice
-   * follows that one crew, panning toward whichever is loudest/closest rather than trying to
-   * layer multiple engine sounds (kept simple per the binding spec: "one rumble voice, pan to the
-   * loudest/nearest active crew"). Returns null if no crew is currently active.
+   * currently BOTH active (reported progress within CREW_ACTIVE_RELEASE) AND nearest to the
+   * camera on the x axis, and returns its position/demolish flag — the single shared beeper voice
+   * follows that one crew, panning toward whichever is closest rather than trying to layer
+   * multiple sounds (kept simple per the binding spec's one-voice ruling). Returns null if no
+   * crew is currently active.
    *
    * T25 review fix: recomputing the nearest crew from scratch every frame with no hysteresis meant
    * a camera parked equidistant between two crews would flip the followed crew (and its pan)
@@ -1045,7 +1025,7 @@ export class AmbientAudio {
     let followedEntry: { x: number; demolish: boolean } | null = null;
 
     for (const [crew, { at, x, demolish }] of this.crewProgress.entries()) {
-      if (this.clockTime - at >= ENGINE_GATE_RELEASE) continue; // this crew's gone idle
+      if (this.clockTime - at >= CREW_ACTIVE_RELEASE) continue; // this crew's gone idle
       const dist = Math.abs(x - cameraX);
       if (dist < bestDist) {
         bestDist = dist;
@@ -1070,27 +1050,18 @@ export class AmbientAudio {
 
   private updateConstruction(dt: number, cameraX: number): void {
     const ctx = this.ctx;
-    if (!ctx || !this.engineGain || !this.enginePanner || !this.beeperGain || !this.beeperPanner) return;
+    if (!ctx || !this.beeperGain || !this.beeperPanner) return;
 
     const now = ctx.currentTime;
     const nearest = this.nearestActiveCrew(cameraX);
     const active = nearest !== null;
 
-    const targetGain = active ? dbToGain(ENGINE_GAIN_DB) : 0;
-    const cur = this.engineGain.gain.value;
-    const rate = dt / 0.4; // ~0.4s gate ease
-    const nextGain = cur + (targetGain - cur) * Math.min(1, rate * 4);
-    this.engineGain.gain.cancelScheduledValues(now);
-    this.engineGain.gain.setValueAtTime(nextGain, now);
-
     if (active) {
-      // Damped per-frame ease toward the target pan (same style as engineGain's gate ease above)
-      // rather than a bare setValueAtTime snap — otherwise a followed-crew switch (or even normal
-      // camera motion) causes an audible stereo-image jump.
+      // Damped per-frame ease toward the target pan rather than a bare setValueAtTime snap —
+      // otherwise a followed-crew switch (or even normal camera motion) causes an audible
+      // stereo-image jump.
       const targetPan = clamp((nearest.x - cameraX) / PAN_DIVISOR, -PAN_CLAMP, PAN_CLAMP);
       this.panCurrent += (targetPan - this.panCurrent) * Math.min(1, dt / PAN_EASE_TAU);
-      this.enginePanner.pan.cancelScheduledValues(now);
-      this.enginePanner.pan.setValueAtTime(this.panCurrent, now);
       this.beeperPanner.pan.cancelScheduledValues(now);
       this.beeperPanner.pan.setValueAtTime(this.panCurrent, now);
     }
@@ -1130,7 +1101,7 @@ export class AmbientAudio {
     if (!this.ctx || !this.sfxBus) return;
 
     for (const [crew, { at, x }] of this.crewProgress.entries()) {
-      const active = this.clockTime - at <= ENGINE_GATE_RELEASE;
+      const active = this.clockTime - at <= CREW_ACTIVE_RELEASE;
       if (!active) continue;
 
       const timer = (this.radioTimer.get(crew) ?? 0) + dt;
