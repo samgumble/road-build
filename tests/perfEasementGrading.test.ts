@@ -163,6 +163,13 @@ describe('Perf: combined easement x grading load (Task 47 item 2)', () => {
   });
 
   it('WITH batching (beginDeformBatch/endDeformBatch): the same worst case drops several-fold, to legitimate once-per-batch replay work', () => {
+    // Unbatched baseline measured fresh HERE (not reused from the sibling test) so both numbers
+    // come from the same process on the same machine — the old absolute cap (`worst < 60ms`,
+    // calibrated on a dev machine) flaked on slower CI runners (64ms and 87ms observed), which
+    // broke the deploy workflow twice while the batching itself was working fine.
+    const baselineScenario = buildWorstCaseScenario('perf-easement-grading-batched-baseline');
+    const unbatchedWorst = Math.max(...measureBatches(baselineScenario, false));
+
     const scenario = buildWorstCaseScenario('perf-easement-grading-batched');
     const batchMs = measureBatches(scenario, true);
 
@@ -175,17 +182,19 @@ describe('Perf: combined easement x grading load (Task 47 item 2)', () => {
     console.log(
       `[perf][batched] ${scenario.ROW_COUNT} registered easements (dense grid), 3 crews grading ` +
       `edges crossing the grid, batch=128 sim-steps (16x HUD equivalent) over ${batchMs.length} ` +
-      `batches: worst=${worst.toFixed(3)}ms avg=${avg.toFixed(3)}ms`,
+      `batches: worst=${worst.toFixed(3)}ms avg=${avg.toFixed(3)}ms ` +
+      `(unbatched baseline worst=${unbatchedWorst.toFixed(3)}ms, ratio=${(unbatchedWorst / worst).toFixed(1)}x)`,
     );
 
     // The dedupe collapses N-calls-per-sample-per-batch down to 1-call-per-sample-per-batch, but
     // with this many DISTINCT easement samples touched by 3 concurrent crews crossing a dense
     // 24-edge grid, the once-per-batch replay itself is still real, legitimate work (measured
     // floor with easements fully unregistered: ~4-7ms/batch for grading alone — see
-    // task-47-report.md). This asserts the fix brings the SAME worst case down several-fold from
-    // the unbatched ~156ms (a real regression guard against the dedupe regressing back to
-    // per-call replay), not an unrealistic near-zero target.
-    expect(worst).toBeLessThan(60);
+    // task-47-report.md). The regression this guards against — the dedupe silently reverting to
+    // per-call replay — would put the batched worst case right back AT the unbatched baseline
+    // (ratio ~1x); the working fix measures ~4-5x better. Asserting a conservative 2x ratio keeps
+    // that guard while being immune to absolute machine speed.
+    expect(worst).toBeLessThan(unbatchedWorst / 2);
   });
 
   it('produces the same final terrain heights whether or not the batch bracket is used (replay is order-independent/commutative)', () => {
