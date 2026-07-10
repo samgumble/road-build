@@ -235,6 +235,7 @@ export class GrowthSim {
   private simTime = 0;
   private lastRecomputeAt = -Infinity;
   private recomputePending = false;
+  private developmentPaused = false;
 
   private houses = 0;
   private records: SpawnRecord[] = [];
@@ -282,6 +283,17 @@ export class GrowthSim {
 
   get houseCount(): number {
     return this.houses;
+  }
+
+  /** Pauses only positive world development (dev accumulation, threshold spawns, and upgrades).
+   * Road-distance maintenance and destructive lifecycles keep advancing so construction can still
+   * clear its corridor and already-stranded scenery can finish fading while growth is paused. */
+  get isDevelopmentPaused(): boolean {
+    return this.developmentPaused;
+  }
+
+  setDevelopmentPaused(paused: boolean): void {
+    this.developmentPaused = paused;
   }
 
   get spawned(): ReadonlyArray<SpawnRecord> {
@@ -631,6 +643,15 @@ export class GrowthSim {
       this.recomputePending = false;
     }
 
+    if (!this.developmentPaused) this.updateDevelopment(dt);
+
+    // Cleanup remains live while positive development is paused: otherwise building a road with
+    // growth paused would leave corridor trees frozen mid-fade and stranded settlements immortal.
+    this.updateStrandedDecay();
+    this.updateClearing();
+  }
+
+  private updateDevelopment(dt: number): void {
     for (let j = 0; j < GRID_SIZE; j++) {
       for (let i = 0; i < GRID_SIZE; i++) {
         const idx = cellIndex(i, j);
@@ -673,9 +694,6 @@ export class GrowthSim {
         }
       }
     }
-
-    this.updateStrandedDecay();
-    this.updateClearing();
   }
 
   /**

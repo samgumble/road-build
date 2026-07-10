@@ -311,8 +311,11 @@ function main(): void {
       homes: growth.houseCount,
       buildings: growth.spawned.filter((record) => record.kind === 'building').length,
       paused: loop.isPaused,
+      growthPaused: growth.isDevelopmentPaused,
     }),
     getEdgeLength: (edgeId) => graph.edges.get(edgeId)?.length ?? 0,
+    getGrowthPaused: () => growth.isDevelopmentPaused,
+    setGrowthPaused: (paused) => growth.setDevelopmentPaused(paused),
     onNewWorld: navigateToSeed,
   });
   hud.suppressHintIfRoadsExist(restoredRoads);

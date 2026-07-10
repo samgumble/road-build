@@ -3,6 +3,7 @@ import {
   constructionJobProgress,
   formatConstructionNotice,
   formatCrewTicker,
+  formatGrowthControl,
   formatSiteOverview,
 } from '../src/ui/hud';
 
@@ -16,6 +17,7 @@ describe('formatSiteOverview', () => {
       homes: 8,
       buildings: 2,
       paused: false,
+      growthPaused: false,
     })).toEqual([
       'NETWORK  7 ROADS',
       'WORK      3 CREWS · 4 JOBS',
@@ -34,7 +36,36 @@ describe('formatSiteOverview', () => {
       homes: 0,
       buildings: 0,
       paused: true,
+      growthPaused: true,
     }).at(-1)).toBe('SIM       PAUSED');
+  });
+
+  it('shows environment growth state independently from the global simulation state', () => {
+    expect(formatSiteOverview({
+      roads: 2,
+      scheduledJobs: 0,
+      activeCrews: 0,
+      cars: 4,
+      homes: 3,
+      buildings: 1,
+      paused: false,
+      growthPaused: true,
+    }).at(-1)).toBe('SIM       RUNNING · GROWTH PAUSED');
+  });
+});
+
+describe('environment growth control', () => {
+  it('uses explicit labels and feedback for both toggle states', () => {
+    expect(formatGrowthControl(false)).toEqual({
+      full: 'Growth',
+      compact: 'GROW',
+      notice: 'ENVIRONMENT GROWTH RESUMED',
+    });
+    expect(formatGrowthControl(true)).toEqual({
+      full: 'Growth Paused',
+      compact: 'GROW OFF',
+      notice: 'ENVIRONMENT GROWTH PAUSED',
+    });
   });
 });
 

@@ -1095,3 +1095,36 @@ describe('GrowthSim', () => {
     });
   });
 });
+
+describe('GrowthSim development pause', () => {
+  it('freezes development accumulation without catching up when resumed', () => {
+    const { sim } = world();
+    sim.setDevelopmentPaused(true);
+
+    // The first update still applies the pending road-distance recompute, but paused development
+    // must remain exactly untouched regardless of elapsed sim time.
+    sim.update(3);
+    const frozen = sim.devLevels;
+    sim.update(30);
+    expect(sim.devLevels).toEqual(frozen);
+    expect(Math.max(...sim.devLevels)).toBe(0);
+
+    sim.setDevelopmentPaused(false);
+    sim.update(1);
+    expect(Math.max(...sim.devLevels)).toBeGreaterThan(0);
+  });
+
+  it('continues cleanup lifecycles while new development is paused', () => {
+    const bus = new EventBus();
+    const hf = new Heightfield('growth-pause-cleanup', bus);
+    const graph = new RoadGraph(bus, makeSampler(hf));
+    const sim = new GrowthSim(graph, hf, bus, createRng('growth-pause-cleanup'));
+    const tree: SpawnRecord = { kind: 'tree', x: 0, z: 0, rot: 0, id: 1 };
+    sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [tree], [{ id: 1, fading: 29.5 }]);
+    sim.setDevelopmentPaused(true);
+
+    sim.update(1);
+
+    expect(sim.spawned).toEqual([]);
+  });
+});

@@ -58,6 +58,10 @@ assuming a green build means the page is live.
   (`H`/`?`) showing network, jobs, town, traffic, and simulation state. The guide uses a proper
   modal backdrop/focus handoff; crew lines show multi-stage job completion and concise terminal
   milestones without turning the zen toy into a notification feed.
+- Environment-growth control: the HUD toggle persists under `groundwork-growth-paused` and calls
+  `GrowthSim.setDevelopmentPaused`. It freezes only positive development accumulation, threshold
+  spawns, and upgrades. Road-distance recompute, corridor clearing, stranded decay, construction,
+  traffic, and weather keep advancing; do not replace it with a main-loop skip of `growth.update`.
 - Rain darkens and lowers the roughness of existing road materials by surface type. Dry weather
   is an exact authored-material reset, and fresh asphalt/paint curing composes with wetness rather
   than being overwritten by it.
@@ -82,6 +86,8 @@ assuming a green build means the page is live.
 - **Launch flow:** Start-screen art is decorative; title/actions must stay real HTML. Keep the HUD
   inert and the sim paused until dismissal, let secondary buttons receive their own Enter/Space,
   and preserve a reduced-motion path.
+- **Growth pause:** Cleanup lifecycles must remain live while positive development is paused, and
+  resume must continue from the frozen accumulator with no elapsed-time catch-up.
 
 ## Current improvement backlog
 

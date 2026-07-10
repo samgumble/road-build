@@ -71,6 +71,18 @@ export function formatConstructionNotice(stage: Stage | 'removed', crew: number)
   return null;
 }
 
+export interface GrowthControlCopy {
+  full: string;
+  compact: string;
+  notice: string;
+}
+
+export function formatGrowthControl(paused: boolean): GrowthControlCopy {
+  return paused
+    ? { full: 'Growth Paused', compact: 'GROW OFF', notice: 'ENVIRONMENT GROWTH PAUSED' }
+    : { full: 'Growth', compact: 'GROW', notice: 'ENVIRONMENT GROWTH RESUMED' };
+}
+
 /** Task 25: up to this many crew ticker lines are shown, one per active crew (indices 0..N-1,
  * matching `BuildQueue.MAX_CREWS`'s 0-based `crew` field on construction events). Kept as a local
  * constant rather than importing MAX_CREWS from the sim so the UI layer doesn't need a sim-layer
@@ -291,6 +303,7 @@ export interface SiteOverview {
   homes: number;
   buildings: number;
   paused: boolean;
+  growthPaused: boolean;
 }
 
 /** Compact, stable wording for the site guide's event-driven snapshot. Kept pure so the UI's
@@ -301,7 +314,7 @@ export function formatSiteOverview(site: SiteOverview): string[] {
     `WORK      ${site.activeCrews} CREW${site.activeCrews === 1 ? '' : 'S'} · ${site.scheduledJobs} JOB${site.scheduledJobs === 1 ? '' : 'S'}`,
     `TOWN      ${site.homes} HOME${site.homes === 1 ? '' : 'S'} · ${site.buildings} BUILDING${site.buildings === 1 ? '' : 'S'}`,
     `TRAFFIC   ${site.cars} CAR${site.cars === 1 ? '' : 'S'}`,
-    `SIM       ${site.paused ? 'PAUSED' : 'RUNNING'}`,
+    `SIM       ${site.paused ? 'PAUSED' : site.growthPaused ? 'RUNNING · GROWTH PAUSED' : 'RUNNING'}`,
   ];
 }
 
@@ -315,6 +328,8 @@ interface HudDeps {
   audio: AmbientAudio;
   getSiteOverview: () => SiteOverview;
   getEdgeLength: (edgeId: number) => number;
+  getGrowthPaused: () => boolean;
+  setGrowthPaused: (paused: boolean) => void;
   onNewWorld: (seed: string) => void;
 }
 
@@ -333,6 +348,7 @@ const SAVE_KEY = 'groundwork-save';
  * unreadable (private browsing, storage disabled, corrupt value), matching this game's
  * "music-on-by-default" design. */
 const MUSIC_KEY = 'groundwork-music';
+const GROWTH_PAUSED_KEY = 'groundwork-growth-paused';
 
 function readPersistedMusicOn(): boolean {
   try {
@@ -348,6 +364,22 @@ function persistMusicOn(on: boolean): void {
     window.localStorage.setItem(MUSIC_KEY, on ? '1' : '0');
   } catch {
     // localStorage unavailable — the toggle still works for this session, just doesn't persist.
+  }
+}
+
+function readPersistedGrowthPaused(): boolean {
+  try {
+    return window.localStorage.getItem(GROWTH_PAUSED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function persistGrowthPaused(paused: boolean): void {
+  try {
+    window.localStorage.setItem(GROWTH_PAUSED_KEY, paused ? '1' : '0');
+  } catch {
+    // Storage unavailable — the control still owns the current session correctly.
   }
 }
 
@@ -372,6 +404,7 @@ export class Hud {
   private demolishBtn!: HTMLButtonElement;
   private speedBtns: HTMLButtonElement[] = [];
   private pauseBtn!: HTMLButtonElement;
+  private growthBtn!: HTMLButtonElement;
   private guideBtn!: HTMLButtonElement;
   private guideBackdrop!: HTMLElement;
   private guidePanel!: HTMLElement;
@@ -404,6 +437,7 @@ export class Hud {
     // buildMusicButton's initial `refreshMusicButton()` reflects it immediately rather than
     // flashing the default-on state for a frame.
     this.deps.audio.musicOn = readPersistedMusicOn();
+    this.deps.setGrowthPaused(readPersistedGrowthPaused());
 
     injectResponsiveStyles();
     this.buildTopLeft();
@@ -485,6 +519,7 @@ export class Hud {
     bar.appendChild(this.buildDivider());
     bar.appendChild(this.buildSpeedGroup());
     bar.appendChild(this.buildPauseButton());
+    bar.appendChild(this.buildGrowthButton());
     bar.appendChild(this.buildDivider());
     bar.appendChild(this.buildNewWorldGroup());
     bar.appendChild(this.buildGuideButton());
@@ -580,6 +615,34 @@ export class Hud {
     setResponsiveLabel(this.pauseBtn, paused ? 'Resume' : 'Pause', paused ? 'PLAY' : 'PAUSE');
     this.pauseBtn.style.borderBottomColor = paused ? ACCENT : 'transparent';
     this.pauseBtn.style.color = paused ? ACCENT : TEXT;
+  }
+
+  private buildGrowthButton(): HTMLButtonElement {
+    const btn = el('button', { type: 'button' }, {
+      ...baseButtonStyle(),
+      borderBottom: '2px solid transparent',
+    });
+    btn.addEventListener('click', () => {
+      const paused = !this.deps.getGrowthPaused();
+      this.deps.setGrowthPaused(paused);
+      persistGrowthPaused(paused);
+      this.refreshGrowthButton();
+      this.refreshGuide();
+      this.showNotice(formatGrowthControl(paused).notice);
+    });
+    this.growthBtn = btn;
+    this.refreshGrowthButton();
+    return btn;
+  }
+
+  private refreshGrowthButton(): void {
+    const paused = this.deps.getGrowthPaused();
+    const copy = formatGrowthControl(paused);
+    setResponsiveLabel(this.growthBtn, copy.full, copy.compact);
+    this.growthBtn.style.borderBottomColor = paused ? ACCENT : 'transparent';
+    this.growthBtn.style.color = paused ? ACCENT : TEXT;
+    this.growthBtn.setAttribute('aria-pressed', String(paused));
+    this.growthBtn.title = paused ? 'Resume settlement and vegetation growth' : 'Pause settlement and vegetation growth';
   }
 
   private buildGuideButton(): HTMLButtonElement {
@@ -935,6 +998,7 @@ export class Hud {
     this.refreshModeButtons();
     this.refreshSpeedButtons();
     this.refreshPauseButton();
+    this.refreshGrowthButton();
     this.refreshGuide();
   }
 
