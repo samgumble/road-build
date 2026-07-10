@@ -77,11 +77,14 @@ export function formatConstructionNotice(stage: Stage | 'removed', crew: number)
  * dependency purely for a display cap — if MAX_CREWS ever changes, bump this alongside it. */
 const MAX_CREW_LINES = 3;
 
-const PANEL_BG = '#1d1f21';
-const BORDER = '#3a3d40';
-const ACCENT = '#e8641b';
-const TEXT = '#d8d5cd';
-const TEXT_DIM = '#8a8d90';
+// Shared visual language with startScreen.ts's generated dawn key art: deep slate field-office
+// glass, warm safety orange, and paper-white typography. Kept local so the HUD remains a small,
+// dependency-free DOM surface rather than introducing a styling framework for six color tokens.
+const PANEL_BG = 'rgba(17, 23, 25, 0.92)';
+const BORDER = 'rgba(216, 213, 205, 0.22)';
+const ACCENT = '#f06b24';
+const TEXT = '#ece9df';
+const TEXT_DIM = '#a9aaa5';
 
 /**
  * Task 29 (mobile): responsive HUD rules for viewports <=480px — compacted button labels (each
@@ -95,6 +98,74 @@ const TEXT_DIM = '#8a8d90';
  * external stylesheet.
  */
 const RESPONSIVE_CSS = `
+  #gw-top-left,
+  #gw-toolbar,
+  #gw-guide-panel,
+  #gw-new-world-panel {
+    background: linear-gradient(145deg, rgba(18,24,26,.96), rgba(18,24,26,.84)) !important;
+    border-color: rgba(216,213,205,.25) !important;
+    box-shadow: 0 16px 50px rgba(0,0,0,.28), inset 0 1px rgba(255,255,255,.035) !important;
+    backdrop-filter: blur(12px) saturate(1.08);
+  }
+  #gw-top-left,
+  #gw-toolbar {
+    border-top: 2px solid ${ACCENT} !important;
+  }
+  #gw-top-left .gw-office-label {
+    margin-bottom: 7px;
+    color: ${ACCENT};
+    font-size: 8px;
+    letter-spacing: .18em;
+  }
+  #gw-top-left .gw-seed {
+    font-size: 12px;
+    letter-spacing: .12em;
+  }
+  #gw-toolbar {
+    box-shadow: 0 20px 60px rgba(0,0,0,.34), inset 0 1px rgba(255,255,255,.04) !important;
+  }
+  #gw-toolbar::before {
+    content: 'SITE COMMAND';
+    position: absolute;
+    left: 12px;
+    top: -17px;
+    color: rgba(236,233,223,.62);
+    font: 700 8px/1 ui-monospace, 'SF Mono', Menlo, monospace;
+    letter-spacing: .16em;
+  }
+  #gw-toolbar button,
+  #gw-guide-panel button,
+  #gw-new-world-panel button {
+    background: rgba(255,255,255,.035) !important;
+    border-color: rgba(216,213,205,.20);
+    transition: transform .16s ease, color .16s ease, border-color .16s ease, background .16s ease;
+  }
+  #gw-toolbar button:hover,
+  #gw-guide-panel button:hover,
+  #gw-new-world-panel button:hover {
+    transform: translateY(-1px);
+    border-color: rgba(216,213,205,.5) !important;
+    background: rgba(255,255,255,.07) !important;
+  }
+  #gw-toolbar button:focus-visible,
+  #gw-guide-panel button:focus-visible,
+  #gw-new-world-panel button:focus-visible,
+  #gw-new-world-panel input:focus-visible {
+    outline: 2px solid #ffd29d;
+    outline-offset: 2px;
+  }
+  #gw-hint {
+    padding: 9px 13px;
+    background: rgba(17,23,25,.64);
+    border: 1px solid rgba(216,213,205,.2);
+    border-left: 3px solid ${ACCENT};
+    box-shadow: 0 12px 35px rgba(0,0,0,.2);
+    backdrop-filter: blur(7px);
+  }
+  #gw-notices > div {
+    box-shadow: 0 14px 38px rgba(0,0,0,.27);
+    backdrop-filter: blur(9px);
+  }
   #gw-toolbar {
     padding-bottom: calc(8px + env(safe-area-inset-bottom));
   }
@@ -108,6 +179,7 @@ const RESPONSIVE_CSS = `
       justify-content: center;
       padding-bottom: calc(8px + env(safe-area-inset-bottom));
     }
+    #gw-toolbar::before { display: none; }
     #gw-toolbar button {
       min-width: 44px;
       min-height: 44px;
@@ -281,7 +353,8 @@ function persistMusicOn(on: boolean): void {
 
 /**
  * Bottom-center toolbar + top-left seed/status readout, styled as an engineer's site plan: charcoal
- * panels, 1px borders, uppercase mono labels, safety-orange active accents, no shadows/gradients.
+ * panels, fine borders, uppercase mono labels, safety-orange active accents, and restrained
+ * depth borrowed from the generated title art's slate/amber dawn palette.
  * All DOM lives inside the existing `#hud` container (`pointer-events: none`); interactive children
  * re-enable pointer events individually.
  */
@@ -346,6 +419,10 @@ export class Hud {
       padding: '10px 14px', pointerEvents: 'none',
     });
 
+    panel.appendChild(el('div', {
+      textContent: 'GROUNDWORK / FIELD OFFICE', className: 'gw-office-label',
+    }, labelStyle()));
+
     const seedLine = el('div', { textContent: this.deps.seed, className: 'gw-seed' }, {
       ...labelStyle(), color: TEXT, marginBottom: '4px',
     });
@@ -381,7 +458,7 @@ export class Hud {
 
     this.root.appendChild(panel);
 
-    this.hintEl = el('div', { textContent: 'DRAG TO SURVEY A ROAD' }, {
+    this.hintEl = el('div', { id: 'gw-hint', textContent: 'DRAG TO SURVEY A ROAD' }, {
       position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
       ...labelStyle(), color: TEXT, fontSize: '13px', pointerEvents: 'none',
       transition: 'opacity 0.8s ease',
@@ -589,7 +666,7 @@ export class Hud {
 
     this.newWorldBtn = el('button', { type: 'button' }, baseButtonStyle());
     setResponsiveLabel(this.newWorldBtn, 'New World', 'NEW');
-    this.newWorldPanel = el('div', {}, {
+    this.newWorldPanel = el('div', { id: 'gw-new-world-panel' }, {
       display: 'none',
       position: 'absolute', bottom: 'calc(100% + 8px)', left: '50%', transform: 'translateX(-50%)',
       background: PANEL_BG, border: `1px solid ${BORDER}`, borderRadius: '3px',

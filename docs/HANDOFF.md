@@ -42,7 +42,7 @@ assuming a green build means the page is live.
 | World growth | `src/sim/growth/`, `src/sim/quarry.ts` | Deterministic road-adjacent settlement, scenery lifecycle, wilderness and quarry placement. Save/restore lives in `src/sim/save.ts`. |
 | Traffic | `src/sim/traffic/traffic.ts` | Lanes, routing, junction locks, box clearing, and deterministic recovery from saturated rings. Keep changes seeded and fixed-step. |
 | Rendering | `src/render/` | Three.js scene, instancing, terrain/water/sky, weather-responsive road bands, construction dressing, scenery and cars. Rendering should consume events/state; it must not become authoritative. |
-| Input/UI/audio | `src/input/`, `src/ui/hud.ts`, `src/audio/ambient.ts` | Draw/camera gestures; responsive event-driven HUD with per-crew aggregate progress and milestone notices; lazy gesture-started audio and optional ambient music. |
+| Input/UI/audio | `src/input/`, `src/ui/startScreen.ts`, `src/ui/hud.ts`, `src/audio/ambient.ts` | Generated-art title flow; draw/camera gestures; responsive event-driven HUD with per-crew aggregate progress and milestone notices; lazy gesture-started audio and optional ambient music. |
 
 ## Shipped player-facing systems
 
@@ -61,6 +61,10 @@ assuming a green build means the page is live.
 - Rain darkens and lowers the roughness of existing road materials by surface type. Dry weather
   is an exact authored-material reset, and fresh asphalt/paint curing composes with wetness rather
   than being overwritten by it.
+- Generated title presentation: `public/art/groundwork-title-dawn.jpg` plus a phone-specific crop,
+  with source intent/provenance in `public/art/README.md`. `StartScreen` keeps the sim paused and
+  the HUD inert until Continue/Enter/Space, then unlocks audio and crossfades into the ready world.
+  New/returning sites get distinct labels without changing save semantics.
 
 ## Invariants worth protecting
 
@@ -75,6 +79,9 @@ assuming a green build means the page is live.
 - **Render lifetime:** Instanced scenery slot compaction must purge all animations referencing a
   freed instance. Construction dressing is pooled and must dispose cleanly.
 - **Mobile UI:** Retain ≥44px touch targets, safe-area padding, and no browser-page pinch zoom.
+- **Launch flow:** Start-screen art is decorative; title/actions must stay real HTML. Keep the HUD
+  inert and the sim paused until dismissal, let secondary buttons receive their own Enter/Space,
+  and preserve a reduced-motion path.
 
 ## Current improvement backlog
 

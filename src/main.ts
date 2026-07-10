@@ -19,6 +19,7 @@ import { QuarrySim } from './sim/quarry';
 import { SceneryRenderer } from './render/sceneryRenderer';
 import { Atmosphere } from './render/atmosphere';
 import { Hud, randomSeed } from './ui/hud';
+import { StartScreen } from './ui/startScreen';
 import { serialize, deserialize, restoreWorld } from './sim/save';
 import { AmbientAudio } from './audio/ambient';
 import { QUALITY } from './render/quality';
@@ -285,6 +286,15 @@ function main(): void {
   // that arrived after a restore had already pre-cleared >= 1 site.
   sceneryRenderer.setWilderness(wildernessSim.activeWithIndex);
 
+  const navigateToSeed = (newSeed: string) => {
+    // Each seed owns its own save slot (starting empty for a seed that's never been visited),
+    // so there's nothing to clear here — just navigate. `main()`'s boot sequence on the new
+    // page load resolves the seed from the URL and records it as last-played.
+    const url = new URL(window.location.href);
+    url.searchParams.set('seed', newSeed);
+    window.location.search = url.searchParams.toString();
+  };
+
   const hud = new Hud({
     bus,
     drawTool,
@@ -303,17 +313,31 @@ function main(): void {
       paused: loop.isPaused,
     }),
     getEdgeLength: (edgeId) => graph.edges.get(edgeId)?.length ?? 0,
-    onNewWorld: (newSeed) => {
-      // Each seed owns its own save slot (starting empty for a seed that's never been visited),
-      // so there's nothing to clear here — just navigate. `main()`'s boot sequence on the new
-      // page load resolves the seed from the URL and records it as last-played.
-      const url = new URL(window.location.href);
-      url.searchParams.set('seed', newSeed);
-      window.location.search = url.searchParams.toString();
-    },
+    onNewWorld: navigateToSeed,
   });
   hud.suppressHintIfRoadsExist(restoredRoads);
-  document.addEventListener('keydown', (event) => hud.handleKeyboardShortcut(event));
+
+  // The title screen owns keyboard/focus while it is visible and keeps the fixed-step sim frozen;
+  // the render loop still paints behind it, so dismissal crossfades directly into a fully-ready
+  // world with no loading flash. Its primary user gesture also unlocks Web Audio (canvas-only
+  // gesture listeners above cannot see a click on this DOM overlay).
+  let startScreenOpen = true;
+  loop.setPaused(true);
+  new StartScreen({
+    seed,
+    hasRoads: restoredRoads,
+    inertRoot: document.getElementById('hud')!,
+    onContinue: () => {
+      startScreenOpen = false;
+      audio.start();
+      loop.setPaused(false);
+      hud.syncControls();
+    },
+    onNewWorld: () => navigateToSeed(randomSeed()),
+  });
+  document.addEventListener('keydown', (event) => {
+    if (!startScreenOpen) hud.handleKeyboardShortcut(event);
+  });
 
   const save = () => {
     try {

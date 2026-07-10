@@ -9,6 +9,10 @@ small houses grow up along the corridors you've carved, so the island slowly tur
 from bare terrain into something that looks lived-in. Day turns to night, it rains
 occasionally, and you can just let it run.
 
+The game opens on an original illustrated title screen, with separate desktop and mobile crops;
+entering the site crossfades directly into the initialized world. The field-office HUD carries the
+same slate, paper, and safety-orange visual language through construction status and controls.
+
 ## Controls
 
 | Input | Action |
@@ -71,6 +75,10 @@ time-scale settings. For the full design rationale and the original task breakdo
 see `docs/superpowers/specs/2026-07-02-groundwork-zen-road-builder-design.md` and
 `docs/superpowers/plans/2026-07-02-groundwork-implementation.md`. For a concise handoff for
 future contributors or coding agents, start with [`docs/HANDOFF.md`](docs/HANDOFF.md).
+
+Title artwork lives in `public/art/`; its generation provenance and asset intent are documented in
+`public/art/README.md`. The title and all controls remain HTML rather than being baked into the
+image, preserving accessibility, responsive layout, and editable copy.
 
 ## Credits
 
