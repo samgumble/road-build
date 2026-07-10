@@ -3,7 +3,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Heightfield } from '../sim/terrain/heightfield';
 import { EventBus } from '../core/events';
-import type { GrowthKind, SpawnRecord, DecayEntry } from '../sim/growth/growth';
+import { FIELD_SIZE, type GrowthKind, type SpawnRecord, type DecayEntry } from '../sim/growth/growth';
 import type { WildernessTree } from '../sim/growth/wilderness';
 
 /** Minimal shape `place()` actually needs — a `SpawnRecord` satisfies this, but so does a
@@ -63,7 +63,6 @@ const TARGET_TREE_HEIGHT = 5.5; // u, normalized tree height (varies per real-wo
 const TARGET_HOUSE_HEIGHT = 3.4; // u, matches brief's ~4x3x4 house footprint
 const TARGET_BUILDING_HEIGHT = 10; // u, matches brief's 5x10x5 building footprint
 
-const FIELD_SIZE = 10;
 const FIELD_STRIPE_COLORS = ['#7fae6b', '#6a9b58'];
 
 const FLATTEN_RADIUS = 5;

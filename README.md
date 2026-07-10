@@ -26,6 +26,7 @@ same slate, paper, and safety-orange visual language through construction status
 | Toolbar: 1× / 4× / 16× | Simulation speed |
 | Toolbar: Pause / Resume, or Space | Freeze/resume the simulation without losing your view |
 | Toolbar: Growth / Growth Paused | Pause or resume new vegetation and settlement development while construction, traffic, weather, and cleanup continue |
+| Toolbar: Hide Controls / Show Controls | Collapse the site-command bar to a single restore button; the preference persists across reloads |
 | Toolbar: Guide, or H / ? | Open the live site overview and control reference |
 | Toolbar: New World | Start a fresh island from a seed |
 | Toolbar: Photo | Save a PNG screenshot of the current view |

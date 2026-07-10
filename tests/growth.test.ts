@@ -105,7 +105,7 @@ describe('GrowthSim', () => {
   });
 
   it('fields prefer cells near an existing house (deterministic seed)', () => {
-    const { bus, sim } = world();
+    const { bus, sim, g } = world();
     const records: { kind: string; x: number; z: number }[] = [];
     bus.on('growth:spawn', (e) => records.push({ kind: e.kind, x: e.x, z: e.z }));
     for (let i = 0; i < 60 * 420; i++) sim.update(1 / 60);
@@ -120,6 +120,14 @@ describe('GrowthSim', () => {
     // and fields spawn before some houses exist), but a clear majority should end up adjacent to
     // one once houses exist, given the preference logic scans for them.
     expect(fieldsNearHouse).toBeGreaterThan(0);
+
+    // A field is a 10x10 square, not a point. Its full circumradius must clear the 6u road plus a
+    // small verge; checking only the old 6.5u center clearance allowed its grass plane to cover
+    // the asphalt even though the record itself was technically outside the road.
+    const fieldFootprintClearance = ROAD_WIDTH / 2 + Math.hypot(5, 5) + 0.5;
+    for (const field of fields) {
+      expect(nearestRoadSample(g, field.x, field.z).dist).toBeGreaterThanOrEqual(fieldFootprintClearance - 0.02);
+    }
   });
 
   it('is deterministic: same seed + build sequence produces identical records', () => {
@@ -932,6 +940,25 @@ describe('GrowthSim', () => {
       expect(removedIds.sort()).toEqual([1, 2, 3, 4]);
       expect(sim.spawned.length).toBe(0);
       expect(sim.houseCount).toBe(0);
+    });
+
+    it('clears a field when its grass footprint overlaps the corridor even if its center does not', () => {
+      const { bus, hf, g, edgeId } = buildGraph('clear-field-footprint');
+      const sim = new GrowthSim(g, hf, bus, createRng('clear-field-footprint'));
+      const edge = g.edges.get(edgeId)!;
+      const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+      const centerOutsideOldPointRadius = ROAD_WIDTH / 2 + 4;
+      const field: SpawnRecord = {
+        kind: 'field', x: sample.x, z: sample.z + centerOutsideOldPointRadius, rot: 0, id: 1,
+      };
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [field]);
+
+      const clearedIds: number[] = [];
+      bus.on('growth:cleared', (e) => clearedIds.push(e.id));
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
+
+      expect(clearedIds).toEqual([1]);
     });
 
     it('does not clear records outside the corridor', () => {

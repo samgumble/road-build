@@ -62,6 +62,13 @@ assuming a green build means the page is live.
   `GrowthSim.setDevelopmentPaused`. It freezes only positive development accumulation, threshold
   spawns, and upgrades. Road-distance recompute, corridor clearing, stranded decay, construction,
   traffic, and weather keep advancing; do not replace it with a main-loop skip of `growth.update`.
+- The site-command toolbar can collapse to a single `Show Controls` button. Its state persists under
+  `groundwork-toolbar-collapsed`; keep the restore action outside `.gw-toolbar-controls` so a
+  collapsed toolbar can never strand the player without a way to reopen it.
+- Procedural fields are 10×10 squares (`FIELD_SIZE` is shared by GrowthSim and SceneryRenderer),
+  not point records. Spawn clearance uses the field circumradius plus the road half-width/verge,
+  and corridor clearing adds the same footprint radius. Preserve both halves of that invariant or
+  field grass can overlap an existing/new road even while its center passes a point-distance check.
 - Rain darkens and lowers the roughness of existing road materials by surface type. Dry weather
   is an exact authored-material reset, and fresh asphalt/paint curing composes with wetness rather
   than being overwritten by it.
@@ -88,6 +95,8 @@ assuming a green build means the page is live.
   and preserve a reduced-motion path.
 - **Growth pause:** Cleanup lifecycles must remain live while positive development is paused, and
   resume must continue from the frozen accumulator with no elapsed-time catch-up.
+- **Scenery footprints:** Any new scenery type larger than a point needs footprint-aware placement
+  and corridor clearing; do not reuse the field/tree center-distance rule blindly.
 
 ## Current improvement backlog
 

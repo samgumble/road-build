@@ -83,6 +83,19 @@ export function formatGrowthControl(paused: boolean): GrowthControlCopy {
     : { full: 'Growth', compact: 'GROW', notice: 'ENVIRONMENT GROWTH RESUMED' };
 }
 
+export interface ToolbarCollapseCopy {
+  full: string;
+  compact: string;
+  title: string;
+  expanded: boolean;
+}
+
+export function formatToolbarCollapse(collapsed: boolean): ToolbarCollapseCopy {
+  return collapsed
+    ? { full: 'Show Controls', compact: 'TOOLS', title: 'Expand site controls', expanded: false }
+    : { full: 'Hide Controls', compact: 'HIDE', title: 'Collapse site controls', expanded: true };
+}
+
 /** Task 25: up to this many crew ticker lines are shown, one per active crew (indices 0..N-1,
  * matching `BuildQueue.MAX_CREWS`'s 0-based `crew` field on construction events). Kept as a local
  * constant rather than importing MAX_CREWS from the sim so the UI layer doesn't need a sim-layer
@@ -136,6 +149,11 @@ const RESPONSIVE_CSS = `
   #gw-toolbar {
     box-shadow: 0 20px 60px rgba(0,0,0,.34), inset 0 1px rgba(255,255,255,.04) !important;
   }
+  #gw-toolbar .gw-toolbar-controls {
+    display: flex;
+    align-items: stretch;
+    gap: 8px;
+  }
   #gw-toolbar::before {
     content: 'SITE COMMAND';
     position: absolute;
@@ -186,10 +204,13 @@ const RESPONSIVE_CSS = `
   }
   @media (max-width: 480px) {
     #gw-toolbar {
-      flex-wrap: wrap;
       max-width: calc(100vw - 16px);
       justify-content: center;
       padding-bottom: calc(8px + env(safe-area-inset-bottom));
+    }
+    #gw-toolbar .gw-toolbar-controls {
+      flex-wrap: wrap;
+      justify-content: center;
     }
     #gw-toolbar::before { display: none; }
     #gw-toolbar button {
@@ -349,6 +370,7 @@ const SAVE_KEY = 'groundwork-save';
  * "music-on-by-default" design. */
 const MUSIC_KEY = 'groundwork-music';
 const GROWTH_PAUSED_KEY = 'groundwork-growth-paused';
+const TOOLBAR_COLLAPSED_KEY = 'groundwork-toolbar-collapsed';
 
 function readPersistedMusicOn(): boolean {
   try {
@@ -383,6 +405,22 @@ function persistGrowthPaused(paused: boolean): void {
   }
 }
 
+function readPersistedToolbarCollapsed(): boolean {
+  try {
+    return window.localStorage.getItem(TOOLBAR_COLLAPSED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function persistToolbarCollapsed(collapsed: boolean): void {
+  try {
+    window.localStorage.setItem(TOOLBAR_COLLAPSED_KEY, collapsed ? '1' : '0');
+  } catch {
+    // Storage unavailable — collapse still works for the current session.
+  }
+}
+
 /**
  * Bottom-center toolbar + top-left seed/status readout, styled as an engineer's site plan: charcoal
  * panels, fine borders, uppercase mono labels, safety-orange active accents, and restrained
@@ -405,6 +443,9 @@ export class Hud {
   private speedBtns: HTMLButtonElement[] = [];
   private pauseBtn!: HTMLButtonElement;
   private growthBtn!: HTMLButtonElement;
+  private toolbarControls!: HTMLElement;
+  private toolbarCollapseBtn!: HTMLButtonElement;
+  private toolbarCollapsed = false;
   private guideBtn!: HTMLButtonElement;
   private guideBackdrop!: HTMLElement;
   private guidePanel!: HTMLElement;
@@ -438,6 +479,7 @@ export class Hud {
     // flashing the default-on state for a frame.
     this.deps.audio.musicOn = readPersistedMusicOn();
     this.deps.setGrowthPaused(readPersistedGrowthPaused());
+    this.toolbarCollapsed = readPersistedToolbarCollapsed();
 
     injectResponsiveStyles();
     this.buildTopLeft();
@@ -515,19 +557,48 @@ export class Hud {
       padding: '8px', pointerEvents: 'auto',
     });
 
-    bar.appendChild(this.buildModeGroup());
-    bar.appendChild(this.buildDivider());
-    bar.appendChild(this.buildSpeedGroup());
-    bar.appendChild(this.buildPauseButton());
-    bar.appendChild(this.buildGrowthButton());
-    bar.appendChild(this.buildDivider());
-    bar.appendChild(this.buildNewWorldGroup());
-    bar.appendChild(this.buildGuideButton());
-    bar.appendChild(this.buildPhotoButton());
-    bar.appendChild(this.buildMusicButton());
-    bar.appendChild(this.buildMuteButton());
+    const controls = el('div', { id: 'gw-toolbar-controls', className: 'gw-toolbar-controls' });
+    controls.appendChild(this.buildModeGroup());
+    controls.appendChild(this.buildDivider());
+    controls.appendChild(this.buildSpeedGroup());
+    controls.appendChild(this.buildPauseButton());
+    controls.appendChild(this.buildGrowthButton());
+    controls.appendChild(this.buildDivider());
+    controls.appendChild(this.buildNewWorldGroup());
+    controls.appendChild(this.buildGuideButton());
+    controls.appendChild(this.buildPhotoButton());
+    controls.appendChild(this.buildMusicButton());
+    controls.appendChild(this.buildMuteButton());
+    this.toolbarControls = controls;
+    bar.appendChild(controls);
+    bar.appendChild(this.buildToolbarCollapseButton());
 
     this.root.appendChild(bar);
+    this.refreshToolbarCollapse();
+  }
+
+  private buildToolbarCollapseButton(): HTMLButtonElement {
+    const btn = el('button', { type: 'button' }, {
+      ...baseButtonStyle(), borderBottom: '2px solid transparent', borderRadius: '3px',
+    });
+    btn.setAttribute('aria-controls', 'gw-toolbar-controls');
+    btn.addEventListener('click', () => {
+      this.toolbarCollapsed = !this.toolbarCollapsed;
+      persistToolbarCollapsed(this.toolbarCollapsed);
+      this.refreshToolbarCollapse();
+    });
+    this.toolbarCollapseBtn = btn;
+    return btn;
+  }
+
+  private refreshToolbarCollapse(): void {
+    const copy = formatToolbarCollapse(this.toolbarCollapsed);
+    this.toolbarControls.style.display = this.toolbarCollapsed ? 'none' : 'flex';
+    setResponsiveLabel(this.toolbarCollapseBtn, copy.full, copy.compact);
+    this.toolbarCollapseBtn.title = copy.title;
+    this.toolbarCollapseBtn.setAttribute('aria-expanded', String(copy.expanded));
+    this.toolbarCollapseBtn.style.color = this.toolbarCollapsed ? ACCENT : TEXT_DIM;
+    this.toolbarCollapseBtn.style.borderBottomColor = this.toolbarCollapsed ? ACCENT : 'transparent';
   }
 
   private buildDivider(): HTMLElement {

@@ -5,6 +5,7 @@ import {
   formatCrewTicker,
   formatGrowthControl,
   formatSiteOverview,
+  formatToolbarCollapse,
 } from '../src/ui/hud';
 
 describe('formatSiteOverview', () => {
@@ -65,6 +66,23 @@ describe('environment growth control', () => {
       full: 'Growth Paused',
       compact: 'GROW OFF',
       notice: 'ENVIRONMENT GROWTH PAUSED',
+    });
+  });
+});
+
+describe('toolbar collapse control', () => {
+  it('keeps an explicit, accessible restore action in both states', () => {
+    expect(formatToolbarCollapse(false)).toEqual({
+      full: 'Hide Controls',
+      compact: 'HIDE',
+      title: 'Collapse site controls',
+      expanded: true,
+    });
+    expect(formatToolbarCollapse(true)).toEqual({
+      full: 'Show Controls',
+      compact: 'TOOLS',
+      title: 'Expand site controls',
+      expanded: false,
     });
   });
 });

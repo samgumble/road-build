@@ -67,6 +67,12 @@ const ALONG_ROAD_JITTER = 1.5;
 const FIELD_HOUSE_SEARCH_RADIUS = 14;
 // rad — wobble applied to a field's road-aligned rotation.
 const FIELD_ROT_JITTER = 0.1;
+// Shared with SceneryRenderer: a field is a rendered square, so road clearance must account for
+// its whole footprint rather than treating the record's center as a point. The circumradius makes
+// this safe at curves/endpoints and for any rotation; the final 0.5u leaves a narrow visible verge.
+export const FIELD_SIZE = 10;
+const FIELD_FOOTPRINT_RADIUS = FIELD_SIZE / Math.SQRT2;
+const FIELD_ROAD_CLEARANCE = ROAD_WIDTH / 2 + FIELD_FOOTPRINT_RADIUS + 0.5;
 
 // A cell crossing the 'tree' threshold spawns trees only with this probability; every qualifying
 // cell along a corridor would otherwise plant 2-3 trees every 4u (CELL), which at typical canopy
@@ -478,16 +484,30 @@ export class GrowthSim {
     }
   }
 
-  /** Pushes (x,z) away from the nearest road sample if it lands within MIN_ROAD_CLEARANCE. */
-  private clearOfRoads(x: number, z: number): { x: number; z: number } {
-    const near = this.nearestRoadInfo(x, z);
-    if (near.dist >= MIN_ROAD_CLEARANCE || near.dist === Infinity) return { x, z };
-    // push (x,z) directly away from the nearest sample out to MIN_ROAD_CLEARANCE
-    let dx = x - near.x, dz = z - near.z;
-    const len = Math.hypot(dx, dz) || 1;
-    dx /= len;
-    dz /= len;
-    return { x: near.x + dx * MIN_ROAD_CLEARANCE, z: near.z + dz * MIN_ROAD_CLEARANCE };
+  /** Pushes (x,z) away from roads until the nearest sample satisfies `minClearance`. Re-querying
+   * after each projection handles curves where moving away from one sample exposes a closer one. */
+  private clearOfRoads(x: number, z: number, minClearance = MIN_ROAD_CLEARANCE): { x: number; z: number } {
+    let px = x, pz = z;
+    for (let iter = 0; iter < 5; iter++) {
+      const near = this.nearestRoadInfo(px, pz);
+      if (near.dist >= minClearance || near.dist === Infinity) return { x: px, z: pz };
+
+      let dx = px - near.x, dz = pz - near.z;
+      const len = Math.hypot(dx, dz);
+      if (len < 1e-6) {
+        // Exactly on the centerline: choose a stable perpendicular rather than leaving the point
+        // unmoved (the old `|| 1` fallback kept dx/dz at zero and could strand scenery on-road).
+        const perpendicular = near.heading + Math.PI / 2;
+        dx = Math.cos(perpendicular);
+        dz = Math.sin(perpendicular);
+      } else {
+        dx /= len;
+        dz /= len;
+      }
+      px = near.x + dx * minClearance;
+      pz = near.z + dz * minClearance;
+    }
+    return { x: px, z: pz };
   }
 
   /**
@@ -602,14 +622,14 @@ export class GrowthSim {
     }
 
     if (!nearestHouse) {
-      const { x, z } = this.clearOfRoads(cx, cz);
+      const { x, z } = this.clearOfRoads(cx, cz, FIELD_ROAD_CLEARANCE);
       return { x, z, rot };
     }
 
     // Nudge the field toward the house, staying clear of the road, so it reads as sitting beside
     // the farmhouse rather than at the raw cell center.
     const toward = { x: (cx + nearestHouse.x) / 2, z: (cz + nearestHouse.z) / 2 };
-    const { x, z } = this.clearOfRoads(toward.x, toward.z);
+    const { x, z } = this.clearOfRoads(toward.x, toward.z, FIELD_ROAD_CLEARANCE);
     return { x, z, rot };
   }
 
@@ -852,10 +872,11 @@ export class GrowthSim {
 
   /**
    * Task 42: an edge just reached (or was restored at/past) 'graded' — find every grown record
-   * within CLEAR_RADIUS of one of that edge's non-bridge samples and begin its quick clearing fade
-   * (unless already clearing). Mirrors `WildernessSim.clearCorridor` in wilderness.ts exactly (same
-   * radius, same non-bridge-sample-only matching), but operates on GrowthSim's own `records` (every
-   * kind — tree/field/house/building) instead of a separate wilderness tree list, and starts a
+   * overlapping the corridor around one of that edge's non-bridge samples and begin its quick
+   * clearing fade (unless already clearing). Point-like records use the same center radius as
+   * `WildernessSim.clearCorridor`; fields add their square footprint's circumradius so grass cannot
+   * remain over asphalt merely because the field center is outside the corridor. This operates on
+   * GrowthSim's own `records` (every kind — tree/field/house/building) and starts a
    * timed fade (`clearingSince`) rather than an immediate boolean flip, so the renderer gets a
    * chance to play the fade before the record actually disappears (see `updateClearing`).
    */
@@ -867,7 +888,8 @@ export class GrowthSim {
       if (this.clearingSince.has(r.id)) continue; // already clearing — don't restart its fade
       for (const s of edge.samples) {
         if (s.bridge) continue;
-        if (Math.hypot(s.x - r.x, s.z - r.z) <= CLEAR_RADIUS) {
+        const footprintRadius = r.kind === 'field' ? FIELD_FOOTPRINT_RADIUS : 0;
+        if (Math.hypot(s.x - r.x, s.z - r.z) <= CLEAR_RADIUS + footprintRadius) {
           // Task 42: corridor clearing pre-empts stranded-decay outright — a record that happened
           // to already be mid-grace/mid-fade when the road's corridor reached it is simply
           // reclassified as "clearing" (its stranded/fading timers are irrelevant now: the road is
