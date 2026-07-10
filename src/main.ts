@@ -207,7 +207,7 @@ function main(): void {
       const dt = Math.min((now - lastFrameTime) / 1000, 0.25);
       lastFrameTime = now;
       cameraRig.update(dt);
-      roadRenderer.update(dt);
+      roadRenderer.update(dt, atmosphere.rainAmount);
       drawTool.update(dt);
       // Important 10: the day/night cycle is meant to accelerate with the HUD's speed control
       // (1x/4x/16x, via `loop.timeScale`) the same way the fixed-step sim does — Atmosphere's own
@@ -302,6 +302,7 @@ function main(): void {
       buildings: growth.spawned.filter((record) => record.kind === 'building').length,
       paused: loop.isPaused,
     }),
+    getEdgeLength: (edgeId) => graph.edges.get(edgeId)?.length ?? 0,
     onNewWorld: (newSeed) => {
       // Each seed owns its own save slot (starting empty for a seed that's never been visited),
       // so there's nothing to clear here — just navigate. `main()`'s boot sequence on the new

@@ -1,5 +1,5 @@
 import type { EventBus } from '../core/events';
-import type { Stage } from '../core/types';
+import { STAGES, type Stage } from '../core/types';
 import type { DrawTool, DrawToolMode } from '../input/drawTool';
 import type { Loop } from '../core/loop';
 import type { AmbientAudio } from '../audio/ambient';
@@ -27,7 +27,49 @@ const STAGE_TICKER: Record<Stage, string> = {
   paved: 'PAVING…',
   painted: 'PAINTING LINES…',
 };
+const DEMOLISH_TICKER: Partial<Record<Stage, string>> = {
+  painted: 'REMOVING LINES…',
+  paved: 'REMOVING ASPHALT…',
+  gravel: 'HAULING GRAVEL…',
+  graded: 'RESTORING GROUND…',
+};
 const CREW_IDLE = 'CREW IDLE';
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+export function constructionJobProgress(
+  stageProgress: Partial<Record<Stage, number>>,
+  demolish: boolean,
+  activeStage: Stage,
+  activeProgress: number,
+): number {
+  if (!demolish) {
+    const total = STAGES.reduce((sum, stage) => sum + clamp01(stageProgress[stage] ?? 0), 0);
+    return total / STAGES.length;
+  }
+
+  // Demolition walks painted -> paved -> gravel -> graded, with t decreasing within each pass.
+  // Convert that "remaining structure" representation into a conventional 0 -> 1 completion bar.
+  const stageIndex = STAGES.indexOf(activeStage);
+  const remainingCompletedStages = Math.max(0, stageIndex - 1);
+  const remaining = remainingCompletedStages + clamp01(activeProgress);
+  return clamp01(1 - remaining / (STAGES.length - 1));
+}
+
+export function formatCrewTicker(crew: number, stage: Stage, demolish: boolean, onBreak: boolean): string {
+  if (onBreak) return `CREW ${crew + 1} ON BREAK`;
+  const action = demolish ? (DEMOLISH_TICKER[stage] ?? 'CLEARING SITE…') : STAGE_TICKER[stage];
+  return `CREW ${crew + 1} ${action}`;
+}
+
+export function formatConstructionNotice(stage: Stage | 'removed', crew: number): string | null {
+  if (crew < 0) return null;
+  if (stage === 'painted') return `ROAD OPEN · CREW ${crew + 1} COMPLETE`;
+  if (stage === 'removed') return `ROAD REMOVED · CREW ${crew + 1} CLEAR`;
+  return null;
+}
 
 /** Task 25: up to this many crew ticker lines are shown, one per active crew (indices 0..N-1,
  * matching `BuildQueue.MAX_CREWS`'s 0-based `crew` field on construction events). Kept as a local
@@ -89,6 +131,25 @@ const RESPONSIVE_CSS = `
       width: min(330px, calc(100vw - 32px)) !important;
       max-height: calc(100vh - 32px);
       overflow-y: auto;
+    }
+    #gw-notices {
+      top: 84px !important;
+      left: 8px;
+      right: 8px !important;
+      align-items: center !important;
+    }
+    #gw-notices > div {
+      max-width: calc(100vw - 32px);
+      text-align: center;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #gw-top-left .gw-ticker-row > div:last-child > div,
+    #gw-notices > div {
+      transition: none !important;
+    }
+    #gw-guide-backdrop {
+      backdrop-filter: none !important;
     }
   }
 `;
@@ -181,7 +242,17 @@ interface HudDeps {
   canvas: HTMLCanvasElement;
   audio: AmbientAudio;
   getSiteOverview: () => SiteOverview;
+  getEdgeLength: (edgeId: number) => number;
   onNewWorld: (seed: string) => void;
+}
+
+interface CrewHudState {
+  edgeId: number;
+  activeStage: Stage;
+  activeProgress: number;
+  stageProgress: Partial<Record<Stage, number>>;
+  demolish: boolean;
+  onBreak: boolean;
 }
 
 const SAVE_KEY = 'groundwork-save';
@@ -217,7 +288,9 @@ function persistMusicOn(on: boolean): void {
 export class Hud {
   private root: HTMLElement;
   private tickerContainer!: HTMLElement;
+  private tickerRowEls: HTMLElement[] = [];
   private tickerLineEls: HTMLElement[] = [];
+  private tickerProgressEls: HTMLElement[] = [];
   private idleLineEl!: HTMLElement;
   private hintEl!: HTMLElement;
   private hintShown = true;
@@ -227,7 +300,9 @@ export class Hud {
   private speedBtns: HTMLButtonElement[] = [];
   private pauseBtn!: HTMLButtonElement;
   private guideBtn!: HTMLButtonElement;
+  private guideBackdrop!: HTMLElement;
   private guidePanel!: HTMLElement;
+  private guideCloseBtn!: HTMLButtonElement;
   private guideOverviewLines: HTMLElement[] = [];
   private guideOpen = false;
 
@@ -243,7 +318,9 @@ export class Hud {
    * 'removed'). Populated from `construction:stage` events — `crew: -1` (the sim's synthetic
    * "no live crew" sentinel for instant-remove/save-restore-sync emits, see queue.ts) is ignored,
    * since it never represents an actual ticker-worthy crew. */
-  private stageByCrew = new Map<number, Stage>();
+  private crewStateByCrew = new Map<number, CrewHudState>();
+  private tickerFramePending = false;
+  private noticeContainer!: HTMLElement;
 
   constructor(private deps: HudDeps) {
     const hud = document.getElementById('hud');
@@ -279,9 +356,20 @@ export class Hud {
     // the render layer uses for its per-crew rigs.
     this.tickerContainer = el('div', {}, { display: 'flex', flexDirection: 'column', gap: '2px' });
     for (let i = 0; i < MAX_CREW_LINES; i++) {
-      const line = el('div', { textContent: '', className: 'gw-ticker-line' }, { ...labelStyle(), color: TEXT_DIM, display: 'none' });
+      const row = el('div', { className: 'gw-ticker-row' }, { display: 'none', minWidth: '220px' });
+      const line = el('div', { textContent: '', className: 'gw-ticker-line' }, { ...labelStyle(), color: TEXT_DIM });
+      const track = el('div', {}, { height: '2px', marginTop: '3px', overflow: 'hidden', background: BORDER });
+      const fill = el('div', {}, {
+        width: '100%', height: '100%', background: ACCENT, transform: 'scaleX(0)',
+        transformOrigin: 'left center', transition: 'transform 0.12s linear',
+      });
+      track.appendChild(fill);
+      row.appendChild(line);
+      row.appendChild(track);
+      this.tickerRowEls.push(row);
       this.tickerLineEls.push(line);
-      this.tickerContainer.appendChild(line);
+      this.tickerProgressEls.push(fill);
+      this.tickerContainer.appendChild(row);
     }
     this.tickerContainer.appendChild(
       // Fallback single "CREW IDLE" line, shown only when every crew line is hidden (no crew has
@@ -300,6 +388,12 @@ export class Hud {
       opacity: '1',
     });
     this.root.appendChild(this.hintEl);
+
+    this.noticeContainer = el('div', { id: 'gw-notices', ariaLive: 'polite' }, {
+      position: 'fixed', top: '16px', right: '16px', display: 'flex', flexDirection: 'column',
+      alignItems: 'flex-end', gap: '6px', pointerEvents: 'none',
+    });
+    this.root.appendChild(this.noticeContainer);
   }
 
   private buildToolbar(): void {
@@ -423,10 +517,18 @@ export class Hud {
   }
 
   private buildGuideOverlay(): void {
-    const panel = el('section', { id: 'gw-guide-panel' }, {
+    const backdrop = el('div', { id: 'gw-guide-backdrop' }, {
+      display: 'none', position: 'fixed', inset: '0', background: 'rgba(10, 12, 13, 0.58)',
+      backdropFilter: 'blur(2px)', pointerEvents: 'auto', zIndex: '1',
+    });
+    backdrop.addEventListener('click', () => this.toggleGuide(false));
+
+    const panel = el('section', {
+      id: 'gw-guide-panel', role: 'dialog', ariaModal: 'true', ariaLabel: 'Site guide', tabIndex: -1,
+    }, {
       display: 'none', position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
       width: '390px', background: PANEL_BG, border: `1px solid ${BORDER}`, borderRadius: '3px',
-      padding: '16px', pointerEvents: 'auto', zIndex: '2',
+      padding: '16px', pointerEvents: 'auto', zIndex: '2', boxShadow: '0 18px 60px rgba(0,0,0,0.38)',
     });
 
     const header = el('div', {}, { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' });
@@ -435,6 +537,7 @@ export class Hud {
       ...baseButtonStyle(), padding: '2px 8px', fontSize: '16px', lineHeight: '20px',
     });
     close.addEventListener('click', () => this.toggleGuide(false));
+    this.guideCloseBtn = close;
     header.appendChild(close);
     panel.appendChild(header);
 
@@ -455,16 +558,24 @@ export class Hud {
       panel.appendChild(el('div', { textContent: title }, { ...labelStyle(), color: TEXT_DIM, marginTop: '14px', marginBottom: '5px' }));
       for (const line of lines) panel.appendChild(el('div', { textContent: line }, { ...labelStyle(), color: TEXT, fontSize: '10px', lineHeight: '1.5' }));
     }
+    this.guideBackdrop = backdrop;
     this.guidePanel = panel;
+    this.root.appendChild(backdrop);
     this.root.appendChild(panel);
   }
 
   private toggleGuide(force?: boolean): void {
     this.guideOpen = force ?? !this.guideOpen;
+    this.guideBackdrop.style.display = this.guideOpen ? '' : 'none';
     this.guidePanel.style.display = this.guideOpen ? '' : 'none';
     this.guideBtn.style.borderBottomColor = this.guideOpen ? ACCENT : 'transparent';
     this.guideBtn.style.color = this.guideOpen ? ACCENT : TEXT;
-    if (this.guideOpen) this.refreshGuide();
+    if (this.guideOpen) {
+      this.refreshGuide();
+      this.guideCloseBtn.focus();
+    } else {
+      this.guideBtn.focus();
+    }
   }
 
   private refreshGuide(): void {
@@ -595,31 +706,65 @@ export class Hud {
   }
 
   private wireEvents(): void {
-    this.deps.bus.on('construction:stage', ({ crew, stage }) => {
+    this.deps.bus.on('construction:stage', ({ edgeId, crew, stage }) => {
       // crew: -1 is the sim's synthetic "no live crew" sentinel (instant pending-job removal,
       // save-restore's stage-sync emit — see queue.ts) — never a real crew ticker line.
       if (crew < 0) return;
-      // A crew reaching a terminal stage frees up that ticker line — collapse it rather than
-      // showing a stale "PAINTING LINES…" for a crew that's actually gone back to idle.
+      const notice = formatConstructionNotice(stage, crew);
+      if (notice) this.showNotice(notice);
+
       if (stage === 'removed' || stage === 'painted') {
-        this.stageByCrew.delete(crew);
+        this.crewStateByCrew.delete(crew);
       } else {
-        this.stageByCrew.set(crew, stage);
+        const previous = this.crewStateByCrew.get(crew);
+        const state: CrewHudState = previous?.edgeId === edgeId ? previous : {
+          edgeId,
+          activeStage: stage,
+          activeProgress: 1,
+          stageProgress: {},
+          demolish: false,
+          onBreak: false,
+        };
+        state.activeStage = stage;
+        state.activeProgress = 1;
+        state.stageProgress[stage] = 1;
+        this.crewStateByCrew.set(crew, state);
       }
       this.updateTicker();
       this.refreshGuide();
     });
-    // The survey phase (see queue.ts) never fires `construction:stage` — a fresh build job walks
-    // the surveyor the length of the edge purely via `construction:progress` events, and only
-    // starts emitting `construction:stage` once grading begins. Without this, a crew stays absent
-    // from the ticker for the entire (sometimes lengthy, on long edges) survey pass even though
-    // it's genuinely busy. Seed the crew's entry straight from the first 'surveyed' progress event
-    // instead; `construction:stage`'s own 'graded' event overwrites it as soon as surveying ends.
-    this.deps.bus.on('construction:progress', ({ crew, stage }) => {
-      if (crew < 0 || stage !== 'surveyed' || this.stageByCrew.has(crew)) return;
-      this.stageByCrew.set(crew, stage);
-      this.updateTicker();
-      this.refreshGuide();
+    this.deps.bus.on('construction:progress', ({ edgeId, crew, stage, t, demolish, onBreak }) => {
+      if (crew < 0) return;
+      const length = this.deps.getEdgeLength(edgeId);
+      const progress = length > 0 ? clamp01(t / length) : 0;
+      const previous = this.crewStateByCrew.get(crew);
+      const state: CrewHudState = previous?.edgeId === edgeId ? previous : {
+        edgeId,
+        activeStage: stage,
+        activeProgress: progress,
+        stageProgress: {},
+        demolish,
+        onBreak,
+      };
+      state.stageProgress[stage] = progress;
+      state.demolish = demolish;
+      state.onBreak = onBreak;
+
+      if (demolish) {
+        state.activeStage = stage;
+        state.activeProgress = progress;
+      } else {
+        // The stage train emits multiple fronts per tick. Display the furthest-advanced kind that
+        // has genuinely started, while the overall bar averages every stage's independent t.
+        let activeStage = stage;
+        for (const candidate of STAGES) {
+          if ((state.stageProgress[candidate] ?? 0) > 0) activeStage = candidate;
+        }
+        state.activeStage = activeStage;
+        state.activeProgress = state.stageProgress[activeStage] ?? 0;
+      }
+      this.crewStateByCrew.set(crew, state);
+      this.scheduleTickerUpdate();
     });
     this.deps.bus.on('roads:edgeAdded', () => {
       this.dismissHint();
@@ -628,28 +773,72 @@ export class Hud {
     this.deps.bus.on('roads:edgeRemoved', () => this.refreshGuide());
     this.deps.bus.on('growth:spawn', () => this.refreshGuide());
     this.deps.bus.on('growth:remove', () => this.refreshGuide());
-    this.deps.bus.on('growth:upgrade', () => this.refreshGuide());
+    this.deps.bus.on('growth:upgrade', () => {
+      this.refreshGuide();
+      this.showNotice('SETTLEMENT GROWING · NEW BUILDING');
+    });
+    this.deps.bus.on('quarry:placed', () => this.showNotice('QUARRY ESTABLISHED · SUPPLY LINE READY'));
+    this.deps.bus.on('atmosphere:phase', ({ night }) => {
+      this.showNotice(night ? 'NIGHT SHIFT · WORK LIGHTS ON' : 'DAYBREAK · FULL OPERATIONS');
+    });
   }
 
-  /** Renders one line per crew with an entry in `stageByCrew` (indices in ascending crew order,
+  /** Renders one line per crew with an entry in `crewStateByCrew` (indices in ascending crew order,
    * up to MAX_CREW_LINES), collapsing the single fallback "CREW IDLE" line as soon as any crew has
    * a line showing, and collapsing every per-crew line back down once all crews go idle. */
+  private scheduleTickerUpdate(): void {
+    if (this.tickerFramePending) return;
+    this.tickerFramePending = true;
+    requestAnimationFrame(() => {
+      this.tickerFramePending = false;
+      this.updateTicker();
+    });
+  }
+
   private updateTicker(): void {
-    const activeCrews = [...this.stageByCrew.entries()].sort(([a], [b]) => a - b);
+    const activeCrews = [...this.crewStateByCrew.entries()].sort(([a], [b]) => a - b);
 
     for (let i = 0; i < this.tickerLineEls.length; i++) {
       const line = this.tickerLineEls[i];
+      const row = this.tickerRowEls[i];
+      const fill = this.tickerProgressEls[i];
       const entry = activeCrews[i];
       if (entry) {
-        const [crew, stage] = entry;
-        line.textContent = `CREW ${crew + 1} ${STAGE_TICKER[stage]}`;
-        line.style.display = '';
+        const [crew, state] = entry;
+        line.textContent = formatCrewTicker(crew, state.activeStage, state.demolish, state.onBreak);
+        const progress = constructionJobProgress(
+          state.stageProgress, state.demolish, state.activeStage, state.activeProgress,
+        );
+        fill.style.transform = `scaleX(${progress.toFixed(4)})`;
+        fill.style.background = state.onBreak ? TEXT_DIM : ACCENT;
+        row.style.display = '';
       } else {
-        line.style.display = 'none';
+        row.style.display = 'none';
       }
     }
 
     this.idleLineEl.style.display = activeCrews.length === 0 ? '' : 'none';
+  }
+
+  private showNotice(message: string): void {
+    while (this.noticeContainer.childElementCount >= 3) {
+      this.noticeContainer.firstElementChild?.remove();
+    }
+    const notice = el('div', { textContent: message }, {
+      ...labelStyle(), color: TEXT, background: PANEL_BG, border: `1px solid ${BORDER}`,
+      borderLeft: `3px solid ${ACCENT}`, borderRadius: '3px', padding: '9px 12px',
+      opacity: '0', transform: 'translateY(-8px)', transition: 'opacity 0.2s ease, transform 0.2s ease',
+    });
+    this.noticeContainer.appendChild(notice);
+    requestAnimationFrame(() => {
+      notice.style.opacity = '1';
+      notice.style.transform = 'translateY(0)';
+    });
+    window.setTimeout(() => {
+      notice.style.opacity = '0';
+      notice.style.transform = 'translateY(-5px)';
+      window.setTimeout(() => notice.remove(), 220);
+    }, 2800);
   }
 
   private dismissHint(): void {

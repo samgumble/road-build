@@ -41,8 +41,8 @@ assuming a green build means the page is live.
 | Roads and construction | `src/sim/roads/`, `src/sim/construction/queue.ts` | Graph commits, split/loop behavior, construction stage train, crews, terrain grading, and demolition. `BuildQueue` exposes only compact status metrics to the UI. |
 | World growth | `src/sim/growth/`, `src/sim/quarry.ts` | Deterministic road-adjacent settlement, scenery lifecycle, wilderness and quarry placement. Save/restore lives in `src/sim/save.ts`. |
 | Traffic | `src/sim/traffic/traffic.ts` | Lanes, routing, junction locks, box clearing, and deterministic recovery from saturated rings. Keep changes seeded and fixed-step. |
-| Rendering | `src/render/` | Three.js scene, instancing, terrain/water/sky, road bands, construction dressing, scenery and cars. Rendering should consume events/state; it must not become authoritative. |
-| Input/UI/audio | `src/input/`, `src/ui/hud.ts`, `src/audio/ambient.ts` | Draw/camera gestures; responsive event-driven HUD; lazy gesture-started audio and optional ambient music. |
+| Rendering | `src/render/` | Three.js scene, instancing, terrain/water/sky, weather-responsive road bands, construction dressing, scenery and cars. Rendering should consume events/state; it must not become authoritative. |
+| Input/UI/audio | `src/input/`, `src/ui/hud.ts`, `src/audio/ambient.ts` | Draw/camera gestures; responsive event-driven HUD with per-crew aggregate progress and milestone notices; lazy gesture-started audio and optional ambient music. |
 
 ## Shipped player-facing systems
 
@@ -55,7 +55,12 @@ assuming a green build means the page is live.
   tiers, a two-thirds-day/one-third-night cycle, night-dimmed water, ambient music, and real photo
   capture.
 - Site command UI: Draw/Demolish, speed controls, Pause/Resume (`Space`), and a live Guide
-  (`H`/`?`) showing network, jobs, town, traffic, and simulation state.
+  (`H`/`?`) showing network, jobs, town, traffic, and simulation state. The guide uses a proper
+  modal backdrop/focus handoff; crew lines show multi-stage job completion and concise terminal
+  milestones without turning the zen toy into a notification feed.
+- Rain darkens and lowers the roughness of existing road materials by surface type. Dry weather
+  is an exact authored-material reset, and fresh asphalt/paint curing composes with wetness rather
+  than being overwritten by it.
 
 ## Invariants worth protecting
 
@@ -81,6 +86,9 @@ These are deliberately uncommitted product directions, not known blockers:
 4. Add camera bookmarks / focus-active-crew shortcuts for larger settlements.
 5. Profile an optimized production build on a real mobile device and a built-out 16× map before
    raising visual density further.
+6. Manually spot-check the crew progress bars, notices, guide backdrop/focus, and wet roads in a
+   real browser at desktop and 375px-wide mobile sizes. The implementation has focused tests and
+   a production build, but Codex browser automation is policy-blocked from the localhost URL.
 
 ## Review checklist
 

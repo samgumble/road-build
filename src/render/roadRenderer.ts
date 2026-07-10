@@ -34,6 +34,31 @@ export const STAGE_COLOR: Record<Stage, string> = {
 export const ROLLER_TRAIL_DISTANCE = 8;
 export const PAVED_COMPACTED_COLOR = '#2f3234'; // paved, darkened ~20% — compacted asphalt behind the roller
 
+export type RoadSurfaceKind = 'earth' | 'gravel' | 'asphalt' | 'paint';
+
+const WET_SURFACE_TARGET: Record<RoadSurfaceKind, { colorScale: number; roughness: number }> = {
+  earth: { colorScale: 0.92, roughness: 0.72 },
+  gravel: { colorScale: 0.82, roughness: 0.52 },
+  asphalt: { colorScale: 0.70, roughness: 0.18 },
+  paint: { colorScale: 0.84, roughness: 0.30 },
+};
+
+/** Pure authored response used by the renderer and tests. Rain only reduces roughness, so it
+ * composes with fresh-asphalt/paint sheen instead of making a curing surface paradoxically duller. */
+export function wetRoadAppearance(
+  kind: RoadSurfaceKind,
+  rainAmount: number,
+  dryRoughness: number,
+): { colorScale: number; roughness: number } {
+  const rain = Math.max(0, Math.min(1, rainAmount));
+  const target = WET_SURFACE_TARGET[kind];
+  const wetRoughness = Math.min(dryRoughness, target.roughness);
+  return {
+    colorScale: 1 + (target.colorScale - 1) * rain,
+    roughness: dryRoughness + (wetRoughness - dryRoughness) * rain,
+  };
+}
+
 const STAGE_YLIFT: Record<Stage, number> = {
   surveyed: 0.02,
   graded: 0.06,
@@ -425,6 +450,13 @@ function makeStandardMaterial(
     polygonOffsetFactor: magnitude,
     polygonOffsetUnits: magnitude,
   });
+}
+
+function tagWeatherSurface(mesh: THREE.Mesh, kind: RoadSurfaceKind): void {
+  const material = mesh.material as THREE.MeshStandardMaterial;
+  mesh.userData.weatherSurface = kind;
+  mesh.userData.dryColor = material.color.getHex();
+  mesh.userData.dryRoughness = material.roughness;
 }
 
 /**
@@ -833,7 +865,8 @@ export class RoadRenderer {
       if (rollerT > from) {
         const compactedGeo = buildRibbonGeometry(samples, ROAD_WIDTH, STAGE_YLIFT.paved, from, rollerT);
         const compactedMat = makeStandardMaterial(PAVED_COMPACTED_COLOR, 1, 'ribbon');
-        this.addMesh(v, compactedGeo, compactedMat);
+        const compactedMesh = this.addMesh(v, compactedGeo, compactedMat);
+        tagWeatherSurface(compactedMesh, 'asphalt');
       }
       if (rollerT < to) {
         const freshGeo = buildRibbonGeometry(samples, ROAD_WIDTH, STAGE_YLIFT.paved, rollerT, to);
@@ -841,6 +874,7 @@ export class RoadRenderer {
         freshMat.roughness = 0.35; // fresh asphalt sheen start; advanced in update()
         const freshMesh = this.addMesh(v, freshGeo, freshMat);
         freshMesh.userData.freshAsphalt = true;
+        tagWeatherSurface(freshMesh, 'asphalt');
       }
       return;
     }
@@ -854,6 +888,7 @@ export class RoadRenderer {
       mat.roughness = 0.35; // fresh asphalt sheen start; advanced in update()
       mesh.userData.freshAsphalt = true;
     }
+    tagWeatherSurface(mesh, stage === 'graded' ? 'earth' : stage === 'gravel' ? 'gravel' : 'asphalt');
 
     if (stage === 'painted') {
       const dashGeo = buildDashedRibbonGeometry(samples, CENTERLINE_WIDTH, CENTERLINE_YLIFT, from, to, 2);
@@ -864,6 +899,7 @@ export class RoadRenderer {
       dashMat.roughness = WET_SHEEN_START;
       const dashMesh = this.addMesh(v, dashGeo, dashMat);
       dashMesh.userData.wetPaint = true;
+      tagWeatherSurface(dashMesh, 'paint');
     }
   }
 
@@ -1049,7 +1085,7 @@ export class RoadRenderer {
     for (const key of this.railSettle.keys()) if (key.startsWith(prefix)) this.railSettle.delete(key);
   }
 
-  update(dt: number): void {
+  update(dt: number, rainAmount = 0): void {
     this.clockSeconds += dt;
 
     for (const [edgeId, v] of this.visuals) {
@@ -1067,7 +1103,7 @@ export class RoadRenderer {
         const roughness = 0.35 + (0.9 - 0.35) * u;
         for (const m of v.meshes) {
           if (!m.userData.freshAsphalt) continue;
-          (m.material as THREE.MeshStandardMaterial).roughness = roughness;
+          m.userData.dryRoughness = roughness;
         }
         if (u >= 1) v.freshAsphaltAt = null;
       }
@@ -1079,9 +1115,22 @@ export class RoadRenderer {
         const roughness = WET_SHEEN_START + (WET_SHEEN_END - WET_SHEEN_START) * u;
         for (const m of v.meshes) {
           if (!m.userData.wetPaint) continue;
-          (m.material as THREE.MeshStandardMaterial).roughness = roughness;
+          m.userData.dryRoughness = roughness;
         }
         if (u >= 1) v.wetPaintAt = null;
+      }
+
+      // Rain response is presentation-only and reapplied from stored dry authored values each
+      // frame, so colors/roughness never compound. This also means rain clearing is an exact
+      // return to the pre-rain material rather than an approximation.
+      for (const mesh of v.meshes) {
+        const kind = mesh.userData.weatherSurface as RoadSurfaceKind | undefined;
+        if (!kind) continue;
+        const material = mesh.material as THREE.MeshStandardMaterial;
+        const dryRoughness = mesh.userData.dryRoughness as number;
+        const appearance = wetRoadAppearance(kind, rainAmount, dryRoughness);
+        material.color.setHex(mesh.userData.dryColor as number).multiplyScalar(appearance.colorScale);
+        material.roughness = appearance.roughness;
       }
     }
 

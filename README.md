@@ -24,6 +24,7 @@ occasionally, and you can just let it run.
 | Toolbar: Guide, or H / ? | Open the live site overview and control reference |
 | Toolbar: New World | Start a fresh island from a seed |
 | Toolbar: Photo | Save a PNG screenshot of the current view |
+| Toolbar: Music | Toggle the ambient music rotation independently of sound effects |
 | Toolbar: Mute | Toggle audio |
 
 Leave the camera alone for 20 seconds and it drifts into a slow cinematic orbit;
@@ -60,7 +61,10 @@ imports, which is what makes it fast to unit test in isolation (see `tests/`).
 Rendering code (`src/render/`, `src/input/`, `src/ui/`) listens for sim events and
 draws the current state — roads as extruded ribbon meshes staged by construction
 progress, scenery and traffic as instanced meshes, particles for dust/steam/rain — and
-never mutates sim state directly except through the draw and demolish tools. The
+never mutates sim state directly except through the draw and demolish tools. Rain also
+drives presentation-only road darkening and roughness so asphalt, gravel, earth, and paint
+respond differently without changing simulation state. The HUD summarizes each crew's
+multi-front progress and surfaces only meaningful completion/world milestones. The
 game loop (`src/core/loop.ts`) runs the simulation on a fixed timestep independent of
 the variable-rate render callback, so behavior stays consistent across machines and
 time-scale settings. For the full design rationale and the original task breakdown,

@@ -170,6 +170,11 @@ export class Atmosphere {
     return this.daylightValue;
   }
 
+  /** Eased presentation-only rain amount used by road materials and other visual consumers. */
+  get rainAmount(): number {
+    return this.rainIntensity;
+  }
+
   private buildClouds(): void {
     for (let i = 0; i < CLOUD_GROUP_COUNT; i++) {
       const puffCount = 3 + Math.floor(this.rng() * 3); // 3-5
