@@ -43,6 +43,7 @@ const START_SCREEN_CSS = `
     z-index: 100;
     overflow: hidden;
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
     color: var(--gw-paper);
     background: var(--gw-ink);
@@ -86,6 +87,8 @@ const START_SCREEN_CSS = `
     position: relative;
     z-index: 2;
     width: min(1180px, calc(100vw - 64px));
+    max-width: 100vw;
+    min-width: 0;
     min-height: min(690px, calc(100vh - 64px));
     display: flex;
     align-items: flex-end;
