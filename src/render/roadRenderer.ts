@@ -75,6 +75,27 @@ const CENTERLINE_WIDTH = 0.5;
 const CENTERLINE_COLOR = '#e8e4d8';
 const CENTERLINE_YLIFT = 0.24;
 
+// Phase 1 road-integration pass: a narrow compacted verge visually seats ground roads into the
+// terrain instead of letting the asphalt ribbon end at a razor edge. It begins with grading, uses
+// one wider ribbon underneath the surface, and is omitted on bridge runs (rails/deck own that edge).
+const SHOULDER_EXTRA_PER_SIDE = 1.35;
+const SHOULDER_WIDTH = ROAD_WIDTH + SHOULDER_EXTRA_PER_SIDE * 2;
+const SHOULDER_COLOR: Record<Exclude<Stage, 'surveyed'>, string> = {
+  graded: '#756044',
+  gravel: '#817b70',
+  paved: '#746f64',
+  painted: '#746f64',
+};
+const SHOULDER_Y_GAP = 0.025;
+
+// Two restrained wheel-polish bands on opened roads. Both strips are merged into one geometry,
+// keeping this detail to one draw call per painted range rather than one call per wheel path.
+const TIRE_WEAR_COLOR = '#202426';
+const TIRE_WEAR_WIDTH = 0.24;
+const TIRE_WEAR_OFFSET = ROAD_WIDTH * 0.22;
+const TIRE_WEAR_OPACITY = 0.18;
+const TIRE_WEAR_YLIFT = STAGE_YLIFT.painted + 0.018;
+
 const BRIDGE_COLOR = '#7a7a72';
 const BRIDGE_RAIL_WIDTH = 0.4;
 const BRIDGE_RAIL_HEIGHT = 0.8;
@@ -181,6 +202,7 @@ export function buildRibbonGeometry(
   yLift: number,
   from: number,
   to: number,
+  lateralOffset = 0,
 ): THREE.BufferGeometry {
   const geo = new THREE.BufferGeometry();
   if (samples.length < 2 || to <= from) return geo;
@@ -201,9 +223,11 @@ export function buildRibbonGeometry(
 
   const pushPair = (p: SamplePoint, perp: { px: number; pz: number }) => {
     const vi = positions.length / 3;
-    positions.push(p.x + perp.px * half, p.y + yLift, p.z + perp.pz * half);
+    const cx = p.x + perp.px * lateralOffset;
+    const cz = p.z + perp.pz * lateralOffset;
+    positions.push(cx + perp.px * half, p.y + yLift, cz + perp.pz * half);
     normals.push(0, 1, 0);
-    positions.push(p.x - perp.px * half, p.y + yLift, p.z - perp.pz * half);
+    positions.push(cx - perp.px * half, p.y + yLift, cz - perp.pz * half);
     normals.push(0, 1, 0);
     return vi;
   };
@@ -350,6 +374,23 @@ function findBridgeRuns(samples: RoadSample[]): BridgeRun[] {
   return runs;
 }
 
+/** Subtracts bridge arclength runs from [from,to], leaving only terrain-backed ranges suitable
+ * for shoulders. Conservative boundaries are intentional: a tiny missing verge at a bridge
+ * abutment reads better than a gravel strip floating beside the deck. */
+function groundRanges(samples: RoadSample[], from: number, to: number): Array<{ from: number; to: number }> {
+  const out: Array<{ from: number; to: number }> = [];
+  let cursor = from;
+  for (const run of findBridgeRuns(samples)) {
+    const runFrom = Math.max(from, run.fromDist);
+    const runTo = Math.min(to, run.toDist);
+    if (runTo <= runFrom) continue;
+    if (cursor < runFrom) out.push({ from: cursor, to: runFrom });
+    cursor = Math.max(cursor, runTo);
+  }
+  if (cursor < to) out.push({ from: cursor, to });
+  return out;
+}
+
 /**
  * Splits [from, to] into sub-ranges, clipping any portion that overlaps a bridge run to
  * `min(subRangeEnd, maskTo)` — i.e. a bridge run never draws its deck ribbon past `maskTo`,
@@ -419,6 +460,7 @@ export function getBridgeRunInfo(samples: RoadSample[]): BridgeRunInfo[] {
 /**
  * `offsetStrength` selects the polygon-offset bias applied toward the camera:
  *  - 'none'    — no offset (thin/decorative geometry that doesn't fight the terrain/ribbon).
+ *  - 'shoulder'— terrain verge underlay (-1), behind the road but ahead of coarse terrain.
  *  - 'ribbon'  — the full-width stage ribbons (graded/gravel/paved/painted), factor/units -2.
  *  - 'stripe'  — the painted centerline dashes: stronger than 'ribbon' (-4/-4) so the dashes
  *                reliably win the depth fight against BOTH the terrain and the asphalt ribbon
@@ -429,10 +471,10 @@ export function getBridgeRunInfo(samples: RoadSample[]): BridgeRunInfo[] {
 function makeStandardMaterial(
   color: string,
   opacity = 1,
-  offsetStrength: 'none' | 'ribbon' | 'stripe' = 'none',
+  offsetStrength: 'none' | 'shoulder' | 'ribbon' | 'stripe' = 'none',
 ): THREE.MeshStandardMaterial {
   const offset = offsetStrength !== 'none';
-  const magnitude = offsetStrength === 'stripe' ? -4 : offsetStrength === 'ribbon' ? -2 : 0;
+  const magnitude = offsetStrength === 'stripe' ? -4 : offsetStrength === 'ribbon' ? -2 : offsetStrength === 'shoulder' ? -1 : 0;
   return new THREE.MeshStandardMaterial({
     color,
     flatShading: true,
@@ -853,8 +895,10 @@ export class RoadRenderer {
   }
 
   /** The unclipped per-range body of `buildStageSegment` (see there for the masking wrapper). */
-  private buildStageRange(v: EdgeVisual, samples: RoadSample[], stage: Stage, from: number, to: number, advancing: boolean): void {
+  private buildStageRange(v: EdgeVisual, samples: RoadSample[], stage: Exclude<Stage, 'surveyed'>, from: number, to: number, advancing: boolean): void {
     if (to <= from) return;
+
+    this.buildShoulders(v, samples, stage, from, to);
 
     if (stage === 'paved' && advancing) {
       // Roller trails the paver by ROLLER_TRAIL_DISTANCE (see constructionRenderer.ts): everything
@@ -891,6 +935,7 @@ export class RoadRenderer {
     tagWeatherSurface(mesh, stage === 'graded' ? 'earth' : stage === 'gravel' ? 'gravel' : 'asphalt');
 
     if (stage === 'painted') {
+      this.buildTireWear(v, samples, from, to);
       const dashGeo = buildDashedRibbonGeometry(samples, CENTERLINE_WIDTH, CENTERLINE_YLIFT, from, to, 2);
       const dashMat = makeStandardMaterial(CENTERLINE_COLOR, 1, 'stripe');
       // Wet-sheen (Task 26 deliverable 5): fresh center dashes get a brief gloss right after
@@ -901,6 +946,34 @@ export class RoadRenderer {
       dashMesh.userData.wetPaint = true;
       tagWeatherSurface(dashMesh, 'paint');
     }
+  }
+
+  private buildShoulders(v: EdgeVisual, samples: RoadSample[], stage: Exclude<Stage, 'surveyed'>, from: number, to: number): void {
+    const weatherKind: RoadSurfaceKind = stage === 'graded' ? 'earth' : 'gravel';
+    for (const range of groundRanges(samples, from, to)) {
+      const yLift = Math.max(0.015, STAGE_YLIFT[stage] - SHOULDER_Y_GAP);
+      const geo = buildRibbonGeometry(samples, SHOULDER_WIDTH, yLift, range.from, range.to);
+      const mat = makeStandardMaterial(SHOULDER_COLOR[stage], 1, 'shoulder');
+      mat.roughness = 1;
+      const mesh = this.addMesh(v, geo, mat);
+      mesh.userData.roadDetail = 'shoulder';
+      tagWeatherSurface(mesh, weatherKind);
+    }
+  }
+
+  private buildTireWear(v: EdgeVisual, samples: RoadSample[], from: number, to: number): void {
+    const left = buildRibbonGeometry(samples, TIRE_WEAR_WIDTH, TIRE_WEAR_YLIFT, from, to, TIRE_WEAR_OFFSET);
+    const right = buildRibbonGeometry(samples, TIRE_WEAR_WIDTH, TIRE_WEAR_YLIFT, from, to, -TIRE_WEAR_OFFSET);
+    const geo = mergeGeometries([left, right]);
+    left.dispose();
+    right.dispose();
+
+    const mat = makeStandardMaterial(TIRE_WEAR_COLOR, TIRE_WEAR_OPACITY, 'stripe');
+    mat.roughness = 0.72;
+    mat.depthWrite = false;
+    const mesh = this.addMesh(v, geo, mat);
+    mesh.userData.roadDetail = 'tireWear';
+    tagWeatherSurface(mesh, 'asphalt');
   }
 
   /**

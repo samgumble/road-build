@@ -72,6 +72,10 @@ assuming a green build means the page is live.
 - Rain darkens and lowers the roughness of existing road materials by surface type. Dry weather
   is an exact authored-material reset, and fresh asphalt/paint curing composes with wetness rather
   than being overwritten by it.
+- Road-integration visual pass: every non-survey ground stage renders a wider, lower shoulder
+  ribbon under the authoritative road surface; bridge runs are subtracted so verges never float
+  beside decks. Painted roads add two tire-wear strips merged into one geometry/draw call. Both
+  detail types are tagged into the existing weather lifecycle and disposed through `EdgeVisual.meshes`.
 - Generated title presentation: `public/art/groundwork-title-dawn.jpg` plus a phone-specific crop,
   with source intent/provenance in `public/art/README.md`. `StartScreen` keeps the sim paused and
   the HUD inert until Continue/Enter/Space, then unlocks audio and crossfades into the ready world.
@@ -97,6 +101,8 @@ assuming a green build means the page is live.
   resume must continue from the frozen accumulator with no elapsed-time catch-up.
 - **Scenery footprints:** Any new scenery type larger than a point needs footprint-aware placement
   and corridor clearing; do not reuse the field/tree center-distance rule blindly.
+- **Road detail layering:** Keep shoulder polygon offset weaker than the road ribbon and omit it on
+  bridge arclength ranges. Decorative wear must remain presentation-only and share mesh disposal.
 
 ## Current improvement backlog
 

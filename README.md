@@ -69,7 +69,10 @@ draws the current state — roads as extruded ribbon meshes staged by constructi
 progress, scenery and traffic as instanced meshes, particles for dust/steam/rain — and
 never mutates sim state directly except through the draw and demolish tools. Rain also
 drives presentation-only road darkening and roughness so asphalt, gravel, earth, and paint
-respond differently without changing simulation state. The HUD summarizes each crew's
+respond differently without changing simulation state. Terrain-backed roads gain compacted
+stage-aware shoulders from grading onward, while opened asphalt carries restrained paired tire
+wear; shoulders stop at bridge decks and both details reuse the existing weather/material lifecycle.
+The HUD summarizes each crew's
 multi-front progress and surfaces only meaningful completion/world milestones. The
 game loop (`src/core/loop.ts`) runs the simulation on a fixed timestep independent of
 the variable-rate render callback, so behavior stays consistent across machines and
