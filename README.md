@@ -20,6 +20,8 @@ occasionally, and you can just let it run.
 | Scroll wheel | Zoom, dollying toward the point under the cursor |
 | Toolbar: Draw / Demolish | Switch the active tool (click the active one again to deselect) |
 | Toolbar: 1× / 4× / 16× | Simulation speed |
+| Toolbar: Pause / Resume, or Space | Freeze/resume the simulation without losing your view |
+| Toolbar: Guide, or H / ? | Open the live site overview and control reference |
 | Toolbar: New World | Start a fresh island from a seed |
 | Toolbar: Photo | Save a PNG screenshot of the current view |
 | Toolbar: Mute | Toggle audio |
@@ -63,7 +65,8 @@ game loop (`src/core/loop.ts`) runs the simulation on a fixed timestep independe
 the variable-rate render callback, so behavior stays consistent across machines and
 time-scale settings. For the full design rationale and the original task breakdown,
 see `docs/superpowers/specs/2026-07-02-groundwork-zen-road-builder-design.md` and
-`docs/superpowers/plans/2026-07-02-groundwork-implementation.md`.
+`docs/superpowers/plans/2026-07-02-groundwork-implementation.md`. For a concise handoff for
+future contributors or coding agents, start with [`docs/HANDOFF.md`](docs/HANDOFF.md).
 
 ## Credits
 
@@ -79,7 +82,9 @@ See the `LICENSE.txt` alongside each asset directory for the exact file list and
 license text. No attribution is required by CC0, but it's given here anyway because
 Kenney's packs are consistently excellent and worth pointing people to.
 
-Audio is fully synthesized at runtime (Web Audio), no licensed samples.
+Construction, traffic, weather, and wildlife audio is synthesized at runtime with Web Audio.
+The optional ambient music rotation uses bundled CC0 tracks; full provenance is in
+`public/music/LICENSE.txt`.
 
 ## License
 

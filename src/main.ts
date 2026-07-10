@@ -293,6 +293,15 @@ function main(): void {
     renderFrame,
     canvas,
     audio,
+    getSiteOverview: () => ({
+      roads: graph.edges.size,
+      scheduledJobs: buildQueue.queueLength,
+      activeCrews: buildQueue.activeCrewCount,
+      cars: traffic.cars.length,
+      homes: growth.houseCount,
+      buildings: growth.spawned.filter((record) => record.kind === 'building').length,
+      paused: loop.isPaused,
+    }),
     onNewWorld: (newSeed) => {
       // Each seed owns its own save slot (starting empty for a seed that's never been visited),
       // so there's nothing to clear here — just navigate. `main()`'s boot sequence on the new
@@ -303,6 +312,7 @@ function main(): void {
     },
   });
   hud.suppressHintIfRoadsExist(restoredRoads);
+  document.addEventListener('keydown', (event) => hud.handleKeyboardShortcut(event));
 
   const save = () => {
     try {

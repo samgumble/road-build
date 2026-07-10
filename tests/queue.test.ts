@@ -53,6 +53,20 @@ const run = (queue: BuildQueue, seconds: number) => {
 };
 
 describe('BuildQueue', () => {
+  it('reports active crews and pending jobs separately for site-status UI', () => {
+    const bus = new EventBus();
+    const hf = new Heightfield('q-status', bus);
+    const graph = new RoadGraph(bus, makeSampler(hf));
+    const queue = new BuildQueue(graph, hf, bus);
+    for (const anchor of findParallelAnchors(hf, 32, MAX_CREWS + 1)) {
+      graph.commitChain([anchor, { x: anchor.x + 32, z: anchor.z }]);
+    }
+
+    expect((queue as unknown as { activeCrewCount: number }).activeCrewCount).toBe(MAX_CREWS);
+    expect((queue as unknown as { pendingJobCount: number }).pendingJobCount).toBe(1);
+    expect(queue.queueLength).toBe(MAX_CREWS + 1);
+  });
+
   it('advances an edge through all stages in order', () => {
     const { bus, queue, edgeId, graph } = setup();
     const stages: (Stage | 'removed')[] = [];

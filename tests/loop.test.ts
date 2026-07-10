@@ -16,4 +16,9 @@ describe('stepAccumulator', () => {
     // all 16 steps instead of being clamped to the unscaled cap of 8.
     expect(stepAccumulator(16 / 60, 1 / 60, Math.ceil(8 * 16)).steps).toBe(16);
   });
+  it('holds accumulated simulation time while paused', () => {
+    const r = stepAccumulator(0.05, 1 / 60, 8, true);
+    expect(r.steps).toBe(0);
+    expect(r.remainder).toBe(0);
+  });
 });

@@ -1,6 +1,7 @@
 import { SIM_DT } from './constants';
 
-export function stepAccumulator(acc: number, dt: number, maxSteps: number): { steps: number; remainder: number } {
+export function stepAccumulator(acc: number, dt: number, maxSteps: number, paused = false): { steps: number; remainder: number } {
+  if (paused) return { steps: 0, remainder: 0 };
   let steps = Math.floor(acc / dt);
   if (steps > maxSteps) steps = maxSteps;
   return { steps, remainder: Math.min(acc - steps * dt, dt) };
@@ -8,6 +9,7 @@ export function stepAccumulator(acc: number, dt: number, maxSteps: number): { st
 
 export class Loop {
   timeScale = 1;
+  private paused = false;
   private acc = 0;
   private last = 0;
   private raf = 0;
@@ -25,17 +27,32 @@ export class Loop {
   onBatchStart?: () => void;
   onBatchEnd?: () => void;
   constructor(private update: (dt: number) => void, private render: (alpha: number) => void) {}
+
+  get isPaused(): boolean { return this.paused; }
+
+  /** Pausing drops any interpolation remainder as well as fixed-step updates, so resuming never
+   * advances a partial stale frame or catches up wall-clock time spent reading the site guide. */
+  setPaused(paused: boolean): void {
+    this.paused = paused;
+    this.acc = 0;
+  }
+
+  togglePaused(): boolean {
+    this.setPaused(!this.paused);
+    return this.paused;
+  }
+
   start(): void {
     this.running = true;
     this.last = performance.now();
     const tick = (now: number) => {
       if (!this.running) return;
-      this.acc += Math.min((now - this.last) / 1000, 0.25) * this.timeScale;
+      if (!this.paused) this.acc += Math.min((now - this.last) / 1000, 0.25) * this.timeScale;
       this.last = now;
       // Scale the cap with timeScale: an unscaled cap of 8 silently throttles high HUD speeds
       // (e.g. 16x only ever running 8 of the 16 steps/frame it needs at 60Hz).
       const cap = Math.ceil(8 * Math.max(1, this.timeScale));
-      const { steps, remainder } = stepAccumulator(this.acc, SIM_DT, cap);
+      const { steps, remainder } = stepAccumulator(this.acc, SIM_DT, cap, this.paused);
       if (steps > 0) {
         this.onBatchStart?.();
         try {

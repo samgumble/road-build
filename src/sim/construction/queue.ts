@@ -224,8 +224,18 @@ export class BuildQueue {
     return this.crews.some((c) => c !== null);
   }
 
+  /** Active crew slots, exposed as a compact site-status metric without leaking job internals. */
+  get activeCrewCount(): number {
+    return this.crews.filter((c) => c !== null).length;
+  }
+
+  /** Jobs still waiting for a free crew; active work is intentionally excluded. */
+  get pendingJobCount(): number {
+    return this.queue.length;
+  }
+
   get queueLength(): number {
-    return this.queue.length + this.crews.filter((c) => c !== null).length;
+    return this.pendingJobCount + this.activeCrewCount;
   }
 
   /**

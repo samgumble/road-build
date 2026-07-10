@@ -85,6 +85,11 @@ const RESPONSIVE_CSS = `
     #gw-top-left .gw-ticker-line {
       font-size: 9px !important;
     }
+    #gw-guide-panel {
+      width: min(330px, calc(100vw - 32px)) !important;
+      max-height: calc(100vh - 32px);
+      overflow-y: auto;
+    }
   }
 `;
 
@@ -145,6 +150,28 @@ function baseButtonStyle(): Partial<CSSStyleDeclaration> {
   };
 }
 
+export interface SiteOverview {
+  roads: number;
+  scheduledJobs: number;
+  activeCrews: number;
+  cars: number;
+  homes: number;
+  buildings: number;
+  paused: boolean;
+}
+
+/** Compact, stable wording for the site guide's event-driven snapshot. Kept pure so the UI's
+ * player-facing language is regression-tested without requiring a DOM/WebGL environment. */
+export function formatSiteOverview(site: SiteOverview): string[] {
+  return [
+    `NETWORK  ${site.roads} ROAD${site.roads === 1 ? '' : 'S'}`,
+    `WORK      ${site.activeCrews} CREW${site.activeCrews === 1 ? '' : 'S'} · ${site.scheduledJobs} JOB${site.scheduledJobs === 1 ? '' : 'S'}`,
+    `TOWN      ${site.homes} HOME${site.homes === 1 ? '' : 'S'} · ${site.buildings} BUILDING${site.buildings === 1 ? '' : 'S'}`,
+    `TRAFFIC   ${site.cars} CAR${site.cars === 1 ? '' : 'S'}`,
+    `SIM       ${site.paused ? 'PAUSED' : 'RUNNING'}`,
+  ];
+}
+
 interface HudDeps {
   bus: EventBus;
   drawTool: DrawTool;
@@ -153,6 +180,7 @@ interface HudDeps {
   renderFrame: () => void;
   canvas: HTMLCanvasElement;
   audio: AmbientAudio;
+  getSiteOverview: () => SiteOverview;
   onNewWorld: (seed: string) => void;
 }
 
@@ -197,6 +225,11 @@ export class Hud {
   private drawBtn!: HTMLButtonElement;
   private demolishBtn!: HTMLButtonElement;
   private speedBtns: HTMLButtonElement[] = [];
+  private pauseBtn!: HTMLButtonElement;
+  private guideBtn!: HTMLButtonElement;
+  private guidePanel!: HTMLElement;
+  private guideOverviewLines: HTMLElement[] = [];
+  private guideOpen = false;
 
   private newWorldBtn!: HTMLButtonElement;
   private newWorldPanel!: HTMLElement;
@@ -225,6 +258,7 @@ export class Hud {
     injectResponsiveStyles();
     this.buildTopLeft();
     this.buildToolbar();
+    this.buildGuideOverlay();
     this.wireEvents();
   }
 
@@ -279,8 +313,10 @@ export class Hud {
     bar.appendChild(this.buildModeGroup());
     bar.appendChild(this.buildDivider());
     bar.appendChild(this.buildSpeedGroup());
+    bar.appendChild(this.buildPauseButton());
     bar.appendChild(this.buildDivider());
     bar.appendChild(this.buildNewWorldGroup());
+    bar.appendChild(this.buildGuideButton());
     bar.appendChild(this.buildPhotoButton());
     bar.appendChild(this.buildMusicButton());
     bar.appendChild(this.buildMuteButton());
@@ -352,6 +388,89 @@ export class Hud {
       btn.style.borderBottomColor = isActive ? ACCENT : 'transparent';
       btn.style.color = isActive ? ACCENT : TEXT;
     });
+  }
+
+  private buildPauseButton(): HTMLButtonElement {
+    const btn = el('button', { type: 'button' }, {
+      ...baseButtonStyle(),
+      borderBottom: '2px solid transparent',
+    });
+    btn.addEventListener('click', () => {
+      this.deps.loop.togglePaused();
+      this.syncControls();
+    });
+    this.pauseBtn = btn;
+    this.refreshPauseButton();
+    return btn;
+  }
+
+  private refreshPauseButton(): void {
+    const paused = this.deps.loop.isPaused;
+    setResponsiveLabel(this.pauseBtn, paused ? 'Resume' : 'Pause', paused ? 'PLAY' : 'PAUSE');
+    this.pauseBtn.style.borderBottomColor = paused ? ACCENT : 'transparent';
+    this.pauseBtn.style.color = paused ? ACCENT : TEXT;
+  }
+
+  private buildGuideButton(): HTMLButtonElement {
+    const btn = el('button', { type: 'button' }, {
+      ...baseButtonStyle(),
+      borderBottom: '2px solid transparent',
+    });
+    setResponsiveLabel(btn, 'Guide', 'GUIDE');
+    btn.addEventListener('click', () => this.toggleGuide());
+    this.guideBtn = btn;
+    return btn;
+  }
+
+  private buildGuideOverlay(): void {
+    const panel = el('section', { id: 'gw-guide-panel' }, {
+      display: 'none', position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+      width: '390px', background: PANEL_BG, border: `1px solid ${BORDER}`, borderRadius: '3px',
+      padding: '16px', pointerEvents: 'auto', zIndex: '2',
+    });
+
+    const header = el('div', {}, { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' });
+    header.appendChild(el('div', { textContent: 'SITE GUIDE' }, { ...labelStyle(), color: ACCENT, fontSize: '12px' }));
+    const close = el('button', { type: 'button', textContent: '×', ariaLabel: 'Close site guide' }, {
+      ...baseButtonStyle(), padding: '2px 8px', fontSize: '16px', lineHeight: '20px',
+    });
+    close.addEventListener('click', () => this.toggleGuide(false));
+    header.appendChild(close);
+    panel.appendChild(header);
+
+    const overview = el('div', {}, { display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '14px', padding: '10px', background: '#141516', border: `1px solid ${BORDER}` });
+    for (let i = 0; i < 5; i++) {
+      const line = el('div', { textContent: '' }, { ...labelStyle(), color: i === 4 ? ACCENT : TEXT });
+      this.guideOverviewLines.push(line);
+      overview.appendChild(line);
+    }
+    panel.appendChild(overview);
+
+    const sections: Array<[string, string[]]> = [
+      ['BUILD', ['DRAG TO SURVEY A ROAD', 'DRAW BACK TO THE START TO CLOSE A LOOP', 'DEMOLISH MODE REMOVES A SELECTED ROAD']],
+      ['CAMERA', ['RIGHT DRAG ORBITS · MIDDLE DRAG / WASD PANS', 'WHEEL ZOOMS · TWO FINGERS PAN / PINCH / TWIST']],
+      ['COMMAND', ['SPACE PAUSES OR RESUMES THE SIM', '1 / 4 / 6 SELECT 1× / 4× / 16× SPEED', 'H OR ? OPENS THIS GUIDE']],
+    ];
+    for (const [title, lines] of sections) {
+      panel.appendChild(el('div', { textContent: title }, { ...labelStyle(), color: TEXT_DIM, marginTop: '14px', marginBottom: '5px' }));
+      for (const line of lines) panel.appendChild(el('div', { textContent: line }, { ...labelStyle(), color: TEXT, fontSize: '10px', lineHeight: '1.5' }));
+    }
+    this.guidePanel = panel;
+    this.root.appendChild(panel);
+  }
+
+  private toggleGuide(force?: boolean): void {
+    this.guideOpen = force ?? !this.guideOpen;
+    this.guidePanel.style.display = this.guideOpen ? '' : 'none';
+    this.guideBtn.style.borderBottomColor = this.guideOpen ? ACCENT : 'transparent';
+    this.guideBtn.style.color = this.guideOpen ? ACCENT : TEXT;
+    if (this.guideOpen) this.refreshGuide();
+  }
+
+  private refreshGuide(): void {
+    if (!this.guideOpen) return;
+    const lines = formatSiteOverview(this.deps.getSiteOverview());
+    this.guideOverviewLines.forEach((line, i) => { line.textContent = lines[i] ?? ''; });
   }
 
   private buildNewWorldGroup(): HTMLElement {
@@ -488,6 +607,7 @@ export class Hud {
         this.stageByCrew.set(crew, stage);
       }
       this.updateTicker();
+      this.refreshGuide();
     });
     // The survey phase (see queue.ts) never fires `construction:stage` — a fresh build job walks
     // the surveyor the length of the edge purely via `construction:progress` events, and only
@@ -499,10 +619,16 @@ export class Hud {
       if (crew < 0 || stage !== 'surveyed' || this.stageByCrew.has(crew)) return;
       this.stageByCrew.set(crew, stage);
       this.updateTicker();
+      this.refreshGuide();
     });
     this.deps.bus.on('roads:edgeAdded', () => {
       this.dismissHint();
+      this.refreshGuide();
     });
+    this.deps.bus.on('roads:edgeRemoved', () => this.refreshGuide());
+    this.deps.bus.on('growth:spawn', () => this.refreshGuide());
+    this.deps.bus.on('growth:remove', () => this.refreshGuide());
+    this.deps.bus.on('growth:upgrade', () => this.refreshGuide());
   }
 
   /** Renders one line per crew with an entry in `stageByCrew` (indices in ascending crew order,
@@ -542,6 +668,38 @@ export class Hud {
   syncControls(): void {
     this.refreshModeButtons();
     this.refreshSpeedButtons();
+    this.refreshPauseButton();
+    this.refreshGuide();
+  }
+
+  /** Returns true when the key was consumed. Interactive text controls keep their native keys. */
+  handleKeyboardShortcut(event: KeyboardEvent): boolean {
+    const target = event.target;
+    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return false;
+    if (event.code === 'Space') {
+      event.preventDefault();
+      this.deps.loop.togglePaused();
+      this.syncControls();
+      return true;
+    }
+    if (event.key === 'Escape' && this.guideOpen) {
+      this.toggleGuide(false);
+      return true;
+    }
+    if (event.key === '?' || event.key.toLowerCase() === 'h') {
+      event.preventDefault();
+      this.toggleGuide();
+      return true;
+    }
+    const speeds: Record<string, number> = { '1': 1, '4': 4, '6': 16 };
+    const speed = speeds[event.key];
+    if (speed) {
+      event.preventDefault();
+      this.deps.loop.timeScale = speed;
+      this.syncControls();
+      return true;
+    }
+    return false;
   }
 }
 
