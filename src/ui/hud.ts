@@ -762,7 +762,7 @@ export class Hud {
 
     const sections: Array<[string, string[]]> = [
       ['BUILD', ['DRAG TO SURVEY A ROAD', 'DRAW BACK TO THE START TO CLOSE A LOOP', 'DEMOLISH MODE REMOVES A SELECTED ROAD']],
-      ['CAMERA', ['RIGHT DRAG ORBITS · MIDDLE DRAG / WASD PANS', 'WHEEL ZOOMS · TWO FINGERS PAN / PINCH / TWIST']],
+      ['CAMERA', ['RIGHT DRAG OR Q/E ORBITS · MIDDLE DRAG / WASD PANS', 'WHEEL ZOOMS · TWO FINGERS PAN / PINCH / TWIST']],
       ['COMMAND', ['SPACE PAUSES OR RESUMES THE SIM', '1 / 4 / 6 SELECT 1× / 4× / 16× SPEED', 'H OR ? OPENS THIS GUIDE']],
     ];
     for (const [title, lines] of sections) {

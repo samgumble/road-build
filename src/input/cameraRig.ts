@@ -17,6 +17,20 @@ const MAX_POLAR = Math.PI / 2 - 0.02; // don't go below horizon
 // touch gestures are built the same way rather than introducing a second input API).
 const PINCH_ZOOM_SENSITIVITY = 1.0; // multiplies the inverse distance-ratio applied to goalRadius
 const TWIST_ORBIT_SENSITIVITY = 1.0; // radians of azimuth per radian of measured twist
+const KEYBOARD_ORBIT_SPEED = 0.9; // rad/s; held Q/E action, integrated with frame dt
+
+/** Pure action integration used by CameraRig and tests. Q (left) and E (right) cancel when held
+ * together and integrate by dt, so one second of input turns the same amount at any frame rate. */
+export function keyboardOrbitDelta(rotateLeft: boolean, rotateRight: boolean, dt: number): number {
+  return ((rotateRight ? 1 : 0) - (rotateLeft ? 1 : 0)) * KEYBOARD_ORBIT_SPEED * Math.max(0, dt);
+}
+
+export function isEditableTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  const tag = el.tagName?.toLowerCase();
+  return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+}
 
 export class CameraRig {
   target = new THREE.Vector3(0, 0, 0);
@@ -36,6 +50,7 @@ export class CameraRig {
   private idleTimer = 0;
 
   private panKeys = { w: false, a: false, s: false, d: false };
+  private orbitKeys = { rotateLeft: false, rotateRight: false };
 
   private rightDown = false;
   private middleDown = false;
@@ -175,15 +190,29 @@ export class CameraRig {
     };
 
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isEditableTarget(e.target)) return;
       const k = e.key.toLowerCase();
       if (k === 'w' || k === 'a' || k === 's' || k === 'd') {
         this.registerInput();
         this.panKeys[k] = true;
+      } else if (k === 'q' || k === 'e') {
+        this.registerInput();
+        if (k === 'q') this.orbitKeys.rotateLeft = true;
+        else this.orbitKeys.rotateRight = true;
+        e.preventDefault();
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
       if (k === 'w' || k === 'a' || k === 's' || k === 'd') this.panKeys[k] = false;
+      if (k === 'q') this.orbitKeys.rotateLeft = false;
+      if (k === 'e') this.orbitKeys.rotateRight = false;
+    };
+    const onBlur = () => {
+      this.panKeys = { w: false, a: false, s: false, d: false };
+      this.orbitKeys = { rotateLeft: false, rotateRight: false };
+      this.rightDown = false;
+      this.middleDown = false;
     };
 
     el.addEventListener('pointerdown', onPointerDown);
@@ -193,6 +222,7 @@ export class CameraRig {
     el.addEventListener('wheel', onWheel, { passive: false });
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
 
     this.disposers.push(
       () => el.removeEventListener('contextmenu', onContextMenu),
@@ -203,6 +233,7 @@ export class CameraRig {
       () => el.removeEventListener('wheel', onWheel),
       () => window.removeEventListener('keydown', onKeyDown),
       () => window.removeEventListener('keyup', onKeyUp),
+      () => window.removeEventListener('blur', onBlur),
     );
   }
 
@@ -371,6 +402,12 @@ export class CameraRig {
       if (this.panKeys.s) this.goalTarget.addScaledVector(forward, panSpeed);
       if (this.panKeys.a) this.goalTarget.addScaledVector(right, -panSpeed);
       if (this.panKeys.d) this.goalTarget.addScaledVector(right, panSpeed);
+    }
+
+    const orbitDelta = keyboardOrbitDelta(this.orbitKeys.rotateLeft, this.orbitKeys.rotateRight, dt);
+    if (orbitDelta !== 0) {
+      this.registerInput();
+      this.goalAzimuth += orbitDelta;
     }
 
     // idle detection

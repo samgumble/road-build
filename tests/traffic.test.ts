@@ -52,6 +52,32 @@ describe('TrafficSim', () => {
     expect(sim.cars.length).toBeLessThanOrEqual(3);
     for (const c of sim.cars) expect(Number.isFinite(c.pos.x)).toBe(true);
   });
+
+  it('emits edge-entry traffic and marks a live-painted road first-used exactly once', () => {
+    const { bus, g, sim } = world();
+    const edgeId = [...g.edges.keys()][0];
+    const entries: Array<{ edgeId: number; firstUse: boolean }> = [];
+    bus.on('traffic:edgeEntered', ({ edgeId: entered, firstUse }) => entries.push({ edgeId: entered, firstUse }));
+    bus.emit('construction:stage', { edgeId, stage: 'painted', crew: 0 });
+    sim.targetPopulation = 4;
+    for (let i = 0; i < 60 * 20; i++) sim.update(1 / 60);
+
+    expect(entries.some((entry) => entry.edgeId === edgeId)).toBe(true);
+    expect(entries.filter((entry) => entry.edgeId === edgeId && entry.firstUse)).toHaveLength(1);
+  });
+
+  it('does not arm a false first-use ceremony from restore stage replay', () => {
+    const { bus, g, sim } = world();
+    const edgeId = [...g.edges.keys()][0];
+    const firstUses: number[] = [];
+    bus.on('traffic:edgeEntered', ({ edgeId: entered, firstUse }) => {
+      if (firstUse) firstUses.push(entered);
+    });
+    bus.emit('construction:stage', { edgeId, stage: 'painted', crew: -1 });
+    sim.targetPopulation = 2;
+    for (let i = 0; i < 60 * 10; i++) sim.update(1 / 60);
+    expect(firstUses).toEqual([]);
+  });
   it('cars never overlap below the hard gap on the same lane', () => {
     const { sim } = world();
     sim.targetPopulation = 6;

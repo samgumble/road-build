@@ -96,6 +96,45 @@ const TIRE_WEAR_OFFSET = ROAD_WIDTH * 0.22;
 const TIRE_WEAR_OPACITY = 0.18;
 const TIRE_WEAR_YLIFT = STAGE_YLIFT.painted + 0.018;
 
+const DITCH_WIDTH = 0.42;
+const DITCH_OFFSET = ROAD_WIDTH / 2 + SHOULDER_EXTRA_PER_SIDE + 0.48;
+const DITCH_COLOR = '#4d4937';
+const EDGE_WEAR_WIDTH = 0.18;
+const EDGE_WEAR_OFFSET = ROAD_WIDTH / 2 - 0.16;
+const OPENING_PULSE_DURATION = 1.6;
+
+/** Stable cosmetic hash in [0,1); never consumes simulation RNG state. */
+export function deterministicRoadDetail(edgeId: number, stationIndex: number): number {
+  let x = (Math.imul(edgeId + 1, 0x9e3779b1) ^ Math.imul(stationIndex + 17, 0x85ebca6b)) >>> 0;
+  x ^= x >>> 16;
+  x = Math.imul(x, 0x7feb352d) >>> 0;
+  x ^= x >>> 15;
+  return (x >>> 0) / 0x100000000;
+}
+
+export function surfaceDetailStations(edgeId: number, length: number): { patches: number[]; puddles: number[] } {
+  const patches: number[] = [];
+  const puddles: number[] = [];
+  let index = 0;
+  for (let d = 11; d < length - 5; d += 24, index++) {
+    if (deterministicRoadDetail(edgeId, index) > 0.22) patches.push(d + deterministicRoadDetail(edgeId, index + 100) * 4);
+  }
+  index = 0;
+  for (let d = 17; d < length - 5; d += 34, index++) {
+    if (deterministicRoadDetail(edgeId, index + 200) > 0.28) puddles.push(d + deterministicRoadDetail(edgeId, index + 300) * 3);
+  }
+  return { patches, puddles };
+}
+
+export function trafficWear(passCount: number): number {
+  if (passCount <= 0) return 0;
+  return Math.min(1, Math.log1p(passCount) / Math.log(41));
+}
+
+export function puddleOpacity(rainAmount: number, maxOpacity = 0.34): number {
+  return maxOpacity * Math.max(0, Math.min(1, rainAmount));
+}
+
 const BRIDGE_COLOR = '#7a7a72';
 const BRIDGE_RAIL_WIDTH = 0.4;
 const BRIDGE_RAIL_HEIGHT = 0.8;
@@ -569,6 +608,7 @@ interface EdgeVisual {
   gradedDemolish: boolean; // latest graded progress event's demolish flag (sinks pylons in reverse)
   bridgeMaskTo: number | null; // arclength (edge-absolute) the deck/rails may draw up to within bridge
                                // runs; null = no masking (unaffected — e.g. edge has no active gravel job)
+  openingPulseAt: number | null;
 }
 
 export class RoadRenderer {
@@ -579,6 +619,7 @@ export class RoadRenderer {
   // survives the throttled `rebuild()` cycle (see PylonRiseState/RailSettleState doc comments).
   private pylonRise = new Map<string, PylonRiseState>();
   private railSettle = new Map<string, RailSettleState>();
+  private trafficPasses = new Map<number, number>();
 
   constructor(
     private scene: THREE.Scene,
@@ -588,8 +629,16 @@ export class RoadRenderer {
   ) {
     bus.on('roads:edgeAdded', ({ edgeId }) => this.onEdgeAdded(edgeId));
     bus.on('roads:edgeRemoved', ({ edgeId }) => this.disposeEdge(edgeId));
-    bus.on('construction:stage', ({ edgeId, stage }) => this.onStage(edgeId, stage));
+    bus.on('construction:stage', ({ edgeId, stage, crew }) => this.onStage(edgeId, stage, crew));
     bus.on('construction:progress', ({ edgeId, stage, t, demolish }) => this.onProgress(edgeId, stage, t, demolish));
+    bus.on('traffic:edgeEntered', ({ edgeId, firstUse }) => {
+      this.trafficPasses.set(edgeId, (this.trafficPasses.get(edgeId) ?? 0) + 1);
+      const edge = this.graph.edges.get(edgeId);
+      if (!edge) return;
+      const visual = this.ensureVisual(edge);
+      if (firstUse) visual.openingPulseAt = this.clockSeconds;
+      this.applyTrafficAppearance(visual, edgeId);
+    });
   }
 
   private onEdgeAdded(edgeId: number): void {
@@ -598,7 +647,7 @@ export class RoadRenderer {
     this.rebuild(edge);
   }
 
-  private onStage(edgeId: number, stage: Stage | 'removed'): void {
+  private onStage(edgeId: number, stage: Stage | 'removed', crew = -1): void {
     if (stage === 'removed') {
       this.disposeEdge(edgeId);
       return;
@@ -641,6 +690,7 @@ export class RoadRenderer {
       // freshly laid right now.
       const vv = this.ensureVisual(edge);
       vv.wetPaintAt = this.clockSeconds;
+      if (crew >= 0) vv.openingPulseAt = this.clockSeconds;
     }
     // Bug fix (Task 22 critical finding): `ensureVisual`'s `gradedT` seed
     // (`edge.stage === 'surveyed' ? 0 : edge.length`) can never actually fire from anything but 0,
@@ -734,6 +784,7 @@ export class RoadRenderer {
         gradedT: edge.stage === 'surveyed' ? 0 : edge.length, // already past graded => pylons fully risen
         gradedDemolish: false,
         bridgeMaskTo: null,
+        openingPulseAt: null,
       };
       this.visuals.set(edge.id, v);
     }
@@ -936,6 +987,7 @@ export class RoadRenderer {
 
     if (stage === 'painted') {
       this.buildTireWear(v, samples, from, to);
+      this.buildSurfaceLife(v, samples, from, to);
       const dashGeo = buildDashedRibbonGeometry(samples, CENTERLINE_WIDTH, CENTERLINE_YLIFT, from, to, 2);
       const dashMat = makeStandardMaterial(CENTERLINE_COLOR, 1, 'stripe');
       // Wet-sheen (Task 26 deliverable 5): fresh center dashes get a brief gloss right after
@@ -958,6 +1010,17 @@ export class RoadRenderer {
       const mesh = this.addMesh(v, geo, mat);
       mesh.userData.roadDetail = 'shoulder';
       tagWeatherSurface(mesh, weatherKind);
+
+      const left = buildRibbonGeometry(samples, DITCH_WIDTH, Math.max(0.005, yLift - 0.04), range.from, range.to, DITCH_OFFSET);
+      const right = buildRibbonGeometry(samples, DITCH_WIDTH, Math.max(0.005, yLift - 0.04), range.from, range.to, -DITCH_OFFSET);
+      const ditchGeo = mergeGeometries([left, right]);
+      left.dispose();
+      right.dispose();
+      const ditchMat = makeStandardMaterial(DITCH_COLOR, 0.92, 'shoulder');
+      ditchMat.roughness = 1;
+      const ditch = this.addMesh(v, ditchGeo, ditchMat);
+      ditch.userData.roadDetail = 'ditch';
+      tagWeatherSurface(ditch, 'earth');
     }
   }
 
@@ -973,7 +1036,90 @@ export class RoadRenderer {
     mat.depthWrite = false;
     const mesh = this.addMesh(v, geo, mat);
     mesh.userData.roadDetail = 'tireWear';
+    mesh.userData.trafficReactive = true;
+    mesh.userData.minOpacity = TIRE_WEAR_OPACITY;
+    mesh.userData.maxOpacity = 0.34;
     tagWeatherSurface(mesh, 'asphalt');
+  }
+
+  private buildSurfaceLife(v: EdgeVisual, samples: RoadSample[], from: number, to: number): void {
+    const edgeId = v.group.userData.edgeId as number;
+    const terrainRanges = groundRanges(samples, from, to);
+    if (!terrainRanges.length) return;
+    const onGround = (distance: number) => terrainRanges.some((range) => distance >= range.from && distance <= range.to);
+    const details = surfaceDetailStations(edgeId, to);
+    const patches: THREE.BufferGeometry[] = [];
+    const puddles: THREE.BufferGeometry[] = [];
+
+    for (let i = 0; i < details.patches.length; i++) {
+      const d = details.patches[i];
+      if (d <= from || d >= to || !onGround(d)) continue;
+      const lateral = (deterministicRoadDetail(edgeId, i + 400) * 2 - 1) * 1.45;
+      patches.push(buildRibbonGeometry(samples, 1.1 + deterministicRoadDetail(edgeId, i + 500) * 1.4,
+        STAGE_YLIFT.painted + 0.022, Math.max(from, d - 1.2), Math.min(to, d + 1.2), lateral));
+    }
+    for (let i = 0; i < details.puddles.length; i++) {
+      const d = details.puddles[i];
+      if (d <= from || d >= to || !onGround(d)) continue;
+      const lateral = (deterministicRoadDetail(edgeId, i + 600) < 0.5 ? -1 : 1) * (ROAD_WIDTH / 2 - 0.65);
+      puddles.push(buildRibbonGeometry(samples, 0.75, STAGE_YLIFT.painted + 0.03,
+        Math.max(from, d - 1.6), Math.min(to, d + 1.6), lateral));
+    }
+
+    const edgeParts: THREE.BufferGeometry[] = [];
+    for (const range of terrainRanges) {
+      edgeParts.push(
+        buildRibbonGeometry(samples, EDGE_WEAR_WIDTH, STAGE_YLIFT.painted + 0.02, range.from, range.to, EDGE_WEAR_OFFSET),
+        buildRibbonGeometry(samples, EDGE_WEAR_WIDTH, STAGE_YLIFT.painted + 0.02, range.from, range.to, -EDGE_WEAR_OFFSET),
+      );
+    }
+    // Edge wear and repair patches share one restrained dark aggregate material and geometry, so
+    // surface variation costs one draw call per painted ground range rather than two.
+    const wearParts = [...edgeParts, ...patches];
+    const wearGeo = mergeGeometries(wearParts);
+    wearParts.forEach((part) => part.dispose());
+    const wearMat = makeStandardMaterial('#343739', 0.1, 'stripe');
+    wearMat.depthWrite = false;
+    const surfaceWear = this.addMesh(v, wearGeo, wearMat);
+    surfaceWear.userData.roadDetail = 'surfaceWear';
+    surfaceWear.userData.trafficReactive = true;
+    surfaceWear.userData.minOpacity = 0.1;
+    surfaceWear.userData.maxOpacity = 0.3;
+
+    if (puddles.length) {
+      const geo = mergeGeometries(puddles);
+      puddles.forEach((g) => g.dispose());
+      const mat = makeStandardMaterial('#607b84', 0, 'stripe');
+      mat.depthWrite = false;
+      mat.roughness = 0.08;
+      const mesh = this.addMesh(v, geo, mat);
+      mesh.userData.roadDetail = 'puddles';
+      mesh.userData.rainPuddle = true;
+      mesh.userData.maxOpacity = 0.34;
+    }
+
+    if (v.openingPulseAt !== null) {
+      const geo = buildRibbonGeometry(samples, ROAD_WIDTH - 0.25, STAGE_YLIFT.painted + 0.028, from, to);
+      const mat = makeStandardMaterial('#f2c36b', 0.16, 'stripe');
+      mat.depthWrite = false;
+      mat.emissive.set('#6b3b12');
+      mat.emissiveIntensity = 0.35;
+      const mesh = this.addMesh(v, geo, mat);
+      mesh.userData.roadDetail = 'openingPulse';
+    }
+
+    this.applyTrafficAppearance(v, edgeId);
+  }
+
+  private applyTrafficAppearance(v: EdgeVisual, edgeId: number): void {
+    const wear = trafficWear(this.trafficPasses.get(edgeId) ?? 0);
+    for (const mesh of v.meshes) {
+      if (!mesh.userData.trafficReactive) continue;
+      const mat = mesh.material as THREE.MeshStandardMaterial;
+      const lo = mesh.userData.minOpacity as number;
+      const hi = mesh.userData.maxOpacity as number;
+      mat.opacity = lo + (hi - lo) * wear;
+    }
   }
 
   /**
@@ -1148,6 +1294,7 @@ export class RoadRenderer {
     this.clearMeshes(v);
     this.scene.remove(v.group);
     this.visuals.delete(edgeId);
+    this.trafficPasses.delete(edgeId);
 
     // Bridge theater state (Task 22) is keyed by a prefix containing this edgeId — drop every
     // entry for it so a demolished/removed edge doesn't leak entries forever (an edge's id is
@@ -1197,6 +1344,11 @@ export class RoadRenderer {
       // frame, so colors/roughness never compound. This also means rain clearing is an exact
       // return to the pre-rain material rather than an approximation.
       for (const mesh of v.meshes) {
+        if (mesh.userData.rainPuddle) {
+          (mesh.material as THREE.MeshStandardMaterial).opacity =
+            puddleOpacity(rainAmount, mesh.userData.maxOpacity as number);
+          continue;
+        }
         const kind = mesh.userData.weatherSurface as RoadSurfaceKind | undefined;
         if (!kind) continue;
         const material = mesh.material as THREE.MeshStandardMaterial;
@@ -1204,6 +1356,16 @@ export class RoadRenderer {
         const appearance = wetRoadAppearance(kind, rainAmount, dryRoughness);
         material.color.setHex(mesh.userData.dryColor as number).multiplyScalar(appearance.colorScale);
         material.roughness = appearance.roughness;
+      }
+
+      if (v.openingPulseAt !== null) {
+        const u = (this.clockSeconds - v.openingPulseAt) / OPENING_PULSE_DURATION;
+        for (const mesh of v.meshes) {
+          if (mesh.userData.roadDetail === 'openingPulse') {
+            (mesh.material as THREE.MeshStandardMaterial).opacity = 0.16 * Math.max(0, 1 - u);
+          }
+        }
+        if (u >= 1) v.openingPulseAt = null;
       }
     }
 

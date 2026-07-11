@@ -61,4 +61,21 @@ describe('road integration details', () => {
     const group = renderedEdge('painted', true);
     expect(group.children.some((child) => child.userData.roadDetail === 'shoulder')).toBe(false);
   });
+
+  it('cuts shallow drainage ditches outside both ground-road shoulders', () => {
+    const group = renderedEdge('graded');
+    const ditch = group.children.find((child) => child.userData.roadDetail === 'ditch') as THREE.Mesh;
+    expect(ditch).toBeTruthy();
+    ditch.geometry.computeBoundingBox();
+    const bounds = ditch.geometry.boundingBox!;
+    expect(bounds.max.z - bounds.min.z).toBeGreaterThan(ROAD_WIDTH + 3);
+    expect(ditch.userData.weatherSurface).toBe('earth');
+  });
+
+  it('does not float drainage ditches beside bridge decks', () => {
+    const group = renderedEdge('painted', true);
+    expect(group.children.some((child) => child.userData.roadDetail === 'ditch')).toBe(false);
+    expect(group.children.some((child) => child.userData.roadDetail === 'surfaceWear')).toBe(false);
+    expect(group.children.some((child) => child.userData.roadDetail === 'puddles')).toBe(false);
+  });
 });

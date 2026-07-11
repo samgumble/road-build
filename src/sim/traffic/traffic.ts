@@ -260,6 +260,7 @@ export class TrafficSim {
   private nextId = 1;
   private spawnTimer = 0;
   private junctionLocks = new Map<number, number>(); // nodeId -> carId holding the lock
+  private awaitingFirstUse = new Set<number>();
 
   // Task 32: settlement positions accumulated from growth:spawn (houses/buildings only), used to
   // build a per-node weight map for trip-endpoint selection. Recompute is throttled the same way
@@ -281,11 +282,16 @@ export class TrafficSim {
 
   constructor(
     private graph: RoadGraph,
-    bus: EventBus,
+    private bus: EventBus,
     private rng: () => number,
   ) {
     this.lg = buildLaneGraph(this.graph);
     bus.on('roads:changed', () => this.onRoadsChanged());
+    bus.on('roads:edgeRemoved', ({ edgeId }) => this.awaitingFirstUse.delete(edgeId));
+    bus.on('construction:stage', ({ edgeId, stage, crew }) => {
+      if (stage === 'painted' && crew >= 0) this.awaitingFirstUse.add(edgeId);
+      else if (stage === 'removed') this.awaitingFirstUse.delete(edgeId);
+    });
     bus.on('growth:spawn', (e) => {
       if (e.kind === 'house') this.houses.push({ x: e.x, z: e.z, id: e.id });
       else if (e.kind === 'building') this.buildings.push({ x: e.x, z: e.z, id: e.id });
@@ -452,6 +458,13 @@ export class TrafficSim {
       boxBlockedSeconds: 0,
     };
     this.cs.push(car);
+    this.emitEdgeEntered(car, picked.route[0]);
+  }
+
+  private emitEdgeEntered(car: Car, lane: Lane): void {
+    const firstUse = this.awaitingFirstUse.delete(lane.edgeId);
+    const { pos } = sampleLane(lane, car.s);
+    this.bus.emit('traffic:edgeEntered', { edgeId: lane.edgeId, carId: car.id, pos, firstUse });
   }
 
   /** Nearest car ahead of `c` on the same lane (larger `s`), or null if none. */
@@ -667,6 +680,7 @@ export class TrafficSim {
         const nextLane = c.route[c.routeIndex];
         c.laneId = nextLane.id;
         c.s = overflow;
+        if (nextLane.edgeId !== lane.edgeId) this.emitEdgeEntered(c, nextLane);
       }
 
       // Release lock once `releaseAt(currentLane)` into the (possibly just-entered) next lane.

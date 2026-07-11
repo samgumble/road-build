@@ -76,6 +76,21 @@ assuming a green build means the page is live.
   ribbon under the authoritative road surface; bridge runs are subtracted so verges never float
   beside decks. Painted roads add two tire-wear strips merged into one geometry/draw call. Both
   detail types are tagged into the existing weather lifecycle and disposed through `EdgeVisual.meshes`.
+- Roadside-realism pass: ground roads add shallow drainage ditches; a fixed 11-pool instanced
+  `RoadsideRenderer` derives culverts, retaining walls, guardrails, curve reflectors, junction
+  signs/aprons, settlement utility poles, and gravel scatter from graph/terrain/growth context.
+  Props are deterministic presentation state, skip bridge samples, and rebuild only on relevant
+  road-stage/topology or settlement events.
+- Painted surfaces now derive deterministic patches, edge wear, and rain-only puddles from stable
+  edge ids. `TrafficSim` emits `traffic:edgeEntered`; `RoadRenderer` uses bounded per-edge counts to
+  deepen wear while audio/road presentation recognize the first real vehicle to use a newly opened
+  road. This cosmetic aging intentionally resets on reload and does not change the save schema.
+- Road completion uses the construction renderer's existing machinery/cone/light wind-down, plus
+  an edge-local opening sheen, a restrained completion chord, and one first-use chime. Restore
+  stage replay (`crew: -1`) never arms a false ceremony.
+- Q/E are held keyboard orbit actions in `CameraRig`, integrated by frame `dt`, cancelled when both
+  are held, ignored while editing text, and cleared on window blur. Existing RMB/touch orbit paths
+  remain unchanged.
 - Generated title presentation: `public/art/groundwork-title-dawn.jpg` plus a phone-specific crop,
   with source intent/provenance in `public/art/README.md`. `StartScreen` keeps the sim paused and
   the HUD inert until Continue/Enter/Space, then unlocks audio and crossfades into the ready world.

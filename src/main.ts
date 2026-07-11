@@ -5,6 +5,7 @@ import { Heightfield } from './sim/terrain/heightfield';
 import { createScene } from './render/scene';
 import { TerrainRenderer } from './render/terrainRenderer';
 import { RoadRenderer } from './render/roadRenderer';
+import { RoadsideRenderer } from './render/roadsideRenderer';
 import { CameraRig } from './input/cameraRig';
 import { DrawTool } from './input/drawTool';
 import { RoadGraph } from './sim/roads/graph';
@@ -144,6 +145,7 @@ function main(): void {
 
   const growth = new GrowthSim(graph, hf, bus, createRng('growth-' + hf.seed));
   const sceneryRenderer = new SceneryRenderer(scene, hf, bus);
+  const roadsideRenderer = new RoadsideRenderer(scene, graph, hf, bus);
 
   // Task 31: ambient wilderness — sparse seeded trees scattered across the island, generated
   // deterministically from the same seed as the Heightfield. Unlike GrowthSim's road-driven
@@ -285,6 +287,8 @@ function main(): void {
   // round fix wave): `active`'s compacted array silently misindexed any live `wilderness:cleared`
   // that arrived after a restore had already pre-cleared >= 1 site.
   sceneryRenderer.setWilderness(wildernessSim.activeWithIndex);
+  // Seed settlement-aware utility poles after restore (live growth events keep this current).
+  roadsideRenderer.setSettlements(growth.spawned);
 
   const navigateToSeed = (newSeed: string) => {
     // Each seed owns its own save slot (starting empty for a seed that's never been visited),

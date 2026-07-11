@@ -20,6 +20,7 @@ same slate, paper, and safety-orange visual language through construction status
 | LMB drag (on terrain) | Survey a new road — release to commit it, or let go somewhere invalid and the preview fades |
 | LMB click (Demolish mode) | Remove the road under the cursor; the crew tears it up in reverse |
 | RMB drag | Orbit the camera |
+| Q / E | Rotate the camera left / right |
 | MMB drag, or W/A/S/D | Pan the camera |
 | Scroll wheel | Zoom, dollying toward the point under the cursor |
 | Toolbar: Draw / Demolish | Switch the active tool (click the active one again to deselect) |

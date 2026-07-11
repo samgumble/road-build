@@ -10,6 +10,10 @@ export interface GameEvents {
   // near the stockpile, vehicles idle) via this flag rather than inferring it from a lack of
   // position change.
   'construction:progress': { edgeId: number; stage: Stage; t: number; pos: V3; heading: number; vehicle: VehicleKind; demolish: boolean; crew: number; onBreak: boolean };
+  // Presentation-facing traffic lifecycle: emitted once when a car spawns onto or transitions
+  // into a different road edge. `firstUse` is true exactly once for a road that was painted by a
+  // live crew (restore replay uses crew=-1 and deliberately does not arm a ceremony).
+  'traffic:edgeEntered': { edgeId: number; carId: number; pos: V3; firstUse: boolean };
   'terrain:deformed': { minI: number; minJ: number; maxI: number; maxJ: number };
   // `id` (Task 35, additive): stable per-record id, monotonic within a GrowthSim instance and
   // persisted in saves — lets upgrade/stranded-decay events (below) reference a specific record

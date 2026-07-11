@@ -112,6 +112,11 @@ const CRICKET_GAIN_DB = -24;
 // layers still need the same "this crew is still working" liveness window it defined.
 const CREW_ACTIVE_RELEASE = 1.2; // seconds of silence-from-last-progress before a crew reads as idle
 const BLIP_GAIN_DB = -18;
+
+export function roadStageCue(stage: string): 'none' | 'progress' | 'complete' {
+  if (stage === 'removed') return 'none';
+  return stage === 'painted' ? 'complete' : 'progress';
+}
 const BEEPER_FREQ = 880;
 const BEEPER_HZ = 1.2; // pulses per second
 const BEEPER_GAIN_DB = -26;
@@ -269,6 +274,9 @@ export class AmbientAudio {
   constructor(private bus: EventBus) {
     this.bus.on('construction:stage', (payload) => this.onConstructionStage(payload));
     this.bus.on('construction:progress', (payload) => this.onConstructionProgress(payload));
+    this.bus.on('traffic:edgeEntered', ({ firstUse }) => {
+      if (firstUse) this.playFirstUseChime();
+    });
     window.addEventListener('construction:graderScrape', this.onGraderScrape);
   }
 
@@ -540,10 +548,55 @@ export class AmbientAudio {
     this.crewProgress.set(payload.crew, { at: this.clockTime, x: payload.pos.x, demolish: payload.demolish });
   }
 
-  private onConstructionStage(payload: { stage: string }): void {
+  private onConstructionStage(payload: { stage: string; crew?: number }): void {
     if (!this.ctx || !this.sfxBus) return;
-    if (payload.stage === 'removed') return;
-    this.playStageBlip();
+    const cue = roadStageCue(payload.stage);
+    if (cue === 'none') return;
+    if (cue === 'complete' && (payload.crew ?? 0) >= 0) this.playCompletionSwell();
+    else this.playStageBlip();
+  }
+
+  private playCompletionSwell(): void {
+    const ctx = this.ctx;
+    const destination = this.sfxBus;
+    if (!ctx || !destination) return;
+    const now = ctx.currentTime;
+    const notes = [392, 493.88, 587.33]; // G4, B4, D5 — warmer/lower than the normal stage blip
+    notes.forEach((freq, i) => {
+      const startAt = now + i * 0.11;
+      const osc = ctx.createOscillator();
+      osc.type = i === 0 ? 'triangle' : 'sine';
+      osc.frequency.value = freq;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0, startAt);
+      g.gain.linearRampToValueAtTime(dbToGain(BLIP_GAIN_DB - 2), startAt + 0.025);
+      g.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.75);
+      osc.connect(g);
+      g.connect(destination);
+      osc.start(startAt);
+      osc.stop(startAt + 0.8);
+      osc.onended = () => { osc.disconnect(); g.disconnect(); };
+    });
+  }
+
+  private playFirstUseChime(): void {
+    const ctx = this.ctx;
+    const destination = this.sfxBus;
+    if (!ctx || !destination) return;
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(783.99, now);
+    osc.frequency.exponentialRampToValueAtTime(987.77, now + 0.18);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0, now);
+    g.gain.linearRampToValueAtTime(dbToGain(BLIP_GAIN_DB - 8), now + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
+    osc.connect(g);
+    g.connect(destination);
+    osc.start(now);
+    osc.stop(now + 0.46);
+    osc.onended = () => { osc.disconnect(); g.disconnect(); };
   }
 
   private playStageBlip(): void {
