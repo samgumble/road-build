@@ -135,6 +135,19 @@ These are deliberately uncommitted product directions, not known blockers:
    focus/backdrop behavior was correct. Localhost automation was policy-blocked, so that check used
    the published GitHub Pages build after its workflow passed.
 
+## Latest release verification — 2026-07-10
+
+- Commit `fe59de7` is on `origin/main`; GitHub Pages run `29134423122` completed successfully.
+- Local and CI verification: 33 Vitest files / 283 tests pass; `tsc --noEmit` and Vite production
+  build pass. The existing bundle-size advisory remains non-blocking.
+- Published smoke test used a clean `roadside-check-fe59de7` seed with development paused: a road
+  built through the full stage train, emitted the Road Open milestone, accepted traffic, rendered
+  seated shoulders/ditches/surface wear without scenery overlap, and produced no console errors.
+- Desktop HUD/title and a 375×812 responsive viewport were checked; document width stayed exactly
+  375px with no horizontal overflow. The in-app browser's live viewport-resize screenshot briefly
+  showed a partial WebGL frame until reload, but a clean-size reload and prior mobile checks cover
+  layout; keep real-device WebGL resize in the standing mobile QA checklist.
+
 ## Review checklist
 
 - Scope the diff to the owning subsystem and preserve unrelated local changes.
@@ -143,3 +156,34 @@ These are deliberately uncommitted product directions, not known blockers:
 - If changing UI, check desktop and a narrow mobile viewport; make keyboard shortcuts ignore text
   fields and keep controls accessible.
 - After deployment, verify the GitHub Pages URL rather than only the local build.
+
+## Next program — Living Towns + Art Upgrade (planned 2026-07-11)
+
+- Master release map: `docs/superpowers/plans/2026-07-11-living-towns-roadmap.md`.
+- Road smoothing/planning/undo: `docs/superpowers/plans/2026-07-11-road-craft.md`.
+- Settlement morphology, pacing, traffic insight, objectives, and landmarks:
+  `docs/superpowers/plans/2026-07-11-living-towns-experience.md`.
+- Model, animation, atmosphere, graphics, and camera work:
+  `docs/superpowers/plans/2026-07-11-model-animation-graphics.md`.
+
+The first Road Craft slice is implemented locally but not committed at the time of this handoff:
+
+- `smoothRoadCenterline` in `src/sim/roads/path.ts` applies two conservative local smoothing
+  passes to short hand-drawn snap jitter, then bounded quadratic corner fillets. `RoadEdge.ctrl`
+  remains snapped/topology-authoritative and saved exactly as before; only derived samples change.
+- Exact edge endpoints, loop/junction nodes, preview geometry, road ribbons, construction paths,
+  terrain grading, and traffic lanes all stay on one shared sample pipeline. Two-point roads retain
+  the legacy sample distribution because the terrain clamp regression suite depends on it and
+  they contain no intermediate wobble to improve.
+- Added 3 tests: endpoint/jitter smoothing, bounded right-angle rounding, and lane steering from
+  the smoothed centerline. All 33 test files pass and `npm run build` is green. The bundle-size
+  advisory remains the same non-blocking warning.
+- Local browser smoke check loaded an existing save through the new sampler with no console errors;
+  the already-built loop network remained connected and visually smooth. No save migration is
+  required.
+- Road/bridge continuity is part of the same local Road Craft slice. `RoadRenderer` now folds
+  full-width endpoint disks into each completed surface ribbon's existing geometry, closing the
+  triangular hole between two butt-ended edge groups at degree-2 corners without adding draw
+  calls. `ConstructionRenderer` lets a final active bridge span finish its descend+bounce after
+  gravel progress leaves the run; the old 0.2s liveness cleanup could strand a short final span's
+  mask forever at the prior 16u boundary. `tests/roadContinuity.test.ts` reproduces both failures.

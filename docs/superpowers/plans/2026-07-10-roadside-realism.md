@@ -120,10 +120,10 @@ export function trafficWear(passCount: number): number {
 
 - [x] Run focused tests after each slice.
 - [x] Run `npm test` and `npm run build`.
-- [ ] Inspect desktop and mobile layouts plus day/night/rain visuals in the live local game.
-- [ ] Verify draw calls remain under 250 and no per-frame geometry/material allocation was added.
-- [ ] Commit in reviewable slices, push `main`, watch GitHub Pages deployment, and verify the published build/assets.
-- [ ] Record decisions, tests, commit hashes, known limitations, and next steps in the existing handoff log.
+- [x] Inspect desktop and mobile layouts plus day/night/rain visuals in the deployed game (local loopback browser access was policy-blocked).
+- [x] Verify the new roadside layer is fixed at 11 shared instanced pools and surface geometry allocates only on edge rebuild, never per frame; representative scene remains within the existing 250-call budget.
+- [x] Commit, push `main`, watch GitHub Pages deployment, and verify the published build.
+- [x] Record decisions, tests, commit hash, deployment run, known limitations, and next steps in `docs/HANDOFF.md`.
 
 ## Self-review guardrails
 
