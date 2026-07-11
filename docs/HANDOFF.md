@@ -166,7 +166,8 @@ These are deliberately uncommitted product directions, not known blockers:
 - Model, animation, atmosphere, graphics, and camera work:
   `docs/superpowers/plans/2026-07-11-model-animation-graphics.md`.
 
-The first Road Craft slice is implemented locally but not committed at the time of this handoff:
+The first Road Craft slice shipped in `3baa112`; the program plans and this handoff shipped in
+`c65c603`:
 
 - `smoothRoadCenterline` in `src/sim/roads/path.ts` applies two conservative local smoothing
   passes to short hand-drawn snap jitter, then bounded quadratic corner fillets. `RoadEdge.ctrl`
@@ -187,3 +188,36 @@ The first Road Craft slice is implemented locally but not committed at the time 
   calls. `ConstructionRenderer` lets a final active bridge span finish its descend+bounce after
   gravel progress leaves the run; the old 0.2s liveness cleanup could strand a short final span's
   mask forever at the prior 16u boundary. `tests/roadContinuity.test.ts` reproduces both failures.
+- GitHub Pages run `29154017546` passed its test/build/deploy jobs. The published smoke check loaded
+  `assets/index-CTYerQ0x.js` at `https://samgumble.github.io/road-build/` with no console errors.
+
+## Current local slice — Living Towns / connected junctions / asset uplift (2026-07-11)
+
+This slice is fully implemented and locally verified but should only be marked deployed after its
+commit is pushed and the Pages workflow finishes:
+
+- `GrowthSim` receives an independent morphology seed from `main.ts`. A pure, coordinate-derived
+  two-octave field forms dense settlement pockets and quiet rural gaps; painted degree-3 junctions
+  raise the nearby density floor. No save migration is required and legacy direct test callers keep
+  the previous pacing when no morphology seed is supplied.
+- `RoadGraph.magnetSnap` can target the sampled centerline of a two-control-point road. Committing
+  there inserts a control point, replaces the original edge with two normal edges, and shares the
+  resulting node with the new branch. Lane tests prove routes traverse the new T-junction both ways.
+- Painted center stripes trim back 5u at degree-3+ endpoints; existing junction aprons and the
+  endpoint-cap surface geometry now read as a deliberate clean intersection instead of overlapping
+  dash fragments.
+- `ROAD_ENGINEERED_HALF_WIDTH` is the shared asphalt + shoulder + ditch + margin footprint.
+  `GrowthSim` and `WildernessSim` clear inside that whole corridor, preventing trees and field grass
+  from surviving on road shoulders or drainage ditches.
+- Construction dirt marks now match physical contacts: four patches for wheeled trucks/liners, two
+  continuous crawler tracks for excavators/pavers, six wheel patches for graders, and two roller
+  drum contacts. Painted roadway wear renders four merged strips (two wheel paths per direction).
+- `SceneryRenderer` expands the six shipped source GLBs into 21 deterministic instanced variants:
+  9 tree, 8 house, and 4 building looks using authored PBR material clones, grounded palettes, and
+  silhouette proportion changes. This increases variety without new downloads or per-frame allocs.
+- Verification: 36 Vitest files / 301 tests pass; `npm run build` passes (the existing 500kB chunk
+  advisory remains non-blocking). A local 1x/16x browser smoke test loaded an established town in
+  night and daylight, showed the expanded tree/building silhouettes, and produced no console errors.
+- New focused coverage: graph centerline splitting, bidirectional lane routing, junction stripe
+  cleanup, settlement morphology determinism/junction boost, full engineered-corridor clearing,
+  vehicle contact layouts, roadway wear symmetry, and runtime model-style counts.

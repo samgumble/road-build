@@ -4,7 +4,7 @@ import { EventBus } from '../../core/events';
 import { RoadGraph } from '../roads/graph';
 import { Heightfield } from '../terrain/heightfield';
 import { sampleHeadingAt } from '../roads/path';
-import { GRID_SIZE, CELL, WORLD_SIZE, ROAD_WIDTH } from '../../core/constants';
+import { GRID_SIZE, CELL, WORLD_SIZE, ROAD_ENGINEERED_HALF_WIDTH, ROAD_WIDTH } from '../../core/constants';
 
 const GRADED_INDEX = STAGES.indexOf('graded');
 
@@ -72,7 +72,7 @@ const FIELD_ROT_JITTER = 0.1;
 // this safe at curves/endpoints and for any rotation; the final 0.5u leaves a narrow visible verge.
 export const FIELD_SIZE = 10;
 const FIELD_FOOTPRINT_RADIUS = FIELD_SIZE / Math.SQRT2;
-const FIELD_ROAD_CLEARANCE = ROAD_WIDTH / 2 + FIELD_FOOTPRINT_RADIUS + 0.5;
+export const FIELD_ROAD_CLEARANCE = ROAD_ENGINEERED_HALF_WIDTH + FIELD_FOOTPRINT_RADIUS + 0.5;
 
 // A cell crossing the 'tree' threshold spawns trees only with this probability; every qualifying
 // cell along a corridor would otherwise plant 2-3 trees every 4u (CELL), which at typical canopy
@@ -111,14 +111,72 @@ const STRANDED_DEV_DECAY_TARGET = 0.4;
 // literal 'graded' event" lesson). Unlike stranded decay (60s grace + 30s fade, rescuable),
 // clearing is immediate + quick (no grace period at all — the excavator is physically there right
 // now) and NEVER rescuable: demolishing the road later does not un-clear a record it displaced.
-// Trees within this distance of any non-bridge road sample are cleared as the excavator's corridor
-// passes through: half the road width plus a small margin, identical reasoning to wilderness.ts.
-const CLEAR_RADIUS = ROAD_WIDTH / 2 + 2;
+// Records within this distance of any non-bridge road sample are cleared as the excavator's
+// corridor passes through: asphalt + compacted shoulder + ditch + vegetation safety margin,
+// identical to wilderness.ts and sourced from the renderer's shared footprint constants.
+const CLEAR_RADIUS = ROAD_ENGINEERED_HALF_WIDTH;
 // sim-seconds — quick fade matching wilderness.ts's WILDERNESS_FADE_DURATION feel (the renderer's
 // own constant is separate, see sceneryRenderer.ts), deliberately far shorter than
 // STRANDED_FADE_S/STRANDED_GRACE_S: a record physically in the roadbed doesn't get a grace period,
 // it's simply gone as the grading pass reaches it.
 const CLEAR_FADE_S = 1.5;
+
+// Living Towns: one coarse, seeded value-noise field shapes development into contiguous pockets
+// instead of letting every equally-roaded cell urbanize at nearly the same rate. This is derived
+// from world coordinates + the world seed, so it needs no save field and old saves gain the same
+// morphology deterministically when loaded.
+const MORPHOLOGY_CELL = 56;
+const MORPHOLOGY_MIN = 0.12;
+const MORPHOLOGY_MAX = 1.2;
+const JUNCTION_CENTER_RADIUS = 24;
+
+function morphologyHash(ix: number, iz: number, seed: number): number {
+  let h = (Math.imul(ix, 0x1f123bb5) ^ Math.imul(iz, 0x5f356495) ^ Math.floor(seed * 0x7fffffff)) >>> 0;
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x7feb352d) >>> 0;
+  h ^= h >>> 15;
+  h = Math.imul(h, 0x846ca68b) >>> 0;
+  h ^= h >>> 16;
+  return (h >>> 0) / 0x100000000;
+}
+
+function smooth01(t: number): number {
+  const u = Math.max(0, Math.min(1, t));
+  return u * u * (3 - 2 * u);
+}
+
+function valueNoise2d(x: number, z: number, seed: number, scale: number): number {
+  const gx = x / scale, gz = z / scale;
+  const ix = Math.floor(gx), iz = Math.floor(gz);
+  const tx = smooth01(gx - ix), tz = smooth01(gz - iz);
+  const a = morphologyHash(ix, iz, seed);
+  const b = morphologyHash(ix + 1, iz, seed);
+  const c = morphologyHash(ix, iz + 1, seed);
+  const d = morphologyHash(ix + 1, iz + 1, seed);
+  const top = a + (b - a) * tx;
+  const bottom = c + (d - c) * tx;
+  return top + (bottom - top) * tz;
+}
+
+/** Seeded development-rate multiplier for a world position. Broad low-frequency pockets create
+ * neighborhoods and rural gaps; a smaller octave prevents perfectly round blobs. A real
+ * three-way painted-road junction raises the local floor so connected networks naturally form
+ * compact centers. Pure/exported so pacing and determinism stay directly testable. */
+export function settlementMorphology(
+  x: number,
+  z: number,
+  seed: number,
+  junctionDistance: number,
+): number {
+  const broad = valueNoise2d(x, z, seed, MORPHOLOGY_CELL);
+  const detail = valueNoise2d(x, z, seed + 0.371, MORPHOLOGY_CELL / 2);
+  const noise = broad * 0.78 + detail * 0.22;
+  const density = smooth01((noise - 0.38) / 0.34);
+  const pocket = MORPHOLOGY_MIN + (MORPHOLOGY_MAX - MORPHOLOGY_MIN) * density;
+  if (!Number.isFinite(junctionDistance) || junctionDistance >= JUNCTION_CENTER_RADIUS) return pocket;
+  const junction = 0.72 + 0.5 * smooth01(1 - junctionDistance / JUNCTION_CENTER_RADIUS);
+  return Math.max(pocket, junction);
+}
 
 export type GrowthKind = 'tree' | 'field' | 'house' | 'building';
 
@@ -237,6 +295,7 @@ export class GrowthSim {
   // held fixed thereafter — 0 means "not yet rolled" (see rateMultFor), which is safe since actual
   // multipliers never reach 0.
   private rateMult = new Float32Array(GRID_SIZE * GRID_SIZE);
+  private settlementMult = new Float32Array(GRID_SIZE * GRID_SIZE);
 
   private simTime = 0;
   private lastRecomputeAt = -Infinity;
@@ -269,9 +328,11 @@ export class GrowthSim {
     private hf: Heightfield,
     private bus: EventBus,
     private rng: () => number,
+    private morphologySeed: number | null = null,
   ) {
     this.bus.on('roads:changed', () => {
       this.recomputePending = true;
+      this.settlementMult.fill(0); // a newly-connected junction can reshape nearby future growth
     });
     // Task 42: an edge's construction reaching (or being restored at/past) 'graded' clears any
     // grown record sitting in its corridor. Mirrors WildernessSim's own listener in wilderness.ts
@@ -530,6 +591,29 @@ export class GrowthSim {
     return best;
   }
 
+  private nearestPaintedJunctionDistance(x: number, z: number): number {
+    let best = Infinity;
+    for (const node of this.graph.nodes.values()) {
+      let paintedDegree = 0;
+      for (const edgeId of this.graph.edgesAtNode(node.id)) {
+        if (this.graph.edges.get(edgeId)?.stage === 'painted') paintedDegree++;
+      }
+      if (paintedDegree < 3) continue;
+      best = Math.min(best, Math.hypot(node.x - x, node.z - z));
+    }
+    return best;
+  }
+
+  private settlementMultFor(idx: number, x: number, z: number): number {
+    if (this.morphologySeed === null) return 1; // legacy/test callers retain established pacing
+    let mult = this.settlementMult[idx];
+    if (mult === 0) {
+      mult = settlementMorphology(x, z, this.morphologySeed, this.nearestPaintedJunctionDistance(x, z));
+      this.settlementMult[idx] = mult;
+    }
+    return mult;
+  }
+
   /**
    * Places a house/building so it faces the nearest road at a consistent [SETBACK_MIN,
    * SETBACK_MAX] distance from the road centerline sample, replacing the old radial push. The
@@ -688,7 +772,7 @@ export class GrowthSim {
           this.rateMult[idx] = mult;
         }
 
-        const rate = DEV_RATE_BASE * mult * (1 - d / DEV_RATE_DIST_DIVISOR);
+        const rate = DEV_RATE_BASE * mult * this.settlementMultFor(idx, x, z) * (1 - d / DEV_RATE_DIST_DIVISOR);
         if (rate <= 0) continue;
         this.dev[idx] += dt * rate;
 

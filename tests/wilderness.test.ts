@@ -5,7 +5,7 @@ import { Heightfield } from '../src/sim/terrain/heightfield';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { makeSampler } from '../src/sim/roads/path';
 import { EventBus } from '../src/core/events';
-import { ROAD_WIDTH } from '../src/core/constants';
+import { ROAD_WIDTH, ROAD_ENGINEERED_HALF_WIDTH } from '../src/core/constants';
 
 describe('generateWilderness', () => {
   it('is deterministic: same seed twice produces deep-equal results', () => {
@@ -76,6 +76,27 @@ function buildGraph(seed: string) {
 }
 
 describe('WildernessSim clearing', () => {
+  it('clears wilderness trees from the full shoulder and ditch footprint', () => {
+    const { bus, hf, graph } = buildGraph('wild-ditch-clear');
+    let anchor = { x: 0, z: 0 };
+    outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+      if (hf.isLand(x, z) && hf.isLand(x + 64, z)) { anchor = { x, z }; break outer; }
+    const [edgeId] = graph.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+    const edge = graph.edges.get(edgeId)!;
+    const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+    const oldCorridorEdge = ROAD_WIDTH / 2 + 2;
+    const trees = [
+      { x: sample.x, z: sample.z + oldCorridorEdge + 0.35, rot: 0, count: 1 },
+      { x: sample.x, z: sample.z + ROAD_ENGINEERED_HALF_WIDTH + 2, rot: 0, count: 1 },
+    ];
+    const sim = new WildernessSim(trees, bus, graph);
+
+    edge.stage = 'graded';
+    bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
+
+    expect(sim.active).toEqual([trees[1]]);
+  });
+
   it('clears exactly the trees within the road corridor when an edge reaches graded', () => {
     const { bus, hf, graph } = buildGraph('wild-clear');
 

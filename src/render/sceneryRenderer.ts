@@ -63,6 +63,37 @@ const TARGET_TREE_HEIGHT = 5.5; // u, normalized tree height (varies per real-wo
 const TARGET_HOUSE_HEIGHT = 3.4; // u, matches brief's ~4x3x4 house footprint
 const TARGET_BUILDING_HEIGHT = 10; // u, matches brief's 5x10x5 building footprint
 
+export interface ModelStyleVariant {
+  tint: string;
+  widthScale: number;
+  heightScale: number;
+  roughnessDelta: number;
+}
+
+/** Runtime asset library built from the compact CC0 GLB source set. Each source mesh gets several
+ * PBR colorways AND silhouette proportions, yielding 21 deterministic instanced variants from six
+ * downloads without multiplying network weight or creating one draw call per individual object.
+ * The palette stays grounded/matte so the expanded variety still reads as one authored town. */
+export const MODEL_STYLE_VARIANTS: Readonly<Record<'tree' | 'house' | 'building', readonly ModelStyleVariant[]>> = {
+  tree: [
+    { tint: '#dce8d0', widthScale: 0.86, heightScale: 1.16, roughnessDelta: 0.04 },
+    { tint: '#f2ead2', widthScale: 1.08, heightScale: 0.93, roughnessDelta: 0.08 },
+    { tint: '#cbd9bd', widthScale: 1.22, heightScale: 0.82, roughnessDelta: 0.1 },
+  ],
+  house: [
+    { tint: '#f1ddd0', widthScale: 0.94, heightScale: 1.03, roughnessDelta: 0.03 },
+    { tint: '#d8e4ed', widthScale: 1.05, heightScale: 0.96, roughnessDelta: 0.06 },
+    { tint: '#e7e0c8', widthScale: 1.12, heightScale: 0.91, roughnessDelta: 0.08 },
+    { tint: '#d9d0df', widthScale: 0.9, heightScale: 1.1, roughnessDelta: 0.02 },
+  ],
+  building: [
+    { tint: '#d5e1e8', widthScale: 0.86, heightScale: 1.18, roughnessDelta: -0.08 },
+    { tint: '#ddd6ca', widthScale: 1.08, heightScale: 0.9, roughnessDelta: 0.08 },
+    { tint: '#c9d2d3', widthScale: 0.95, heightScale: 1.06, roughnessDelta: -0.02 },
+    { tint: '#dfcfc7', widthScale: 1.16, heightScale: 0.82, roughnessDelta: 0.1 },
+  ],
+};
+
 const FIELD_STRIPE_COLORS = ['#7fae6b', '#6a9b58'];
 
 const FLATTEN_RADIUS = 5;
@@ -478,7 +509,10 @@ export class SceneryRenderer {
   ): Promise<VariantMesh[]> {
     const loader = new GLTFLoader();
     const loaded: VariantMesh[] = [];
-    const perVariantCapacity = Math.floor(totalCapacity / files.length);
+    const styles = MODEL_STYLE_VARIANTS[category];
+    const runtimeVariantCount = files.length * styles.length;
+    const perVariantCapacity = Math.floor(totalCapacity / runtimeVariantCount);
+    let runtimeVariantIndex = 0;
 
     for (let fi = 0; fi < files.length; fi++) {
       const file = files[fi];
@@ -557,15 +591,37 @@ export class SceneryRenderer {
       merged.translate(0, -liftedBox.min.y, 0);
       merged.computeVertexNormals();
 
-      const capacity = fi === files.length - 1 ? totalCapacity - perVariantCapacity * (files.length - 1) : perVariantCapacity;
-      const mesh = new THREE.InstancedMesh(merged, material, capacity);
-      mesh.count = 0;
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      mesh.frustumCulled = false;
-      this.scene.add(mesh);
+      for (const style of styles) {
+        const styledGeometry = merged.clone();
+        styledGeometry.scale(style.widthScale, style.heightScale, style.widthScale);
+        styledGeometry.computeBoundingBox();
 
-      loaded.push({ mesh, baseHeight: targetHeight });
+        const styledMaterial = material.clone();
+        if (styledMaterial instanceof THREE.MeshStandardMaterial) {
+          styledMaterial.color.multiply(new THREE.Color(style.tint));
+          styledMaterial.roughness = THREE.MathUtils.clamp(
+            styledMaterial.roughness + style.roughnessDelta,
+            0.35,
+            1,
+          );
+        }
+
+        const isLast = runtimeVariantIndex === runtimeVariantCount - 1;
+        const capacity = isLast
+          ? totalCapacity - perVariantCapacity * (runtimeVariantCount - 1)
+          : perVariantCapacity;
+        runtimeVariantIndex++;
+        const mesh = new THREE.InstancedMesh(styledGeometry, styledMaterial, capacity);
+        mesh.count = 0;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        mesh.frustumCulled = false;
+        this.scene.add(mesh);
+
+        loaded.push({ mesh, baseHeight: targetHeight * style.heightScale });
+      }
+      merged.dispose();
+      material.dispose();
     }
 
     return loaded;

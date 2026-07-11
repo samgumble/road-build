@@ -84,6 +84,23 @@ describe('lane graph', () => {
     expect(total).toBeLessThan(200); // took a 2-edge leg (~128u), not a silly loop
   });
 
+  it('routes through a branch connected to the visible centerline of an existing road', () => {
+    const g = new RoadGraph(new EventBus(), flatSampler);
+    g.commitChain([{ x: 0, z: 0 }, { x: 48, z: 0 }]);
+    // No authored control point existed at x=24; committing the branch must split the through road.
+    g.commitChain([{ x: 24, z: 0 }, { x: 24, z: 32 }]);
+    for (const edge of g.edges.values()) edge.stage = 'painted';
+
+    const junction = [...g.nodes.values()].find((n) => n.x === 24 && n.z === 0)!;
+    const west = [...g.nodes.values()].find((n) => n.x === 0 && n.z === 0)!;
+    const north = [...g.nodes.values()].find((n) => n.x === 24 && n.z === 32)!;
+    const lg = buildLaneGraph(g);
+
+    expect(g.edgesAtNode(junction.id)).toHaveLength(3);
+    expect(findRoute(lg, west.id, north.id)).not.toBeNull();
+    expect(findRoute(lg, north.id, west.id)).not.toBeNull();
+  });
+
   describe('closed loops (Task 41)', () => {
     function loopGraph(): RoadGraph {
       const g = new RoadGraph(new EventBus(), flatSampler);

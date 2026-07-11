@@ -2,7 +2,7 @@ import type { Heightfield } from '../terrain/heightfield';
 import { RoadGraph } from '../roads/graph';
 import { EventBus } from '../../core/events';
 import { createRng } from '../../core/rng';
-import { WORLD_SIZE, ROAD_WIDTH } from '../../core/constants';
+import { ROAD_ENGINEERED_HALF_WIDTH, WORLD_SIZE } from '../../core/constants';
 import { STAGES } from '../../core/types';
 
 const GRADED_INDEX = STAGES.indexOf('graded');
@@ -114,7 +114,7 @@ export function generateWilderness(hf: Heightfield, seed: string): WildernessTre
 // Trees within this distance of any non-bridge road sample are cleared as the excavator's
 // corridor passes through: half the road width plus a small margin so trees flanking the ribbon
 // (not just directly on the centerline) get cleared too.
-const CLEAR_RADIUS = ROAD_WIDTH / 2 + 2;
+const CLEAR_RADIUS = ROAD_ENGINEERED_HALF_WIDTH;
 
 /**
  * Tracks which generated wilderness trees are still "active" (not yet cleared by road

@@ -10,11 +10,27 @@
 
 **Global Constraints:** Same seed/input sequence remains deterministic; existing records restore unchanged; corridor clearing wins over growth; paused development still permits cleanup; traffic population remains bounded.
 
+## Delivered foundation slice — 2026-07-11
+
+- [x] Seeded, coordinate-derived settlement morphology creates broad development pockets and rural
+  gaps without a save migration; painted degree-3 junctions raise the local density floor.
+- [x] Connecting a new road to any visible sampled centerline splits the original edge into a true
+  shared graph node; lane routing is covered in both directions and intersection paint is trimmed.
+- [x] The engineered vegetation exclusion footprint now includes asphalt, shoulder, ditch, and a
+  safety margin for both grown scenery and ambient wilderness.
+- [x] Vehicle ground marks use wheel/track contact layouts; opened roads carry two wheel paths per
+  direction while remaining one merged wear draw call.
+- [x] Six compact source GLBs expand into 21 deterministic instanced PBR/color/silhouette variants,
+  establishing a higher-quality asset library without additional network payload.
+
+The explicit serializable `SettlementCenter`/character/objective layers below remain future work;
+the delivered morphology layer is intentionally migration-free infrastructure for those systems.
+
 ## Task 1: Seed settlement pockets instead of continuous roadside walls
 
 **Files:** `src/sim/growth/growth.ts`, `src/sim/save.ts`, `tests/growth.test.ts`, `tests/save.test.ts`
 
-- [ ] Write deterministic tests for settlement-center selection, influence falloff, and preserved rural gaps.
+- [x] Write deterministic tests for seeded morphology, junction influence, and preserved rural gaps.
 - [ ] Add serializable `SettlementCenter { id, x, z, radius, character }` records.
 - [ ] Bias development rate by center influence while retaining road-distance, land, and slope gates.
 - [ ] Enforce a minimum undeveloped buffer between centers.
@@ -27,7 +43,7 @@
 - [ ] Add seeded setback bands, side-yard spacing, orientation jitter, and parcel-depth limits.
 - [ ] Define characters (`hamlet`, `farm`, `suburb`, `town-center`) that alter type weights and spacing, not core rules.
 - [ ] Reserve sparse landmark parcels and prevent normal records from overlapping them.
-- [ ] Expand renderer variants without adding per-frame instance allocation.
+- [x] Expand renderer variants without adding per-frame instance allocation.
 
 ## Task 3: Pace frontier growth and upgrades
 
@@ -62,4 +78,3 @@
 - [ ] Soak 30 sim minutes with growth paused/resumed, demolition, reroading, and save/reload.
 - [ ] Confirm rural gaps, center silhouettes, and traffic distribution visually at 1× and 16×.
 - [ ] Run full tests/build and update `docs/HANDOFF.md`.
-

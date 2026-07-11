@@ -112,10 +112,46 @@ const MAT_FADE_TIME = 1.2; // seconds for the mat quad to fade as the real ribbo
 const MAT_COLOR = '#232323';
 
 // --- Tire/track marks --------------------------------------------------------------------------
-const TIRE_MARK_POOL_SIZE = 256;
+const TIRE_MARK_POOL_SIZE = 768;
 const TIRE_MARK_FADE = 20; // seconds
 const TIRE_MARK_INTERVAL = 0.25; // seconds between mark stamps per active vehicle
 const TIRE_MARK_COLOR = '#2a2420';
+
+export interface GroundContactMark {
+  lateral: number;
+  longitudinal: number;
+  width: number;
+  length: number;
+}
+
+const FOUR_WHEEL_CONTACTS: GroundContactMark[] = [
+  { lateral: -0.62, longitudinal: -0.72, width: 0.28, length: 0.48 },
+  { lateral: 0.62, longitudinal: -0.72, width: 0.28, length: 0.48 },
+  { lateral: -0.62, longitudinal: 0.72, width: 0.28, length: 0.48 },
+  { lateral: 0.62, longitudinal: 0.72, width: 0.28, length: 0.48 },
+];
+const TRACKED_CONTACTS: GroundContactMark[] = [
+  { lateral: -0.72, longitudinal: 0, width: 0.42, length: 1.35 },
+  { lateral: 0.72, longitudinal: 0, width: 0.42, length: 1.35 },
+];
+const GRADER_CONTACTS: GroundContactMark[] = [-1, 0, 1].flatMap((longitudinal) => [
+  { lateral: -0.62, longitudinal, width: 0.26, length: 0.44 },
+  { lateral: 0.62, longitudinal, width: 0.26, length: 0.44 },
+]);
+const ROLLER_CONTACTS: GroundContactMark[] = [
+  { lateral: 0, longitudinal: -0.62, width: 1.55, length: 0.42 },
+  { lateral: 0, longitudinal: 0.62, width: 1.4, length: 0.42 },
+];
+
+/** Contact patches stamped into dirt/gravel for each physical vehicle layout. Returned arrays are
+ * immutable conventions; callers must not mutate them. */
+export function vehicleGroundContacts(kind: VehicleKind | 'grader'): ReadonlyArray<GroundContactMark> {
+  if (kind === 'excavator' || kind === 'paver') return TRACKED_CONTACTS;
+  if (kind === 'truck' || kind === 'liner') return FOUR_WHEEL_CONTACTS;
+  if (kind === 'grader') return GRADER_CONTACTS;
+  if (kind === 'roller') return ROLLER_CONTACTS;
+  return [];
+}
 
 // --- Floodlight (Task 37: towers stake down at fixed stations, like the T27 cones) -------------
 // Construction lighting density has been expanded twice: the original 70u/6-tower budget became
@@ -4029,23 +4065,31 @@ export class ConstructionRenderer {
   /**
    * Tire/track marks: fading instanced decals stamped under moving vehicles while the terrain is
    * still dirt (graded/gravel stages) — paved/painted stages have a hard surface, no marks. Each
-   * active vehicle stamps at most once every TIRE_MARK_INTERVAL seconds so the ≤256 pool covers a
+   * active vehicle stamps at most once every TIRE_MARK_INTERVAL seconds so the bounded pool covers a
    * good stretch of road without instantly cycling through on a single pass.
    */
   private updateTireMarks(slot: CrewSlot, dt: number): void {
-    for (const state of [...slot.states.values(), slot.roller]) {
-      if (!state.hasTarget) continue;
+    const updateState = (state: VehicleState, kind: VehicleKind | 'grader') => {
+      if (!state.hasTarget) return;
       const marking = (state.stage === 'graded' || state.stage === 'gravel') && state.curSpeed > 0.2;
       if (!marking) {
         state.tireMarkTimer = 0;
-        continue;
+        return;
       }
       state.tireMarkTimer += dt;
       if (state.tireMarkTimer >= TIRE_MARK_INTERVAL) {
         state.tireMarkTimer = 0;
-        this.tireMarks.stamp(state.curPos.x, state.curPos.y, state.curPos.z, state.curHeading, 1.6, 1.2);
+        const cos = Math.cos(state.curHeading), sin = Math.sin(state.curHeading);
+        for (const contact of vehicleGroundContacts(kind)) {
+          const x = state.curPos.x + cos * contact.longitudinal - sin * contact.lateral;
+          const z = state.curPos.z + sin * contact.longitudinal + cos * contact.lateral;
+          this.tireMarks.stamp(x, state.curPos.y, z, state.curHeading, contact.width, contact.length);
+        }
       }
-    }
+    };
+    for (const [kind, state] of slot.states) updateState(state, kind);
+    updateState(slot.roller, 'roller');
+    updateState(slot.grader, 'grader');
   }
 
   /**

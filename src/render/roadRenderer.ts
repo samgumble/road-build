@@ -1,7 +1,12 @@
 import * as THREE from 'three';
 import type { RoadSample, Stage } from '../core/types';
 import { STAGES } from '../core/types';
-import { ROAD_WIDTH } from '../core/constants';
+import {
+  ROAD_DITCH_OUTER_GAP,
+  ROAD_DITCH_WIDTH,
+  ROAD_SHOULDER_EXTRA_PER_SIDE,
+  ROAD_WIDTH,
+} from '../core/constants';
 import { EventBus } from '../core/events';
 import { RoadGraph, RoadEdge } from '../sim/roads/graph';
 import type { Heightfield } from '../sim/terrain/heightfield';
@@ -74,11 +79,33 @@ const SURVEY_OPACITY = 0.55;
 const CENTERLINE_WIDTH = 0.5;
 const CENTERLINE_COLOR = '#e8e4d8';
 const CENTERLINE_YLIFT = 0.24;
+const JUNCTION_STRIPE_CLEARANCE = 5;
+
+/** Removes center paint from the compact asphalt apron at a true connected intersection. Ordinary
+ * corners/dead ends retain their markings; degree-3+ nodes get a calm unstriped conflict area
+ * instead of overlapping dash fragments from every connected edge. */
+export function trimJunctionStripeRange(
+  from: number,
+  to: number,
+  total: number,
+  startDegree: number,
+  endDegree: number,
+): { from: number; to: number } {
+  let trimmedFrom = from;
+  let trimmedTo = to;
+  if (startDegree >= 3 && from < JUNCTION_STRIPE_CLEARANCE) {
+    trimmedFrom = Math.max(from, Math.min(total, JUNCTION_STRIPE_CLEARANCE));
+  }
+  if (endDegree >= 3 && to > total - JUNCTION_STRIPE_CLEARANCE) {
+    trimmedTo = Math.min(to, Math.max(0, total - JUNCTION_STRIPE_CLEARANCE));
+  }
+  return { from: trimmedFrom, to: Math.max(trimmedFrom, trimmedTo) };
+}
 
 // Phase 1 road-integration pass: a narrow compacted verge visually seats ground roads into the
 // terrain instead of letting the asphalt ribbon end at a razor edge. It begins with grading, uses
 // one wider ribbon underneath the surface, and is omitted on bridge runs (rails/deck own that edge).
-const SHOULDER_EXTRA_PER_SIDE = 1.35;
+const SHOULDER_EXTRA_PER_SIDE = ROAD_SHOULDER_EXTRA_PER_SIDE;
 const SHOULDER_WIDTH = ROAD_WIDTH + SHOULDER_EXTRA_PER_SIDE * 2;
 const SHOULDER_COLOR: Record<Exclude<Stage, 'surveyed'>, string> = {
   graded: '#756044',
@@ -88,16 +115,21 @@ const SHOULDER_COLOR: Record<Exclude<Stage, 'surveyed'>, string> = {
 };
 const SHOULDER_Y_GAP = 0.025;
 
-// Two restrained wheel-polish bands on opened roads. Both strips are merged into one geometry,
-// keeping this detail to one draw call per painted range rather than one call per wheel path.
+// Four restrained wheel-polish bands on opened roads: two contact paths inside each directional
+// lane. All strips merge into one geometry/draw call per painted range.
 const TIRE_WEAR_COLOR = '#202426';
 const TIRE_WEAR_WIDTH = 0.24;
-const TIRE_WEAR_OFFSET = ROAD_WIDTH * 0.22;
+export const TRAFFIC_WEAR_OFFSETS = [
+  -(1.5 + 0.45),
+  -(1.5 - 0.45),
+  1.5 - 0.45,
+  1.5 + 0.45,
+] as const;
 const TIRE_WEAR_OPACITY = 0.18;
 const TIRE_WEAR_YLIFT = STAGE_YLIFT.painted + 0.018;
 
-const DITCH_WIDTH = 0.42;
-const DITCH_OFFSET = ROAD_WIDTH / 2 + SHOULDER_EXTRA_PER_SIDE + 0.48;
+const DITCH_WIDTH = ROAD_DITCH_WIDTH;
+const DITCH_OFFSET = ROAD_WIDTH / 2 + SHOULDER_EXTRA_PER_SIDE + ROAD_DITCH_OUTER_GAP;
 const DITCH_COLOR = '#4d4937';
 const EDGE_WEAR_WIDTH = 0.18;
 const EDGE_WEAR_OFFSET = ROAD_WIDTH / 2 - 0.16;
@@ -1022,15 +1054,29 @@ export class RoadRenderer {
     if (stage === 'painted') {
       this.buildTireWear(v, samples, from, to);
       this.buildSurfaceLife(v, samples, from, to);
-      const dashGeo = buildDashedRibbonGeometry(samples, CENTERLINE_WIDTH, CENTERLINE_YLIFT, from, to, 2);
-      const dashMat = makeStandardMaterial(CENTERLINE_COLOR, 1, 'stripe');
-      // Wet-sheen (Task 26 deliverable 5): fresh center dashes get a brief gloss right after
-      // painting, mirroring the fresh-asphalt roughness lerp above but on their own shorter timer
-      // (see WET_SHEEN_DURATION) — paint dries faster than asphalt cures.
-      dashMat.roughness = WET_SHEEN_START;
-      const dashMesh = this.addMesh(v, dashGeo, dashMat);
-      dashMesh.userData.wetPaint = true;
-      tagWeatherSurface(dashMesh, 'paint');
+      const edge = this.graph.edges.get(Number(v.group.userData.edgeId));
+      const stripeRange = edge
+        ? trimJunctionStripeRange(
+          from,
+          to,
+          total,
+          this.graph.edgesAtNode(edge.a).length,
+          this.graph.edgesAtNode(edge.b).length,
+        )
+        : { from, to };
+      if (stripeRange.to > stripeRange.from) {
+        const dashGeo = buildDashedRibbonGeometry(
+          samples, CENTERLINE_WIDTH, CENTERLINE_YLIFT, stripeRange.from, stripeRange.to, 2,
+        );
+        const dashMat = makeStandardMaterial(CENTERLINE_COLOR, 1, 'stripe');
+        // Wet-sheen (Task 26 deliverable 5): fresh center dashes get a brief gloss right after
+        // painting, mirroring the fresh-asphalt roughness lerp above but on their own shorter timer
+        // (see WET_SHEEN_DURATION) — paint dries faster than asphalt cures.
+        dashMat.roughness = WET_SHEEN_START;
+        const dashMesh = this.addMesh(v, dashGeo, dashMat);
+        dashMesh.userData.wetPaint = true;
+        tagWeatherSurface(dashMesh, 'paint');
+      }
     }
   }
 
@@ -1059,11 +1105,10 @@ export class RoadRenderer {
   }
 
   private buildTireWear(v: EdgeVisual, samples: RoadSample[], from: number, to: number): void {
-    const left = buildRibbonGeometry(samples, TIRE_WEAR_WIDTH, TIRE_WEAR_YLIFT, from, to, TIRE_WEAR_OFFSET);
-    const right = buildRibbonGeometry(samples, TIRE_WEAR_WIDTH, TIRE_WEAR_YLIFT, from, to, -TIRE_WEAR_OFFSET);
-    const geo = mergeGeometries([left, right]);
-    left.dispose();
-    right.dispose();
+    const strips = TRAFFIC_WEAR_OFFSETS.map((offset) =>
+      buildRibbonGeometry(samples, TIRE_WEAR_WIDTH, TIRE_WEAR_YLIFT, from, to, offset));
+    const geo = mergeGeometries(strips);
+    strips.forEach((strip) => strip.dispose());
 
     const mat = makeStandardMaterial(TIRE_WEAR_COLOR, TIRE_WEAR_OPACITY, 'stripe');
     mat.roughness = 0.72;

@@ -1,11 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { GrowthSim, type SpawnRecord } from '../src/sim/growth/growth';
+import {
+  FIELD_ROAD_CLEARANCE,
+  FIELD_SIZE,
+  GrowthSim,
+  settlementMorphology,
+  type SpawnRecord,
+} from '../src/sim/growth/growth';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { Heightfield } from '../src/sim/terrain/heightfield';
 import { makeSampler } from '../src/sim/roads/path';
 import { EventBus } from '../src/core/events';
 import { createRng } from '../src/core/rng';
-import { GRID_SIZE, CELL, WORLD_SIZE, ROAD_WIDTH } from '../src/core/constants';
+import { GRID_SIZE, CELL, WORLD_SIZE, ROAD_WIDTH, ROAD_ENGINEERED_HALF_WIDTH } from '../src/core/constants';
 
 const HALF = WORLD_SIZE / 2;
 /** Inverse of growth.ts's private `cellCenter` — maps a grid cell (i, j) back to its world-space
@@ -29,6 +35,44 @@ function world() {
 }
 
 describe('GrowthSim', () => {
+  describe('Living Towns morphology', () => {
+    it('creates deterministic dense pockets and quiet rural gaps that vary by world seed', () => {
+      const valuesA: number[] = [];
+      const valuesB: number[] = [];
+      for (let z = -160; z <= 160; z += 8) {
+        for (let x = -160; x <= 160; x += 8) {
+          valuesA.push(settlementMorphology(x, z, 0.217, Infinity));
+          valuesB.push(settlementMorphology(x, z, 0.731, Infinity));
+        }
+      }
+
+      expect(Math.min(...valuesA)).toBeLessThanOrEqual(0.2);
+      expect(Math.max(...valuesA)).toBeGreaterThanOrEqual(1.05);
+      expect(valuesA).toEqual(valuesA.map((_, i) => {
+        const rowLength = 41;
+        const x = -160 + (i % rowLength) * 8;
+        const z = -160 + Math.floor(i / rowLength) * 8;
+        return settlementMorphology(x, z, 0.217, Infinity);
+      }));
+      expect(valuesA.some((value, i) => Math.abs(value - valuesB[i]) > 0.2)).toBe(true);
+    });
+
+    it('boosts connected-road junctions into compact neighborhood centers', () => {
+      const rural = settlementMorphology(32, -48, 0.217, Infinity);
+      const junction = settlementMorphology(32, -48, 0.217, 0);
+      const fringe = settlementMorphology(32, -48, 0.217, 20);
+
+      expect(junction).toBeGreaterThanOrEqual(1.15);
+      expect(junction).toBeGreaterThanOrEqual(rural);
+      expect(fringe).toBeLessThan(junction);
+    });
+  });
+
+  it('keeps an entire field footprint outside the rendered shoulder and ditch', () => {
+    const fieldRadius = FIELD_SIZE / Math.SQRT2;
+    expect(FIELD_ROAD_CLEARANCE - fieldRadius).toBeGreaterThan(ROAD_ENGINEERED_HALF_WIDTH);
+  });
+
   it('spawns trees first, then houses, near painted roads', () => {
     const { bus, sim } = world();
     const kinds: string[] = [];
@@ -897,6 +941,26 @@ describe('GrowthSim', () => {
       for (let k = 0; k < 60 * 2; k++) sim.update(1 / 60); // well past the quick ~1.5s fade
       expect(removedIds).toEqual([1]);
       expect(sim.spawned.some((r) => r.id === 1)).toBe(false);
+    });
+
+    it('clears trees through the outer ditch footprint, not only over the asphalt ribbon', () => {
+      const { bus, hf, g, edgeId } = buildGraph('clear-ditch-tree');
+      const sim = new GrowthSim(g, hf, bus, createRng('clear-ditch-tree'));
+      const edge = g.edges.get(edgeId)!;
+      const sample = edge.samples[Math.floor(edge.samples.length / 2)];
+      const oldCorridorEdge = ROAD_WIDTH / 2 + 2;
+      const tree: SpawnRecord = {
+        kind: 'tree', x: sample.x, z: sample.z + oldCorridorEdge + 0.35, rot: 0, id: 1,
+      };
+      expect(Math.abs(tree.z - sample.z)).toBeLessThan(ROAD_ENGINEERED_HALF_WIDTH);
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [tree]);
+
+      const cleared: number[] = [];
+      bus.on('growth:cleared', ({ id }) => cleared.push(id));
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
+
+      expect(cleared).toEqual([1]);
     });
 
     it('the quick clearing fade completes well before the 60s stranded grace window', () => {

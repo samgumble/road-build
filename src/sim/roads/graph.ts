@@ -44,6 +44,19 @@ export class RoadGraph {
         if (d <= bestDist) { bestDist = d; best = { x: p.x, z: p.z }; }
       }
     }
+    // A visually long road can have only two authoritative control points, so limiting magnetic
+    // connection targets to interior controls makes its entire middle impossible to connect to.
+    // Sampled centerlines are the same geometry the player sees; snap their nearest point back to
+    // the topology grid. `addNode` resolves that point into a real split during commitChain.
+    for (const e of this.edges.values()) {
+      for (const sample of e.samples) {
+        const d = Math.hypot(sample.x - x, sample.z - z);
+        if (d < bestDist - 1e-6) {
+          bestDist = d;
+          best = RoadGraph.snap(sample.x, sample.z);
+        }
+      }
+    }
     return best ?? RoadGraph.snap(x, z);
   }
 
@@ -57,10 +70,24 @@ export class RoadGraph {
     const existing = this.points.get(key(p));
     if (existing?.kind === 'node') return existing.id;
     if (existing?.kind === 'edge') return this.splitEdge(existing.id, existing.ctrlIndex!).nodeId;
+    const centerline = this.nearestEdgeSample(p, SNAP / 2 + 0.01);
+    if (centerline) return this.splitEdgeAtPoint(centerline.edgeId, p).nodeId;
     const id = this.nextNode++;
     this.nodes.set(id, { id, x: p.x, z: p.z });
     this.points.set(key(p), { kind: 'node', id });
     return id;
+  }
+
+  private nearestEdgeSample(p: P2, radius: number): { edgeId: number; distance: number } | null {
+    let best: { edgeId: number; distance: number } | null = null;
+    for (const edge of this.edges.values()) {
+      for (const sample of edge.samples) {
+        const distance = Math.hypot(sample.x - p.x, sample.z - p.z);
+        if (distance > radius || (best && distance >= best.distance)) continue;
+        best = { edgeId: edge.id, distance };
+      }
+    }
+    return best;
   }
 
   private makeEdge(a: number, b: number, ctrl: P2[], stage: Stage): number {
@@ -89,15 +116,46 @@ export class RoadGraph {
     // the fix — emitting `roads:changed` here too — would mean a double rebuild on the far more
     // common commitChain path, which isn't worth the extra recompute cost for this edge case.
     const e = this.edges.get(edgeId)!;
+    return this.replaceEdgeWithSplit(e, e.ctrl, ctrlIndex);
+  }
+
+  /** Inserts a snapped connection point into the nearest control-polyline leg, then performs the
+   * same normal edge replacement as an existing interior-control split. This is what turns a
+   * centerline magnetic snap into a real shared graph node rather than two coincident visuals. */
+  private splitEdgeAtPoint(edgeId: number, p: P2): { nodeId: number; left: number; right: number } {
+    const edge = this.edges.get(edgeId)!;
+    let bestSegment = 0;
+    let bestDistance = Infinity;
+    for (let i = 0; i < edge.ctrl.length - 1; i++) {
+      const a = edge.ctrl[i], b = edge.ctrl[i + 1];
+      const dx = b.x - a.x, dz = b.z - a.z;
+      const lengthSq = dx * dx + dz * dz;
+      const u = lengthSq > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.z - a.z) * dz) / lengthSq)) : 0;
+      const distance = Math.hypot(p.x - (a.x + dx * u), p.z - (a.z + dz * u));
+      if (distance < bestDistance) { bestDistance = distance; bestSegment = i; }
+    }
+    const expanded = [
+      ...edge.ctrl.slice(0, bestSegment + 1),
+      { ...p },
+      ...edge.ctrl.slice(bestSegment + 1),
+    ];
+    return this.replaceEdgeWithSplit(edge, expanded, bestSegment + 1);
+  }
+
+  private replaceEdgeWithSplit(
+    e: RoadEdge,
+    ctrl: P2[],
+    ctrlIndex: number,
+  ): { nodeId: number; left: number; right: number } {
     this.unindexEdge(e);
-    this.edges.delete(edgeId);
-    const p = e.ctrl[ctrlIndex];
+    this.edges.delete(e.id);
+    const p = ctrl[ctrlIndex];
     const id = this.nextNode++;
     this.nodes.set(id, { id, x: p.x, z: p.z });
     this.points.set(key(p), { kind: 'node', id });
-    const left = this.makeEdge(e.a, id, e.ctrl.slice(0, ctrlIndex + 1), e.stage);
-    const right = this.makeEdge(id, e.b, e.ctrl.slice(ctrlIndex), e.stage);
-    this.bus.emit('roads:edgeRemoved', { edgeId });
+    const left = this.makeEdge(e.a, id, ctrl.slice(0, ctrlIndex + 1), e.stage);
+    const right = this.makeEdge(id, e.b, ctrl.slice(ctrlIndex), e.stage);
+    this.bus.emit('roads:edgeRemoved', { edgeId: e.id });
     this.bus.emit('roads:edgeAdded', { edgeId: left });
     this.bus.emit('roads:edgeAdded', { edgeId: right });
     return { nodeId: id, left, right };

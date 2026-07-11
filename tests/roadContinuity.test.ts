@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { EventBus } from '../src/core/events';
 import type { P2, RoadSample } from '../src/core/types';
 import { ConstructionRenderer } from '../src/render/constructionRenderer';
-import { buildRibbonGeometry, RoadRenderer } from '../src/render/roadRenderer';
+import { buildRibbonGeometry, RoadRenderer, trimJunctionStripeRange } from '../src/render/roadRenderer';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { Heightfield } from '../src/sim/terrain/heightfield';
 
@@ -38,6 +38,12 @@ function progress(bus: EventBus, edgeId: number, t: number): void {
 }
 
 describe('road and bridge continuity', () => {
+  it('clears center paint through a connected three-way intersection while preserving ordinary ends', () => {
+    expect(trimJunctionStripeRange(0, 40, 40, 3, 1)).toEqual({ from: 5, to: 40 });
+    expect(trimJunctionStripeRange(0, 40, 40, 2, 2)).toEqual({ from: 0, to: 40 });
+    expect(trimJunctionStripeRange(0, 40, 40, 3, 3)).toEqual({ from: 5, to: 35 });
+  });
+
   it('winds endpoint coverage upward so it renders from the gameplay camera', () => {
     const samples = bridgeSampler([{ x: 0, z: 0 }, { x: 8, z: 0 }]);
     const geo = buildRibbonGeometry(samples, 6, 0.1, 0, 8, 0, true, true);

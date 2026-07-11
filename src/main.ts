@@ -143,7 +143,8 @@ function main(): void {
   traffic.targetPopulation = 6; // Task 13 scales this with houses: 6 + houses, capped at 80
   const carRenderer = new CarRenderer(scene);
 
-  const growth = new GrowthSim(graph, hf, bus, createRng('growth-' + hf.seed));
+  const morphologySeed = createRng('growth-morphology-' + hf.seed)();
+  const growth = new GrowthSim(graph, hf, bus, createRng('growth-' + hf.seed), morphologySeed);
   const sceneryRenderer = new SceneryRenderer(scene, hf, bus);
   const roadsideRenderer = new RoadsideRenderer(scene, graph, hf, bus);
 

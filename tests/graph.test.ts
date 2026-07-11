@@ -6,6 +6,22 @@ import type { P2, RoadSample } from '../src/core/types';
 const stubSampler = (ctrl: P2[]): RoadSample[] =>
   ctrl.map((p) => ({ x: p.x, y: 1, z: p.z, bridge: false }));
 
+const denseSampler = (ctrl: P2[]): RoadSample[] => {
+  const out: RoadSample[] = [];
+  for (let leg = 0; leg < ctrl.length - 1; leg++) {
+    const a = ctrl[leg], b = ctrl[leg + 1];
+    const length = Math.hypot(b.x - a.x, b.z - a.z);
+    const steps = Math.max(1, Math.ceil(length / 2));
+    for (let i = 0; i < steps; i++) {
+      const u = i / steps;
+      out.push({ x: a.x + (b.x - a.x) * u, y: 1, z: a.z + (b.z - a.z) * u, bridge: false });
+    }
+  }
+  const last = ctrl[ctrl.length - 1];
+  out.push({ x: last.x, y: 1, z: last.z, bridge: false });
+  return out;
+};
+
 const mk = () => new RoadGraph(new EventBus(), stubSampler);
 
 describe('RoadGraph', () => {
@@ -162,6 +178,22 @@ describe('RoadGraph', () => {
       // (8,0) is an interior ctrl point (not a node) of the single edge; a cursor near it
       // should snap onto it.
       expect(g.magnetSnap(9, 1, 6)).toEqual({ x: 8, z: 0 });
+    });
+    it('connects to the rendered centerline of a long road with no interior control point', () => {
+      const bus = new EventBus();
+      const g = new RoadGraph(bus, denseSampler);
+      const [original] = g.commitChain([{ x: 0, z: 0 }, { x: 40, z: 0 }]);
+
+      const snapped = g.magnetSnap(20, 5, 6);
+      expect(snapped).toEqual({ x: 24, z: 0 }); // road centerline, not bare-grid fallback (24,8)
+      const [branch] = g.commitChain([snapped, { x: 24, z: 24 }]);
+
+      expect(g.edges.has(original)).toBe(false);
+      expect(g.edges.size).toBe(3); // two cleaned halves + the connected branch
+      const junction = [...g.nodes.values()].find((node) => node.x === 24 && node.z === 0)!;
+      expect(junction).toBeDefined();
+      expect(g.edgesAtNode(junction.id)).toHaveLength(3);
+      expect(g.edges.has(branch)).toBe(true);
     });
     it('falls back to grid snap when nothing is within radius', () => {
       const g = mk();
