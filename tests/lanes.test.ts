@@ -3,6 +3,8 @@ import { buildLaneGraph, findRoute } from '../src/sim/roads/lanes';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { EventBus } from '../src/core/events';
 import type { P2, RoadSample } from '../src/core/types';
+import { makeSampler } from '../src/sim/roads/path';
+import { Heightfield } from '../src/sim/terrain/heightfield';
 
 const flatSampler = (ctrl: P2[]): RoadSample[] => {
   // densify straight segments at 2u so offsets are smooth
@@ -27,6 +29,34 @@ function grid(): RoadGraph {
 }
 
 describe('lane graph', () => {
+  it('uses the smoothed road centerline for traffic steering', () => {
+    const g = new RoadGraph(new EventBus(), makeSampler(new Heightfield('lane-smoothing')));
+    g.commitChain([
+      { x: 0, z: 0 },
+      { x: 4, z: 4 },
+      { x: 8, z: -4 },
+      { x: 12, z: 4 },
+      { x: 16, z: -4 },
+      { x: 20, z: 0 },
+    ]);
+    for (const edge of g.edges.values()) edge.stage = 'painted';
+
+    const lane = [...buildLaneGraph(g).lanes.values()][0];
+    let maxHeadingChange = 0;
+    for (let i = 2; i < lane.points.length; i++) {
+      const a = lane.points[i - 2], b = lane.points[i - 1], c = lane.points[i];
+      const h1 = Math.atan2(b.z - a.z, b.x - a.x);
+      const h2 = Math.atan2(c.z - b.z, c.x - b.x);
+      let delta = Math.abs(h2 - h1);
+      if (delta > Math.PI) delta = Math.PI * 2 - delta;
+      maxHeadingChange = Math.max(maxHeadingChange, delta);
+    }
+
+    expect(maxHeadingChange).toBeLessThan(0.7);
+    expect(lane.from).toBe([...g.edges.values()][0].a);
+    expect(lane.to).toBe([...g.edges.values()][0].b);
+  });
+
   it('creates two directed lanes per painted edge, offset to the right', () => {
     const g = new RoadGraph(new EventBus(), flatSampler);
     g.commitChain([{ x: 0, z: 0 }, { x: 64, z: 0 }]);

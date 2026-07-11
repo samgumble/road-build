@@ -3,28 +3,119 @@ import { Heightfield } from '../terrain/heightfield';
 import { MAX_ROAD_GRADE, WATER_LEVEL, WORLD_SIZE, SNAP } from '../../core/constants';
 
 const SPACING = 2;
+const LOCAL_SMOOTH_SPAN = SNAP * 2.5;
+const CORNER_RADIUS = 4;
 
 function catmullRom(p0: number, p1: number, p2: number, p3: number, t: number): number {
   const t2 = t * t, t3 = t2 * t;
-  return 0.5 * (2 * p1 + (p2 - p0) * t +
-    (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
-    (3 * p1 - p0 - 3 * p2 + p3) * t3);
+  return 0.5 * (2 * p1 + (p2 - p0) * t
+    + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+    + (3 * p1 - p0 - 3 * p2 + p3) * t3);
+}
+
+/** Preserve the established sample distribution for a two-stake straight road. Terrain grading
+ * and its anisotropic clamp have years of regression coverage against this distribution, while a
+ * two-point line contains no hand-drawn wobble or corner to improve. */
+function sampleStraightLegacy(ctrl: P2[]): P2[] {
+  const [a, b] = ctrl;
+  const n = Math.max(2, Math.ceil(Math.hypot(b.x - a.x, b.z - a.z) / SPACING));
+  const out: P2[] = [];
+  for (let k = 0; k < n; k++) {
+    const t = k / n;
+    out.push({
+      x: catmullRom(a.x, a.x, b.x, b.x, t),
+      z: catmullRom(a.z, a.z, b.z, b.z, t),
+    });
+  }
+  out.push({ ...b });
+  return out;
+}
+
+function lerpPoint(a: P2, b: P2, t: number): P2 {
+  return { x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t };
+}
+
+function appendLine(out: P2[], a: P2, b: P2, includeEnd = false): void {
+  const length = Math.hypot(b.x - a.x, b.z - a.z);
+  const steps = Math.max(1, Math.ceil(length / SPACING));
+  const first = out.length ? 1 : 0;
+  const last = includeEnd ? steps : steps - 1;
+  for (let i = first; i <= last; i++) out.push(lerpPoint(a, b, i / steps));
+}
+
+/**
+ * Produces the shared render/terrain/traffic centerline for a player-drawn road.
+ *
+ * DrawTool records every changed grid snap, which makes a gently drawn road look like a chain of
+ * tiny stair-steps. Two conservative Laplacian passes absorb only short local wobble; long-leg
+ * corners remain fixed. The second pass rounds those retained corners with bounded quadratic
+ * fillets. Endpoints stay bit-exact so junctions, loop closure, save replay, and lane connectivity
+ * continue to use the authoritative snapped graph positions. Quadratic fillets remain inside the
+ * adjacent-segment envelope, avoiding Catmull-Rom overshoot around tight bends.
+ */
+export function smoothRoadCenterline(ctrl: P2[]): P2[] {
+  if (ctrl.length < 2) return ctrl.map((p) => ({ ...p }));
+  if (ctrl.length === 2) return sampleStraightLegacy(ctrl);
+
+  let stable = ctrl.map((p) => ({ ...p }));
+  for (let pass = 0; pass < 2; pass++) {
+    const next = stable.map((p) => ({ ...p }));
+    for (let i = 1; i < stable.length - 1; i++) {
+      const prev = stable[i - 1], cur = stable[i], after = stable[i + 1];
+      const beforeLength = Math.hypot(cur.x - prev.x, cur.z - prev.z);
+      const afterLength = Math.hypot(after.x - cur.x, after.z - cur.z);
+      if (beforeLength <= LOCAL_SMOOTH_SPAN && afterLength <= LOCAL_SMOOTH_SPAN) {
+        next[i] = {
+          x: prev.x * 0.25 + cur.x * 0.5 + after.x * 0.25,
+          z: prev.z * 0.25 + cur.z * 0.5 + after.z * 0.25,
+        };
+      }
+    }
+    stable = next;
+  }
+
+  const out: P2[] = [];
+  let cursor = stable[0];
+  for (let i = 1; i < stable.length - 1; i++) {
+    const prev = stable[i - 1], corner = stable[i], after = stable[i + 1];
+    const inLength = Math.hypot(corner.x - prev.x, corner.z - prev.z);
+    const outLength = Math.hypot(after.x - corner.x, after.z - corner.z);
+    if (inLength < 1e-6 || outLength < 1e-6) continue;
+
+    const inX = (corner.x - prev.x) / inLength;
+    const inZ = (corner.z - prev.z) / inLength;
+    const outX = (after.x - corner.x) / outLength;
+    const outZ = (after.z - corner.z) / outLength;
+    const turnCos = inX * outX + inZ * outZ;
+    if (turnCos > 0.995) continue;
+
+    const cut = Math.min(CORNER_RADIUS, inLength * 0.35, outLength * 0.35);
+    const approach = { x: corner.x - inX * cut, z: corner.z - inZ * cut };
+    const exit = { x: corner.x + outX * cut, z: corner.z + outZ * cut };
+    appendLine(out, cursor, approach, true);
+
+    const curveLength = Math.hypot(corner.x - approach.x, corner.z - approach.z)
+      + Math.hypot(exit.x - corner.x, exit.z - corner.z);
+    const steps = Math.max(2, Math.ceil(curveLength / SPACING));
+    for (let step = 1; step <= steps; step++) {
+      const t = step / steps;
+      const oneMinusT = 1 - t;
+      out.push({
+        x: oneMinusT * oneMinusT * approach.x + 2 * oneMinusT * t * corner.x + t * t * exit.x,
+        z: oneMinusT * oneMinusT * approach.z + 2 * oneMinusT * t * corner.z + t * t * exit.z,
+      });
+    }
+    cursor = exit;
+  }
+  appendLine(out, cursor, stable[stable.length - 1], true);
+  out[0] = { ...ctrl[0] };
+  out[out.length - 1] = { ...ctrl[ctrl.length - 1] };
+  return out;
 }
 
 export function makeSampler(hf: Heightfield) {
   return (ctrl: P2[]): RoadSample[] => {
-    const pts = [ctrl[0], ...ctrl, ctrl[ctrl.length - 1]];
-    const flat: P2[] = [];
-    for (let seg = 0; seg < ctrl.length - 1; seg++) {
-      const [p0, p1, p2, p3] = [pts[seg], pts[seg + 1], pts[seg + 2], pts[seg + 3]];
-      const segLen = Math.hypot(p2.x - p1.x, p2.z - p1.z);
-      const n = Math.max(2, Math.ceil(segLen / SPACING));
-      for (let k = 0; k < n; k++) {
-        const t = k / n;
-        flat.push({ x: catmullRom(p0.x, p1.x, p2.x, p3.x, t), z: catmullRom(p0.z, p1.z, p2.z, p3.z, t) });
-      }
-    }
-    flat.push({ ...ctrl[ctrl.length - 1] });
+    const flat = smoothRoadCenterline(ctrl);
 
     // base elevation
     const ground = flat.map((p) => hf.heightAt(p.x, p.z));

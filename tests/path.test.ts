@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { makeSampler, validateChain, sampleAt } from '../src/sim/roads/path';
+import { makeSampler, validateChain, sampleAt, smoothRoadCenterline } from '../src/sim/roads/path';
 import { Heightfield } from '../src/sim/terrain/heightfield';
 import { MAX_ROAD_GRADE, WATER_LEVEL } from '../src/core/constants';
 
@@ -12,6 +12,39 @@ function landPoint(): { x: number; z: number } {
 }
 
 describe('road path sampling', () => {
+  it('smooths short snapped zigzags while preserving exact road endpoints', () => {
+    const ctrl = [
+      { x: 0, z: 0 },
+      { x: 4, z: 4 },
+      { x: 8, z: -4 },
+      { x: 12, z: 4 },
+      { x: 16, z: -4 },
+      { x: 20, z: 0 },
+    ];
+
+    const smooth = smoothRoadCenterline(ctrl);
+
+    expect(smooth[0]).toEqual(ctrl[0]);
+    expect(smooth[smooth.length - 1]).toEqual(ctrl[ctrl.length - 1]);
+    expect(Math.max(...smooth.map((p) => Math.abs(p.z)))).toBeLessThan(3);
+  });
+
+  it('rounds a normal right-angle corner without overshooting its road envelope', () => {
+    const smooth = smoothRoadCenterline([
+      { x: 0, z: 0 },
+      { x: 24, z: 0 },
+      { x: 24, z: 24 },
+    ]);
+
+    expect(smooth[0]).toEqual({ x: 0, z: 0 });
+    expect(smooth[smooth.length - 1]).toEqual({ x: 24, z: 24 });
+    expect(smooth.every((p) => p.x >= 0 && p.x <= 24 && p.z >= 0 && p.z <= 24)).toBe(true);
+
+    // A rounded bend must include samples on both sides of the original corner, rather than
+    // retaining one abrupt 90-degree heading change at (24, 0).
+    expect(smooth.some((p) => p.x < 24 && p.z > 0)).toBe(true);
+  });
+
   it('samples a curve at ~2u spacing with no grade over the limit', () => {
     const p = landPoint();
     const s = makeSampler(hf)([{ x: p.x, z: p.z }, { x: p.x + 24, z: p.z }, { x: p.x + 48, z: p.z }]);

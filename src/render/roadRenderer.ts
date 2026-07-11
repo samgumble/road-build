@@ -242,6 +242,8 @@ export function buildRibbonGeometry(
   from: number,
   to: number,
   lateralOffset = 0,
+  capStart = false,
+  capEnd = false,
 ): THREE.BufferGeometry {
   const geo = new THREE.BufferGeometry();
   if (samples.length < 2 || to <= from) return geo;
@@ -319,6 +321,30 @@ export function buildRibbonGeometry(
   // If we never hit the `d > hi` break (hi === total, exact end), we're done — last pushed pair is the endpoint.
 
   if (positions.length === 0) return geo;
+
+  // Butt-ended ribbons leave a triangular hole where two ordinary edge groups meet at a bend,
+  // especially degree-2 corners (the decorative junction apron only exists for degree >= 3).
+  // Add endpoint disks to the SAME geometry/draw call whenever this range reaches a true graph
+  // endpoint. Full disks deliberately overlap harmlessly at shared nodes and guarantee coverage
+  // for any joining angle without needing topology-specific triangulation.
+  const addEndpointDisk = (p: SamplePoint) => {
+    const center = positions.length / 3;
+    const cx = p.x;
+    const cy = p.y + yLift;
+    const cz = p.z;
+    positions.push(cx, cy, cz);
+    normals.push(0, 1, 0);
+    const segments = 16;
+    for (let i = 0; i <= segments; i++) {
+      const angle = (i / segments) * Math.PI * 2;
+      positions.push(cx + Math.cos(angle) * half, cy, cz + Math.sin(angle) * half);
+      normals.push(0, 1, 0);
+    }
+    for (let i = 0; i < segments; i++) indices.push(center, center + i + 2, center + i + 1);
+    geo.userData.roadEndpointCaps = (geo.userData.roadEndpointCaps ?? 0) + 1;
+  };
+  if (capStart && lo <= 1e-6) addEndpointDisk(pts[0]);
+  if (capEnd && hi >= total - 1e-6) addEndpointDisk(pts[pts.length - 1]);
 
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
@@ -958,13 +984,18 @@ export class RoadRenderer {
       // paved color.
       const rollerT = Math.max(from, to - ROLLER_TRAIL_DISTANCE);
       if (rollerT > from) {
-        const compactedGeo = buildRibbonGeometry(samples, ROAD_WIDTH, STAGE_YLIFT.paved, from, rollerT);
+        const compactedGeo = buildRibbonGeometry(
+          samples, ROAD_WIDTH, STAGE_YLIFT.paved, from, rollerT, 0, from <= 1e-6, false,
+        );
         const compactedMat = makeStandardMaterial(PAVED_COMPACTED_COLOR, 1, 'ribbon');
         const compactedMesh = this.addMesh(v, compactedGeo, compactedMat);
         tagWeatherSurface(compactedMesh, 'asphalt');
       }
       if (rollerT < to) {
-        const freshGeo = buildRibbonGeometry(samples, ROAD_WIDTH, STAGE_YLIFT.paved, rollerT, to);
+        const total = cumulativeDistances(samples).at(-1)?.dist ?? 0;
+        const freshGeo = buildRibbonGeometry(
+          samples, ROAD_WIDTH, STAGE_YLIFT.paved, rollerT, to, 0, false, to >= total - 1e-6,
+        );
         const freshMat = makeStandardMaterial(STAGE_COLOR.paved, 1, 'ribbon');
         freshMat.roughness = 0.35; // fresh asphalt sheen start; advanced in update()
         const freshMesh = this.addMesh(v, freshGeo, freshMat);
@@ -976,7 +1007,10 @@ export class RoadRenderer {
 
     const yLift = STAGE_YLIFT[stage];
     const color = STAGE_COLOR[stage];
-    const geo = buildRibbonGeometry(samples, ROAD_WIDTH, yLift, from, to);
+    const total = cumulativeDistances(samples).at(-1)?.dist ?? 0;
+    const geo = buildRibbonGeometry(
+      samples, ROAD_WIDTH, yLift, from, to, 0, from <= 1e-6, to >= total - 1e-6,
+    );
     const mat = makeStandardMaterial(color, 1, 'ribbon');
     const mesh = this.addMesh(v, geo, mat);
     if (stage === 'paved' || stage === 'painted') {

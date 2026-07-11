@@ -3901,7 +3901,12 @@ export class ConstructionRenderer {
 
     for (const [edgeId, crossing] of this.bridgeCrossings) {
       const idle = this.clock - crossing.lastProgressAt > this.IDLE_TIMEOUT;
-      if (idle) {
+      const edgeStillExists = this.graph.edges.has(edgeId);
+      // A short final bridge remainder can leave the run before its 1.85s descend+bounce has
+      // finished. Keep that last span alive past the generic 0.2s vehicle-liveness timeout; once
+      // settleBridgeSpan completes, the next frame enters the normal cleanup below and clears the
+      // fully-settled mask. Removed edges still clean up immediately.
+      if (idle && (crossing.activeSpanIdx === null || !edgeStillExists)) {
         // Job moved off this bridge run (finished crossing it, or the whole job went idle/ended).
         // If every span settled, this was a clean completion — nothing left to mask, drop the
         // crossing entirely. Otherwise (job ended mid-crossing, e.g. edge externally removed)
