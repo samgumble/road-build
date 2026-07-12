@@ -103,10 +103,11 @@ connections with presentation-only cylinders or coplanar full-road overlays.
 
 ### Cached signatures
 
-Each node stores a lightweight rendered signature containing its degree, sorted incident edge IDs,
-incident completed stages, and control mode. A requested rebuild that produces the same signature
-is a no-op. This enforces the requirement that cleanup occurs only when a connection or control
-policy actually changes.
+Each node stores a topology signature (degree, sorted incident edge IDs, and headings), a separate
+surface signature (incident completed stages), and its control mode. Only a changed topology
+signature or control mode rebuilds connection geometry. A changed surface signature swaps cached
+material/visibility without rebuilding incident strips. This enforces the requirement that cleanup
+occurs only when a connection or control policy actually changes.
 
 ## Junction classification
 
