@@ -191,10 +191,10 @@ The first Road Craft slice shipped in `3baa112`; the program plans and this hand
 - GitHub Pages run `29154017546` passed its test/build/deploy jobs. The published smoke check loaded
   `assets/index-CTYerQ0x.js` at `https://samgumble.github.io/road-build/` with no console errors.
 
-## Current local slice — Living Towns / connected junctions / asset uplift (2026-07-11)
+## Living Towns / connected junctions / asset uplift — deployed 2026-07-11
 
-This slice is fully implemented and locally verified but should only be marked deployed after its
-commit is pushed and the Pages workflow finishes:
+Commit `c7041e6` is on `origin/main`. GitHub Pages run `29164866302` passed the full test,
+production-build, artifact-upload, and deploy jobs:
 
 - `GrowthSim` receives an independent morphology seed from `main.ts`. A pure, coordinate-derived
   two-octave field forms dense settlement pockets and quiet rural gaps; painted degree-3 junctions
@@ -221,3 +221,25 @@ commit is pushed and the Pages workflow finishes:
 - New focused coverage: graph centerline splitting, bidirectional lane routing, junction stripe
   cleanup, settlement morphology determinism/junction boost, full engineered-corridor clearing,
   vehicle contact layouts, roadway wear symmetry, and runtime model-style counts.
+- The post-deploy HTTP bundle fetch was not run because the Codex session reached its usage ceiling
+  immediately after Pages reported success. CI/Pages itself is green; the next worker should make
+  one direct published-site smoke check before starting another release slice.
+
+## Topology-owned junctions and bridge approaches — local 2026-07-11
+
+- `RoadRenderer` now owns degree-3+ intersections with one convex, topology-derived polygon built
+  from incident road headings. Completed asphalt, gravel, earth, shoulder, ditch, wear, paint, and
+  opening-pulse geometry terminates 5u before the node; the shared junction mesh owns the conflict
+  area and follows the same construction-stage and rain-material lifecycle as ordinary roads.
+- The old `RoadsideRenderer` gray cylinder apron was removed. Do not reintroduce presentation-only
+  intersection disks or independently overlaid edge strips at connected junctions.
+- Ground-to-bridge transitions use explicit 6u variable-width approach meshes. Ordinary road
+  surfaces, shoulders, ditches, repair patches, puddles, and edge wear are partitioned around those
+  zones, so the taper is the sole surface owner rather than a coplanar overlay. Fully-overwater
+  bridges remain unchanged.
+- Regression coverage in `tests/roadContinuity.test.ts` verifies the junction ownership radius,
+  endpoint-cap removal, exact approach extents/widths, and non-overlapping surface/detail ranges.
+  `tests/roadsideRenderer.test.ts` proves the legacy apron pool is gone.
+- Verification: 36 Vitest files / 304 tests pass; `npm run build` passes with only the existing
+  bundle-size advisory. A local saved-world smoke check showed clean connected intersections and
+  no browser warnings/errors.

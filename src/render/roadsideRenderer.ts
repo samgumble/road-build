@@ -21,7 +21,6 @@ export interface RoadsidePlan {
   reflectors: DetailPose[];
   signs: DetailPose[];
   utilityPoles: DetailPose[];
-  junctionAprons: DetailPose[];
   gravelScatter: DetailPose[];
 }
 
@@ -62,7 +61,7 @@ export function planRoadsideDetails(
 ): RoadsidePlan {
   const plan: RoadsidePlan = {
     culverts: [], retainingWalls: [], guardrails: [], reflectors: [], signs: [], utilityPoles: [],
-    junctionAprons: [], gravelScatter: [],
+    gravelScatter: [],
   };
 
   for (const edge of graph.edges.values()) {
@@ -127,7 +126,6 @@ export function planRoadsideDetails(
     });
     if (!painted || edgeIds.length < 3) continue;
     const y = terrain.heightAt(node.x, node.z);
-    plan.junctionAprons.push({ x: node.x, y: y + 0.025, z: node.z, heading: 0 });
     const first = graph.edges.get(edgeIds[0]);
     const heading = first ? headingAt(first.samples, first.a === node.id ? 0 : first.samples.length - 1) : 0;
     const sample = { x: node.x, y, z: node.z, bridge: false };
@@ -189,7 +187,6 @@ export class RoadsideRenderer {
     add(new THREE.BoxGeometry(0.72, 0.58, 0.08), material(0xd8c9a3), 220, (p) => p.signs, 1.55, new THREE.Vector3(1, 1, 1), yaw);
     add(new THREE.CylinderGeometry(0.09, 0.13, 5.2, 6), material(0x4c3928), 420, (p) => p.utilityPoles, 2.6, new THREE.Vector3(1, 1, 1));
     add(new THREE.BoxGeometry(1.6, 0.1, 0.1), material(0x403328), 420, (p) => p.utilityPoles, 5.0, new THREE.Vector3(1, 1, 1), yaw);
-    add(new THREE.CylinderGeometry(5.2, 5.2, 0.05, 16), material(0x777267), 180, (p) => p.junctionAprons, 0, new THREE.Vector3(1, 1, 1));
     add(new THREE.IcosahedronGeometry(0.16, 0), material(0x8f8879), 900, (p) => p.gravelScatter, 0.12, new THREE.Vector3(1, 0.55, 1), yaw);
 
     const rebuild = () => this.rebuild();

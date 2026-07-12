@@ -42,7 +42,7 @@ describe('context-sensitive roadside detail planning', () => {
     expect(first.culverts.length).toBeGreaterThan(0);
     expect(first.signs.length).toBeGreaterThan(0);
     expect(first.utilityPoles.length).toBeGreaterThan(0);
-    expect(first.junctionAprons.length).toBeGreaterThan(0);
+    expect('junctionAprons' in first).toBe(false); // RoadRenderer owns topology-shaped junctions.
   });
 
   it('never places ground furniture on bridge samples', () => {
@@ -69,7 +69,7 @@ describe('context-sensitive roadside detail planning', () => {
     bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
     const group = scene.getObjectByName('roadside-context-details')!;
     expect(group.children.every((child) => child instanceof THREE.InstancedMesh)).toBe(true);
-    expect(group.children.length).toBe(11);
+    expect(group.children.length).toBe(10);
     renderer.dispose();
   });
 });

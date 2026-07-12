@@ -79,7 +79,8 @@ const SURVEY_OPACITY = 0.55;
 const CENTERLINE_WIDTH = 0.5;
 const CENTERLINE_COLOR = '#e8e4d8';
 const CENTERLINE_YLIFT = 0.24;
-const JUNCTION_STRIPE_CLEARANCE = 5;
+const JUNCTION_REACH = 5;
+const BRIDGE_APPROACH_LENGTH = 6;
 
 /** Removes center paint from the compact asphalt apron at a true connected intersection. Ordinary
  * corners/dead ends retain their markings; degree-3+ nodes get a calm unstriped conflict area
@@ -93,13 +94,26 @@ export function trimJunctionStripeRange(
 ): { from: number; to: number } {
   let trimmedFrom = from;
   let trimmedTo = to;
-  if (startDegree >= 3 && from < JUNCTION_STRIPE_CLEARANCE) {
-    trimmedFrom = Math.max(from, Math.min(total, JUNCTION_STRIPE_CLEARANCE));
+  if (startDegree >= 3 && from < JUNCTION_REACH) {
+    trimmedFrom = Math.max(from, Math.min(total, JUNCTION_REACH));
   }
-  if (endDegree >= 3 && to > total - JUNCTION_STRIPE_CLEARANCE) {
-    trimmedTo = Math.min(to, Math.max(0, total - JUNCTION_STRIPE_CLEARANCE));
+  if (endDegree >= 3 && to > total - JUNCTION_REACH) {
+    trimmedTo = Math.min(to, Math.max(0, total - JUNCTION_REACH));
   }
   return { from: trimmedFrom, to: Math.max(trimmedFrom, trimmedTo) };
+}
+
+type JunctionSurfaceStage = 'graded' | 'gravel' | 'paved';
+
+function junctionSurfaceStage(stage: Stage): JunctionSurfaceStage | null {
+  if (stage === 'graded') return 'graded';
+  if (stage === 'gravel') return 'gravel';
+  if (stage === 'paved' || stage === 'painted') return 'paved';
+  return null;
+}
+
+function junctionSurfaceRank(stage: JunctionSurfaceStage): number {
+  return stage === 'graded' ? 0 : stage === 'gravel' ? 1 : 2;
 }
 
 // Phase 1 road-integration pass: a narrow compacted verge visually seats ground roads into the
@@ -276,6 +290,7 @@ export function buildRibbonGeometry(
   lateralOffset = 0,
   capStart = false,
   capEnd = false,
+  widthProfile?: (u: number) => number,
 ): THREE.BufferGeometry {
   const geo = new THREE.BufferGeometry();
   if (samples.length < 2 || to <= from) return geo;
@@ -289,13 +304,14 @@ export function buildRibbonGeometry(
 
   // Build the ordered list of (point, perp) pairs spanning [lo, hi], including
   // interpolated boundary vertices at exactly lo and hi.
-  const half = width / 2;
   const positions: number[] = [];
   const normals: number[] = [];
   const indices: number[] = [];
 
   const pushPair = (p: SamplePoint, perp: { px: number; pz: number }) => {
     const vi = positions.length / 3;
+    const rangeU = hi > lo ? (p.dist - lo) / (hi - lo) : 0;
+    const half = (widthProfile ? widthProfile(Math.max(0, Math.min(1, rangeU))) : width) / 2;
     const cx = p.x + perp.px * lateralOffset;
     const cz = p.z + perp.pz * lateralOffset;
     positions.push(cx + perp.px * half, p.y + yLift, cz + perp.pz * half);
@@ -355,11 +371,12 @@ export function buildRibbonGeometry(
   if (positions.length === 0) return geo;
 
   // Butt-ended ribbons leave a triangular hole where two ordinary edge groups meet at a bend,
-  // especially degree-2 corners (the decorative junction apron only exists for degree >= 3).
-  // Add endpoint disks to the SAME geometry/draw call whenever this range reaches a true graph
-  // endpoint. Full disks deliberately overlap harmlessly at shared nodes and guarantee coverage
-  // for any joining angle without needing topology-specific triangulation.
+  // especially degree-2 corners (degree-3+ nodes are owned by explicit junction geometry below).
+  // Add endpoint disks to the SAME geometry/draw call whenever this range reaches an ordinary
+  // dead-end/degree-2 graph endpoint. Degree-3+ ranges are trimmed before they reach this helper,
+  // so their shared center is owned exclusively by buildJunctionPatchGeometry instead.
   const addEndpointDisk = (p: SamplePoint) => {
+    const capHalf = width / 2;
     const center = positions.length / 3;
     const cx = p.x;
     const cy = p.y + yLift;
@@ -369,7 +386,7 @@ export function buildRibbonGeometry(
     const segments = 16;
     for (let i = 0; i <= segments; i++) {
       const angle = (i / segments) * Math.PI * 2;
-      positions.push(cx + Math.cos(angle) * half, cy, cz + Math.sin(angle) * half);
+      positions.push(cx + Math.cos(angle) * capHalf, cy, cz + Math.sin(angle) * capHalf);
       normals.push(0, 1, 0);
     }
     for (let i = 0; i < segments; i++) indices.push(center, center + i + 2, center + i + 1);
@@ -410,6 +427,77 @@ function mergeGeometries(geos: THREE.BufferGeometry[]): THREE.BufferGeometry {
   merged.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   merged.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
   return merged;
+}
+
+interface JunctionPoint { x: number; z: number }
+
+function convexHull(points: JunctionPoint[]): JunctionPoint[] {
+  const unique = [...new Map(points.map((point) => [`${point.x.toFixed(5)},${point.z.toFixed(5)}`, point])).values()]
+    .sort((a, b) => a.x - b.x || a.z - b.z);
+  if (unique.length <= 2) return unique;
+  const cross = (o: JunctionPoint, a: JunctionPoint, b: JunctionPoint) =>
+    (a.x - o.x) * (b.z - o.z) - (a.z - o.z) * (b.x - o.x);
+  const lower: JunctionPoint[] = [];
+  for (const point of unique) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) lower.pop();
+    lower.push(point);
+  }
+  const upper: JunctionPoint[] = [];
+  for (let i = unique.length - 1; i >= 0; i--) {
+    const point = unique[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) upper.pop();
+    upper.push(point);
+  }
+  lower.pop();
+  upper.pop();
+  return [...lower, ...upper];
+}
+
+/** Builds one topology-owned intersection polygon from the cross-sections of its incident arms.
+ * Unlike overlapping circular end caps, the convex perimeter follows the actual connected road
+ * headings and leaves no independent strip competing for the center. Geometry is world-space so
+ * all incident edge groups can terminate cleanly at the same JUNCTION_REACH boundary. */
+export function buildJunctionPatchGeometry(
+  x: number,
+  y: number,
+  z: number,
+  headings: readonly number[],
+  width = ROAD_WIDTH,
+  reach = JUNCTION_REACH,
+): THREE.BufferGeometry {
+  const geometry = new THREE.BufferGeometry();
+  if (!headings.length) return geometry;
+  const half = width / 2;
+  const candidates: JunctionPoint[] = [];
+  for (const heading of headings) {
+    const dx = Math.cos(heading), dz = Math.sin(heading);
+    const px = -dz, pz = dx;
+    candidates.push(
+      { x: x + px * half, z: z + pz * half },
+      { x: x - px * half, z: z - pz * half },
+      { x: x + dx * reach + px * half, z: z + dz * reach + pz * half },
+      { x: x + dx * reach - px * half, z: z + dz * reach - pz * half },
+    );
+  }
+  const hull = convexHull(candidates);
+  if (hull.length < 3) return geometry;
+  const positions = [x, y, z];
+  const normals = [0, 1, 0];
+  for (const point of hull) {
+    positions.push(point.x, y, point.z);
+    normals.push(0, 1, 0);
+  }
+  const indices: number[] = [];
+  for (let i = 0; i < hull.length; i++) {
+    const current = i + 1;
+    const next = ((i + 1) % hull.length) + 1;
+    // Hull is CCW in XZ; reverse each fan triangle so its Three.js face normal points +Y.
+    indices.push(0, next, current);
+  }
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geometry.setIndex(indices);
+  return geometry;
 }
 
 /** Builds a dashed ribbon: alternating "on" segments of `dashLen`, skipping `dashLen` in between, across [from, to]. */
@@ -471,18 +559,80 @@ function findBridgeRuns(samples: RoadSample[]): BridgeRun[] {
   return runs;
 }
 
+export interface BridgeApproachRange {
+  from: number;
+  to: number;
+  startWidth: number;
+  endWidth: number;
+}
+
+/** Dedicated ownership zones between terrain road and bridge deck. The ground-side end matches the
+ * full compacted shoulder width; the deck-side end matches ROAD_WIDTH exactly. This replaces the
+ * old visual cliff where unrelated shoulder/ditch/rail strips all stopped at the first boolean
+ * bridge sample. Fully-overwater roads have no ground approach and therefore return no range. */
+export function bridgeApproachRanges(samples: RoadSample[]): BridgeApproachRange[] {
+  if (samples.length < 2) return [];
+  const total = cumulativeDistances(samples).at(-1)?.dist ?? 0;
+  const ranges: BridgeApproachRange[] = [];
+  for (const run of findBridgeRuns(samples)) {
+    if (run.fromDist > 0) {
+      ranges.push({
+        from: Math.max(0, run.fromDist - BRIDGE_APPROACH_LENGTH),
+        to: run.fromDist,
+        startWidth: SHOULDER_WIDTH,
+        endWidth: ROAD_WIDTH,
+      });
+    }
+    if (run.toDist < total) {
+      ranges.push({
+        from: run.toDist,
+        to: Math.min(total, run.toDist + BRIDGE_APPROACH_LENGTH),
+        startWidth: ROAD_WIDTH,
+        endWidth: SHOULDER_WIDTH,
+      });
+    }
+  }
+  return ranges;
+}
+
 /** Subtracts bridge arclength runs from [from,to], leaving only terrain-backed ranges suitable
  * for shoulders. Conservative boundaries are intentional: a tiny missing verge at a bridge
  * abutment reads better than a gravel strip floating beside the deck. */
-function groundRanges(samples: RoadSample[], from: number, to: number): Array<{ from: number; to: number }> {
+function groundRanges(
+  samples: RoadSample[],
+  from: number,
+  to: number,
+  bridgeBuffer = 0,
+): Array<{ from: number; to: number }> {
   const out: Array<{ from: number; to: number }> = [];
   let cursor = from;
   for (const run of findBridgeRuns(samples)) {
-    const runFrom = Math.max(from, run.fromDist);
-    const runTo = Math.min(to, run.toDist);
+    const runFrom = Math.max(from, run.fromDist - bridgeBuffer);
+    const runTo = Math.min(to, run.toDist + bridgeBuffer);
     if (runTo <= runFrom) continue;
     if (cursor < runFrom) out.push({ from: cursor, to: runFrom });
     cursor = Math.max(cursor, runTo);
+  }
+  if (cursor < to) out.push({ from: cursor, to });
+  return out;
+}
+
+/** Removes the dedicated abutment tapers from a road-surface interval. The returned pieces and
+ * `bridgeApproachRanges()` form an exact, non-overlapping partition: ordinary ribbons own normal
+ * ground/deck, while one variable-width approach mesh owns each transition. */
+function rangesOutsideBridgeApproaches(
+  samples: RoadSample[],
+  from: number,
+  to: number,
+): Array<{ from: number; to: number }> {
+  const out: Array<{ from: number; to: number }> = [];
+  let cursor = from;
+  for (const approach of bridgeApproachRanges(samples)) {
+    const lo = Math.max(from, approach.from);
+    const hi = Math.min(to, approach.to);
+    if (hi <= lo) continue;
+    if (cursor < lo) out.push({ from: cursor, to: lo });
+    cursor = Math.max(cursor, hi);
   }
   if (cursor < to) out.push({ from: cursor, to });
   return out;
@@ -672,6 +822,8 @@ interface EdgeVisual {
 export class RoadRenderer {
   private visuals = new Map<number, EdgeVisual>();
   private clockSeconds = 0;
+  private readonly junctionGroup = new THREE.Group();
+  private junctionMeshes: THREE.Mesh[] = [];
 
   // Bridge construction theater (Task 22): persisted per-station/per-span animation state that
   // survives the throttled `rebuild()` cycle (see PylonRiseState/RailSettleState doc comments).
@@ -685,9 +837,20 @@ export class RoadRenderer {
     bus: EventBus,
     private hf: Heightfield,
   ) {
-    bus.on('roads:edgeAdded', ({ edgeId }) => this.onEdgeAdded(edgeId));
-    bus.on('roads:edgeRemoved', ({ edgeId }) => this.disposeEdge(edgeId));
-    bus.on('construction:stage', ({ edgeId, stage, crew }) => this.onStage(edgeId, stage, crew));
+    this.junctionGroup.name = 'road-junction-surfaces';
+    this.scene.add(this.junctionGroup);
+    bus.on('roads:edgeAdded', ({ edgeId }) => {
+      this.onEdgeAdded(edgeId);
+      this.rebuildJunctions();
+    });
+    bus.on('roads:edgeRemoved', ({ edgeId }) => {
+      this.disposeEdge(edgeId);
+      this.rebuildJunctions();
+    });
+    bus.on('construction:stage', ({ edgeId, stage, crew }) => {
+      this.onStage(edgeId, stage, crew);
+      this.rebuildJunctions();
+    });
     bus.on('construction:progress', ({ edgeId, stage, t, demolish }) => this.onProgress(edgeId, stage, t, demolish));
     bus.on('traffic:edgeEntered', ({ edgeId, firstUse }) => {
       this.trafficPasses.set(edgeId, (this.trafficPasses.get(edgeId) ?? 0) + 1);
@@ -697,6 +860,87 @@ export class RoadRenderer {
       if (firstUse) visual.openingPulseAt = this.clockSeconds;
       this.applyTrafficAppearance(visual, edgeId);
     });
+  }
+
+  private edgeArmAtNode(edge: RoadEdge, nodeId: number): { heading: number; y: number } | null {
+    if (edge.samples.length < 2) return null;
+    if (edge.a === nodeId) {
+      const a = edge.samples[0], b = edge.samples[1];
+      return { heading: Math.atan2(b.z - a.z, b.x - a.x), y: a.y };
+    }
+    if (edge.b === nodeId) {
+      const a = edge.samples[edge.samples.length - 1], b = edge.samples[edge.samples.length - 2];
+      return { heading: Math.atan2(b.z - a.z, b.x - a.x), y: a.y };
+    }
+    return null;
+  }
+
+  /** Rebuilds all completed degree-3+ conflict areas as topology-owned meshes. Mixed-stage
+   * junctions layer cumulatively: a newly graded branch expands the dirt foundation while the
+   * already-paved through road gets its own narrower asphalt patch on top. No edge-end strip owns
+   * the center, and no presentation-only terrain-height cylinder is involved. */
+  private rebuildJunctions(): void {
+    for (const mesh of this.junctionMeshes) {
+      this.junctionGroup.remove(mesh);
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+    }
+    this.junctionMeshes = [];
+
+    for (const node of this.graph.nodes.values()) {
+      const edgeIds = this.graph.edgesAtNode(node.id);
+      if (edgeIds.length < 3) continue;
+      const arms = edgeIds.flatMap((edgeId) => {
+        const edge = this.graph.edges.get(edgeId);
+        if (!edge) return [];
+        const stage = junctionSurfaceStage(edge.stage);
+        const arm = this.edgeArmAtNode(edge, node.id);
+        return stage && arm ? [{ ...arm, stage }] : [];
+      });
+      const stages = [...new Set(arms.map((arm) => arm.stage))]
+        .sort((a, b) => junctionSurfaceRank(a) - junctionSurfaceRank(b));
+      for (const stage of stages) {
+        const eligible = arms.filter((arm) => junctionSurfaceRank(arm.stage) >= junctionSurfaceRank(stage));
+        if (!eligible.length) continue;
+        const y = Math.max(...eligible.map((arm) => arm.y)) + STAGE_YLIFT[stage] + 0.003;
+        const geometry = buildJunctionPatchGeometry(
+          node.x, y, node.z, eligible.map((arm) => arm.heading), ROAD_WIDTH, JUNCTION_REACH,
+        );
+        if (!geometry.getAttribute('position')) continue;
+        const material = makeStandardMaterial(STAGE_COLOR[stage], 1, 'ribbon');
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.receiveShadow = true;
+        mesh.userData.roadDetail = 'junctionSurface';
+        mesh.userData.junctionStage = stage;
+        tagWeatherSurface(mesh, stage === 'graded' ? 'earth' : stage === 'gravel' ? 'gravel' : 'asphalt');
+        this.junctionGroup.add(mesh);
+        this.junctionMeshes.push(mesh);
+      }
+    }
+  }
+
+  private junctionOwnsEdgeEnd(edge: RoadEdge, nodeId: number, stage: Exclude<Stage, 'surveyed'>): boolean {
+    if (this.graph.edgesAtNode(nodeId).length < 3) return false;
+    const completed = junctionSurfaceStage(edge.stage);
+    const requested = junctionSurfaceStage(stage);
+    return completed !== null && requested !== null
+      && junctionSurfaceRank(completed) >= junctionSurfaceRank(requested);
+  }
+
+  private trimToJunctionOwnership(
+    edge: RoadEdge,
+    stage: Exclude<Stage, 'surveyed'>,
+    from: number,
+    to: number,
+    total: number,
+  ): { from: number; to: number } {
+    return trimJunctionStripeRange(
+      from,
+      to,
+      total,
+      this.junctionOwnsEdgeEnd(edge, edge.a, stage) ? 3 : 0,
+      this.junctionOwnsEdgeEnd(edge, edge.b, stage) ? 3 : 0,
+    );
   }
 
   private onEdgeAdded(edgeId: number): void {
@@ -1007,6 +1251,15 @@ export class RoadRenderer {
   private buildStageRange(v: EdgeVisual, samples: RoadSample[], stage: Exclude<Stage, 'surveyed'>, from: number, to: number, advancing: boolean): void {
     if (to <= from) return;
 
+    const total = cumulativeDistances(samples).at(-1)?.dist ?? 0;
+    const edge = this.graph.edges.get(Number(v.group.userData.edgeId));
+    if (edge) {
+      const owned = this.trimToJunctionOwnership(edge, stage, from, to, total);
+      from = owned.from;
+      to = owned.to;
+      if (to <= from) return;
+    }
+
     this.buildShoulders(v, samples, stage, from, to);
 
     if (stage === 'paved' && advancing) {
@@ -1015,46 +1268,54 @@ export class RoadRenderer {
       // the roller and the paver's leading edge ([rollerT, to]) is freshly laid, still the normal
       // paved color.
       const rollerT = Math.max(from, to - ROLLER_TRAIL_DISTANCE);
-      if (rollerT > from) {
+      for (const range of rangesOutsideBridgeApproaches(samples, from, rollerT)) {
         const compactedGeo = buildRibbonGeometry(
-          samples, ROAD_WIDTH, STAGE_YLIFT.paved, from, rollerT, 0, from <= 1e-6, false,
+          samples, ROAD_WIDTH, STAGE_YLIFT.paved, range.from, range.to, 0,
+          range.from <= 1e-6, range.to >= total - 1e-6,
         );
         const compactedMat = makeStandardMaterial(PAVED_COMPACTED_COLOR, 1, 'ribbon');
         const compactedMesh = this.addMesh(v, compactedGeo, compactedMat);
+        compactedMesh.userData.roadDetail = 'roadSurface';
         tagWeatherSurface(compactedMesh, 'asphalt');
       }
-      if (rollerT < to) {
-        const total = cumulativeDistances(samples).at(-1)?.dist ?? 0;
+      for (const range of rangesOutsideBridgeApproaches(samples, rollerT, to)) {
         const freshGeo = buildRibbonGeometry(
-          samples, ROAD_WIDTH, STAGE_YLIFT.paved, rollerT, to, 0, false, to >= total - 1e-6,
+          samples, ROAD_WIDTH, STAGE_YLIFT.paved, range.from, range.to, 0,
+          range.from <= 1e-6, range.to >= total - 1e-6,
         );
         const freshMat = makeStandardMaterial(STAGE_COLOR.paved, 1, 'ribbon');
         freshMat.roughness = 0.35; // fresh asphalt sheen start; advanced in update()
         const freshMesh = this.addMesh(v, freshGeo, freshMat);
+        freshMesh.userData.roadDetail = 'roadSurface';
         freshMesh.userData.freshAsphalt = true;
         tagWeatherSurface(freshMesh, 'asphalt');
       }
+      this.buildBridgeApproaches(v, samples, stage, from, to);
       return;
     }
 
     const yLift = STAGE_YLIFT[stage];
     const color = STAGE_COLOR[stage];
-    const total = cumulativeDistances(samples).at(-1)?.dist ?? 0;
-    const geo = buildRibbonGeometry(
-      samples, ROAD_WIDTH, yLift, from, to, 0, from <= 1e-6, to >= total - 1e-6,
-    );
-    const mat = makeStandardMaterial(color, 1, 'ribbon');
-    const mesh = this.addMesh(v, geo, mat);
-    if (stage === 'paved' || stage === 'painted') {
-      mat.roughness = 0.35; // fresh asphalt sheen start; advanced in update()
-      mesh.userData.freshAsphalt = true;
+    for (const range of rangesOutsideBridgeApproaches(samples, from, to)) {
+      const geo = buildRibbonGeometry(
+        samples, ROAD_WIDTH, yLift, range.from, range.to, 0,
+        range.from <= 1e-6, range.to >= total - 1e-6,
+      );
+      const mat = makeStandardMaterial(color, 1, 'ribbon');
+      const mesh = this.addMesh(v, geo, mat);
+      mesh.userData.roadDetail = 'roadSurface';
+      if (stage === 'paved' || stage === 'painted') {
+        mat.roughness = 0.35; // fresh asphalt sheen start; advanced in update()
+        mesh.userData.freshAsphalt = true;
+      }
+      tagWeatherSurface(mesh, stage === 'graded' ? 'earth' : stage === 'gravel' ? 'gravel' : 'asphalt');
     }
-    tagWeatherSurface(mesh, stage === 'graded' ? 'earth' : stage === 'gravel' ? 'gravel' : 'asphalt');
+
+    this.buildBridgeApproaches(v, samples, stage, from, to);
 
     if (stage === 'painted') {
       this.buildTireWear(v, samples, from, to);
       this.buildSurfaceLife(v, samples, from, to);
-      const edge = this.graph.edges.get(Number(v.group.userData.edgeId));
       const stripeRange = edge
         ? trimJunctionStripeRange(
           from,
@@ -1080,17 +1341,60 @@ export class RoadRenderer {
     }
   }
 
+  private buildBridgeApproaches(
+    v: EdgeVisual,
+    samples: RoadSample[],
+    stage: Exclude<Stage, 'surveyed'>,
+    from: number,
+    to: number,
+  ): void {
+    if (stage === 'graded') return; // no deck yet; shoulder remains construction earth
+    for (const approach of bridgeApproachRanges(samples)) {
+      const lo = Math.max(from, approach.from);
+      const hi = Math.min(to, approach.to);
+      if (hi <= lo) continue;
+      const fullLength = approach.to - approach.from;
+      const u0 = fullLength > 0 ? (lo - approach.from) / fullLength : 0;
+      const u1 = fullLength > 0 ? (hi - approach.from) / fullLength : 1;
+      const widthAt = (u: number) => {
+        const fullU = u0 + (u1 - u0) * u;
+        return approach.startWidth + (approach.endWidth - approach.startWidth) * fullU;
+      };
+      const geometry = buildRibbonGeometry(
+        samples,
+        widthAt(0),
+        STAGE_YLIFT[stage],
+        lo,
+        hi,
+        0,
+        false,
+        false,
+        widthAt,
+      );
+      const material = makeStandardMaterial(STAGE_COLOR[stage], 1, 'ribbon');
+      material.roughness = stage === 'gravel' ? 0.9 : 0.48;
+      const mesh = this.addMesh(v, geometry, material);
+      mesh.userData.roadDetail = 'bridgeApproach';
+      tagWeatherSurface(mesh, stage === 'gravel' ? 'gravel' : 'asphalt');
+    }
+  }
+
   private buildShoulders(v: EdgeVisual, samples: RoadSample[], stage: Exclude<Stage, 'surveyed'>, from: number, to: number): void {
     const weatherKind: RoadSurfaceKind = stage === 'graded' ? 'earth' : 'gravel';
-    for (const range of groundRanges(samples, from, to)) {
-      const yLift = Math.max(0.015, STAGE_YLIFT[stage] - SHOULDER_Y_GAP);
+    const yLift = Math.max(0.015, STAGE_YLIFT[stage] - SHOULDER_Y_GAP);
+    const shoulderBuffer = stage === 'graded' ? 0 : BRIDGE_APPROACH_LENGTH;
+    for (const range of groundRanges(samples, from, to, shoulderBuffer)) {
       const geo = buildRibbonGeometry(samples, SHOULDER_WIDTH, yLift, range.from, range.to);
       const mat = makeStandardMaterial(SHOULDER_COLOR[stage], 1, 'shoulder');
       mat.roughness = 1;
       const mesh = this.addMesh(v, geo, mat);
       mesh.userData.roadDetail = 'shoulder';
       tagWeatherSurface(mesh, weatherKind);
+    }
 
+    // The tapered bridge approach owns the full verge-to-deck transition. End drainage before
+    // that zone so ditch ribbons cannot float beside the deck or cut diagonally through the taper.
+    for (const range of groundRanges(samples, from, to, BRIDGE_APPROACH_LENGTH)) {
       const left = buildRibbonGeometry(samples, DITCH_WIDTH, Math.max(0.005, yLift - 0.04), range.from, range.to, DITCH_OFFSET);
       const right = buildRibbonGeometry(samples, DITCH_WIDTH, Math.max(0.005, yLift - 0.04), range.from, range.to, -DITCH_OFFSET);
       const ditchGeo = mergeGeometries([left, right]);
@@ -1123,7 +1427,9 @@ export class RoadRenderer {
 
   private buildSurfaceLife(v: EdgeVisual, samples: RoadSample[], from: number, to: number): void {
     const edgeId = v.group.userData.edgeId as number;
-    const terrainRanges = groundRanges(samples, from, to);
+    // Approach slabs are intentionally clean transition geometry. Keep edge wear, puddles, and
+    // repairs out of that ownership zone instead of layering ground-only details over the taper.
+    const terrainRanges = groundRanges(samples, from, to, BRIDGE_APPROACH_LENGTH);
     if (!terrainRanges.length) return;
     const onGround = (distance: number) => terrainRanges.some((range) => distance >= range.from && distance <= range.to);
     const details = surfaceDetailStations(edgeId, to);
@@ -1446,6 +1752,18 @@ export class RoadRenderer {
         }
         if (u >= 1) v.openingPulseAt = null;
       }
+    }
+
+    // Junction surfaces are not children of an edge visual, but they represent the same authored
+    // materials and must react to rain identically. Apply from stored dry values each frame so
+    // rebuilds and weather transitions remain non-compounding.
+    for (const mesh of this.junctionMeshes) {
+      const kind = mesh.userData.weatherSurface as RoadSurfaceKind | undefined;
+      if (!kind) continue;
+      const material = mesh.material as THREE.MeshStandardMaterial;
+      const appearance = wetRoadAppearance(kind, rainAmount, mesh.userData.dryRoughness as number);
+      material.color.setHex(mesh.userData.dryColor as number).multiplyScalar(appearance.colorScale);
+      material.roughness = appearance.roughness;
     }
 
     // Bridge construction theater (Task 22): pylon-rise/rail-settle eases tick every frame,
