@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import type { P2, RoadSample } from '../core/types';
 import { RoadGraph } from '../sim/roads/graph';
-import { validateChain, makeSampler } from '../sim/roads/path';
+import { validateChain, explainChainRejection, makeSampler } from '../sim/roads/path';
 import type { Heightfield } from '../sim/terrain/heightfield';
 
 const PREVIEW_COLOR = 0xe8641b;
@@ -165,6 +165,16 @@ export function resolveDrawSnap(
 export class DrawTool {
   mode: DrawToolMode = 'draw';
 
+  /** Set by main.ts to surface WHY a released chain couldn't be committed (a short uppercase
+   * HUD-notice string from `explainChainRejection`) — same wiring pattern as CameraRig's
+   * `onTwoFingerStart`. Fires only on an actual failed release, never during the drag. */
+  onRejected: ((reason: string) => void) | null = null;
+
+  /** Set by main.ts to open the HUD's undo window with the edge ids a successful commit created
+   * (`commitChain`'s return value — the drawn chain's own new edges only, never split halves of
+   * pre-existing roads it crossed). */
+  onCommitted: ((edgeIds: number[]) => void) | null = null;
+
   private sampler: (ctrl: P2[]) => RoadSample[];
   private raycaster = new THREE.Raycaster();
   private ndc = new THREE.Vector2();
@@ -325,9 +335,12 @@ export class DrawTool {
       this.pointerId = null;
 
       if (this.chainValid && this.chain.length >= 2) {
-        this.graph.commitChain(this.chain);
+        const edgeIds = this.graph.commitChain(this.chain);
+        if (edgeIds.length > 0 && this.onCommitted) this.onCommitted(edgeIds);
         this.clearPreview();
       } else {
+        const reason = explainChainRejection(this.chain, this.hf);
+        if (reason && this.onRejected) this.onRejected(reason);
         this.startFade();
       }
       this.chain = [];

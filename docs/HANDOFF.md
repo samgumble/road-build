@@ -95,6 +95,16 @@ assuming a green build means the page is live.
   with source intent/provenance in `public/art/README.md`. `StartScreen` keeps the sim paused and
   the HUD inert until Continue/Enter/Space, then unlocks audio and crossfades into the ready world.
   New/returning sites get distinct labels without changing save semantics.
+- Survey feedback and undo: a rejected chain release fades AND explains itself through the notice
+  channel (`explainChainRejection` in `src/sim/roads/path.ts` owns every rejection rule;
+  `validateChain` is its boolean shadow — add new rules there, in one place). Each successful
+  commit opens an 8-second `UNDO SURVEY` chip (`Z` shortcut) driven by the pure `UndoWindow`
+  helper in `hud.ts`; undo simply routes `commitChain`'s returned edge ids (never split halves of
+  crossed pre-existing roads) into `BuildQueue.enqueueDemolish`, whose existing per-state handling
+  makes an untouched survey vanish instantly and a started one walk back down.
+- Share: the toolbar Share button copies `islandShareUrl(location.href, seed)` — origin+path with
+  exactly one `?seed=` param, any prior query/hash replaced — falling back to showing the link in
+  a notice when clipboard access is denied.
 
 ## Invariants worth protecting
 
@@ -118,12 +128,16 @@ assuming a green build means the page is live.
   and corridor clearing; do not reuse the field/tree center-distance rule blindly.
 - **Road detail layering:** Keep shoulder polygon offset weaker than the road ribbon and omit it on
   bridge arclength ranges. Decorative wear must remain presentation-only and share mesh disposal.
+- **Undo stays a thin input:** The undo window is wall-clock UI state, not sim state — it must
+  never enter the save file, and undoing must stay "enqueueDemolish over the last commit's own
+  edge ids" (filtered for edges that still exist) rather than growing a parallel removal path.
 
 ## Current improvement backlog
 
 These are deliberately uncommitted product directions, not known blockers:
 
-1. Add a short undo window for the last committed survey and clearer “cannot build here” feedback.
+1. ~~Add a short undo window for the last committed survey and clearer “cannot build here”
+   feedback.~~ Shipped — see "Survey feedback and undo" above.
 2. Add an optional traffic-health diagnostic (throughput/jam hot spots), not a noisy permanent HUD.
 3. Introduce road classes or a planning mode before committing long networks.
 4. Add camera bookmarks / focus-active-crew shortcuts for larger settlements.

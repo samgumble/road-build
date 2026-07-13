@@ -6,7 +6,61 @@ import {
   formatGrowthControl,
   formatSiteOverview,
   formatToolbarCollapse,
+  UndoWindow,
+  UNDO_WINDOW_MS,
+  islandShareUrl,
 } from '../src/ui/hud';
+
+describe('islandShareUrl', () => {
+  it('builds a canonical share link from the page URL and seed', () => {
+    expect(islandShareUrl('https://samgumble.github.io/road-build/', 'amber-valley'))
+      .toBe('https://samgumble.github.io/road-build/?seed=amber-valley');
+  });
+  it('replaces any existing query/hash rather than appending to it', () => {
+    expect(islandShareUrl('https://samgumble.github.io/road-build/?seed=old-one#x', 'misty-ford'))
+      .toBe('https://samgumble.github.io/road-build/?seed=misty-ford');
+  });
+  it('URL-encodes seeds that need it', () => {
+    expect(islandShareUrl('http://localhost:5173/', 'two words'))
+      .toBe('http://localhost:5173/?seed=two+words');
+  });
+});
+
+describe('UndoWindow', () => {
+  it('opens on a commit, stays open within the window, and expires after UNDO_WINDOW_MS', () => {
+    const w = new UndoWindow();
+    expect(w.isOpen(0)).toBe(false);
+    w.open([3, 4], 1000);
+    expect(w.isOpen(1000)).toBe(true);
+    expect(w.isOpen(1000 + UNDO_WINDOW_MS - 1)).toBe(true);
+    expect(w.isOpen(1000 + UNDO_WINDOW_MS)).toBe(false);
+  });
+  it('consume returns the committed edge ids exactly once, then closes', () => {
+    const w = new UndoWindow();
+    w.open([7], 0);
+    expect(w.consume(10)).toEqual([7]);
+    expect(w.isOpen(10)).toBe(false);
+    expect(w.consume(10)).toEqual([]);
+  });
+  it('consume after expiry returns nothing', () => {
+    const w = new UndoWindow();
+    w.open([9], 0);
+    expect(w.consume(UNDO_WINDOW_MS + 1)).toEqual([]);
+  });
+  it('a new commit replaces the previous window entirely (ids and deadline)', () => {
+    const w = new UndoWindow();
+    w.open([1], 0);
+    w.open([2, 5], UNDO_WINDOW_MS); // second survey committed just as the first expires
+    expect(w.consume(UNDO_WINDOW_MS + 10)).toEqual([2, 5]);
+  });
+  it('close() hides the window without consuming', () => {
+    const w = new UndoWindow();
+    w.open([1], 0);
+    w.close();
+    expect(w.isOpen(1)).toBe(false);
+    expect(w.consume(1)).toEqual([]);
+  });
+});
 
 describe('formatSiteOverview', () => {
   it('turns live site metrics into a compact player-facing briefing', () => {

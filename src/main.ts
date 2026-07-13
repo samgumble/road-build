@@ -322,8 +322,23 @@ function main(): void {
     getGrowthPaused: () => growth.isDevelopmentPaused,
     setGrowthPaused: (paused) => growth.setDevelopmentPaused(paused),
     onNewWorld: navigateToSeed,
+    // Undo-last-survey: withdraw each edge the last commit created. enqueueDemolish already does
+    // the right thing per edge state — a still-'surveyed' pending edge instant-removes, and one a
+    // crew has started on converts to a demolition walk-back. Filter ids the player already
+    // demolished by hand during the window so we never queue a demolish for a missing edge.
+    onUndoSurvey: (edgeIds) => {
+      for (const edgeId of edgeIds) {
+        if (graph.edges.has(edgeId)) buildQueue.enqueueDemolish(edgeId);
+      }
+    },
   });
   hud.suppressHintIfRoadsExist(restoredRoads);
+  // Chain-rejection feedback: the DrawTool already fades an invalid preview; this pairs the fade
+  // with a short notice saying WHY (too short / off-island / water endpoint) through the same
+  // channel milestone notices use.
+  drawTool.onRejected = (reason) => hud.showNotice(reason);
+  // Undo window: every successful commit (re-)opens the HUD's transient UNDO SURVEY chip.
+  drawTool.onCommitted = (edgeIds) => hud.openUndoWindow(edgeIds);
 
   // The title screen owns keyboard/focus while it is visible and keeps the fixed-step sim frozen;
   // the render loop still paints behind it, so dismissal crossfades directly into a fully-ready
