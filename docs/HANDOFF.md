@@ -125,6 +125,10 @@ assuming a green build means the page is live.
   settlement pair); phases are hash-seeded, walking uses render dt (theater ambles at any sim
   speed), and the whole group hides at night via `atmosphere:phase`. Pure render theater — no sim
   contract, no save state.
+- Bridge approach rails: `planBridgeApproachRails` (in `roadsideRenderer.ts`, called per edge by
+  the planner) rails BOTH verges of every road-to-bridge transition at two setbacks on the land
+  run. The station loop skips bridge samples entirely, so without this pass the embankment-to-deck
+  lip was guaranteed unrailed. Poses feed the existing guardrail pool — no new draw calls.
 - Instancing audit (2026-07-13): every population-scaled renderer is instanced (cars, scenery GLB
   variants, roadside pools, construction cone/floodlight/particle pools, villagers). The only
   per-object draws are the three bounded construction crew rigs (cheap primitives per the Task 25

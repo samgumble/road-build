@@ -59,6 +59,46 @@ describe('context-sensitive roadside detail planning', () => {
     expect(plan.streetlamps).toEqual([]);
   });
 
+  it('rails both verges of every road-to-bridge approach, on the land side only', () => {
+    const bus = new EventBus();
+    // straight 80u road along x with a bridge span between x=20 and x=60; flat land everywhere so
+    // no drop/water guardrails muddy the assertion — every rail must come from the approaches.
+    // Sampled at 2u (the real sampler's spacing) so the setback walk lands where it would in game.
+    const bridgeSampler = (ctrl: P2[]): RoadSample[] => {
+      const out: RoadSample[] = [];
+      const a = ctrl[0], b = ctrl[ctrl.length - 1];
+      const length = Math.hypot(b.x - a.x, b.z - a.z);
+      const steps = Math.round(length / 2);
+      for (let i = 0; i <= steps; i++) {
+        const u = i / steps;
+        const x = a.x + (b.x - a.x) * u;
+        const z = a.z + (b.z - a.z) * u;
+        out.push({ x, y: 0, z, bridge: x > 20 && x < 60 });
+      }
+      return out;
+    };
+    const graph = new RoadGraph(bus, bridgeSampler);
+    graph.commitChain([{ x: 0, z: 0 }, { x: 80, z: 0 }]);
+    for (const edge of graph.edges.values()) edge.stage = 'painted';
+    const flat = { heightAt: () => 0, isLand: () => true };
+
+    const plan = planRoadsideDetails(graph, flat, []);
+    expect(plan.guardrails.length).toBeGreaterThanOrEqual(8); // 2 rails x 2 verges x 2 approaches
+
+    for (const rail of plan.guardrails) {
+      // never out on the deck: every approach rail stands on the land run
+      expect(rail.x <= 20 + 1e-6 || rail.x >= 60 - 1e-6).toBe(true);
+      // and hugs one of the two transitions rather than scattering down the road
+      const nearTransition = Math.min(Math.abs(rail.x - 20), Math.abs(rail.x - 60));
+      expect(nearTransition).toBeLessThanOrEqual(12);
+    }
+    // both verges of the road are railed (road runs along x, so verges sit at +/-z)
+    expect(plan.guardrails.some((rail) => rail.z > 0)).toBe(true);
+    expect(plan.guardrails.some((rail) => rail.z < 0)).toBe(true);
+    // deterministic like every other detail
+    expect(planRoadsideDetails(graph, flat, [])).toEqual(plan);
+  });
+
   it('plans streetlamps only on painted stretches near settlements, on the opposite station parity to utility poles', () => {
     const bus = new EventBus();
     const graph = new RoadGraph(bus, sampler);
