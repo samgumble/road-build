@@ -6,6 +6,7 @@ import { createScene } from './render/scene';
 import { TerrainRenderer } from './render/terrainRenderer';
 import { RoadRenderer } from './render/roadRenderer';
 import { RoadsideRenderer } from './render/roadsideRenderer';
+import { VillagerRenderer } from './render/villagerRenderer';
 import { CameraRig } from './input/cameraRig';
 import { DrawTool } from './input/drawTool';
 import { RoadGraph } from './sim/roads/graph';
@@ -147,6 +148,7 @@ function main(): void {
   const growth = new GrowthSim(graph, hf, bus, createRng('growth-' + hf.seed), morphologySeed);
   const sceneryRenderer = new SceneryRenderer(scene, hf, bus);
   const roadsideRenderer = new RoadsideRenderer(scene, graph, hf, bus);
+  const villagerRenderer = new VillagerRenderer(scene, graph, hf, bus);
 
   // Task 31: ambient wilderness — sparse seeded trees scattered across the island, generated
   // deterministically from the same seed as the Heightfield. Unlike GrowthSim's road-driven
@@ -237,6 +239,7 @@ function main(): void {
       // setting, popping buildings out instantly at ~1.5% through their local fade rather than
       // smoothly finishing together.
       sceneryRenderer.update(dt * loop.timeScale);
+      villagerRenderer.update(dt);
       // Audio intentionally stays real-time: `update()` uses `dt` only for its own wall-clock
       // scheduling (bird/cricket timers, pad chord crossfades), not to advance the day cycle —
       // `timeOfDay` is read from `atmosphere.timeOfDay`, which is already correctly scaled above.
@@ -290,6 +293,7 @@ function main(): void {
   sceneryRenderer.setWilderness(wildernessSim.activeWithIndex);
   // Seed settlement-aware utility poles after restore (live growth events keep this current).
   roadsideRenderer.setSettlements(growth.spawned);
+  villagerRenderer.setSettlements(growth.spawned);
 
   const navigateToSeed = (newSeed: string) => {
     // Each seed owns its own save slot (starting empty for a seed that's never been visited),

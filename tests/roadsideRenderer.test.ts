@@ -56,6 +56,47 @@ describe('context-sensitive roadside detail planning', () => {
     expect(plan.culverts).toEqual([]);
     expect(plan.reflectors).toEqual([]);
     expect(plan.utilityPoles).toEqual([]);
+    expect(plan.streetlamps).toEqual([]);
+  });
+
+  it('plans streetlamps only on painted stretches near settlements, on the opposite station parity to utility poles', () => {
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, sampler);
+    graph.commitChain([{ x: 0, z: 0 }, { x: 40, z: 0 }, { x: 80, z: 0 }]);
+    for (const edge of graph.edges.values()) edge.stage = 'painted';
+    const settlements = [{ id: 1, kind: 'house' as const, x: 25, z: 10 }];
+
+    const plan = planRoadsideDetails(graph, terrain, settlements);
+    expect(plan.streetlamps.length).toBeGreaterThan(0);
+    // every lamp stands close to the settlement that justified it (24u sample radius + verge offset)
+    for (const lamp of plan.streetlamps) {
+      expect(Math.hypot(lamp.x - 25, lamp.z - 10)).toBeLessThanOrEqual(24 + 8);
+    }
+
+    // no settlements -> no lamps; unpainted road -> no lamps
+    expect(planRoadsideDetails(graph, terrain, []).streetlamps).toEqual([]);
+    for (const edge of graph.edges.values()) edge.stage = 'gravel';
+    expect(planRoadsideDetails(graph, terrain, settlements).streetlamps).toEqual([]);
+  });
+
+  it('night-gates the lamp head glow and light pool through setNight', () => {
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, sampler);
+    const scene = new THREE.Scene();
+    const renderer = new RoadsideRenderer(scene, graph, terrain, bus);
+    const group = scene.getObjectByName('roadside-context-details')!;
+    const head = group.getObjectByName('streetlamp-heads') as THREE.InstancedMesh;
+    const glow = group.getObjectByName('streetlamp-glow') as THREE.InstancedMesh;
+    expect(head).toBeTruthy();
+    expect(glow).toBeTruthy();
+
+    renderer.setNight(true);
+    expect((head.material as THREE.MeshStandardMaterial).emissiveIntensity).toBeGreaterThan(1);
+    expect((glow.material as THREE.MeshBasicMaterial).opacity).toBeGreaterThan(0);
+    renderer.setNight(false);
+    expect((head.material as THREE.MeshStandardMaterial).emissiveIntensity).toBeLessThan(0.2);
+    expect((glow.material as THREE.MeshBasicMaterial).opacity).toBe(0);
+    renderer.dispose();
   });
 
   it('uses a fixed bounded set of shared instanced pools', () => {
@@ -69,7 +110,7 @@ describe('context-sensitive roadside detail planning', () => {
     bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
     const group = scene.getObjectByName('roadside-context-details')!;
     expect(group.children.every((child) => child instanceof THREE.InstancedMesh)).toBe(true);
-    expect(group.children.length).toBe(10);
+    expect(group.children.length).toBe(13); // 10 context-furniture pools + lamp post/head/glow
     renderer.dispose();
   });
 });

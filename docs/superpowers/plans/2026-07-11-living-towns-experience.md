@@ -26,6 +26,20 @@
 The explicit serializable `SettlementCenter`/character/objective layers below remain future work;
 the delivered morphology layer is intentionally migration-free infrastructure for those systems.
 
+## Delivered parcel-variety slice — 2026-07-13 (Claude session)
+
+- [x] Pocket parks: a coordinate-seeded fraction of house-threshold parcels spawn `kind: 'park'`
+  (field-footprint green patch + its own tree records) instead of a house — migration-free, same
+  `morphologyHash` family as the pocket noise. Partial delivery of Task 2's parcel variety.
+- [x] Low-rise damping: each cell rolls a seeded tolerance (1–3 buildings within 20u) when it first
+  passes the upgrade gate; at/over tolerance it permanently stays a house. Breaks continuous tower
+  walls without touching core upgrade rules.
+- [x] Street-level town dressing shipped alongside (render-only): settlement streetlamps with
+  night-gated glow in `RoadsideRenderer`, and day-strolling villagers (`villagerRenderer.ts`).
+
+> Coordination note: the slices above are merged work — do not re-implement parks/low-rise variety
+> from scratch; extend them (e.g. into `SettlementCenter` characters) instead.
+
 ## Task 1: Seed settlement pockets instead of continuous roadside walls
 
 **Files:** `src/sim/growth/growth.ts`, `src/sim/save.ts`, `tests/growth.test.ts`, `tests/save.test.ts`

@@ -19,7 +19,7 @@ export interface GameEvents {
   // persisted in saves — lets upgrade/stranded-decay events (below) reference a specific record
   // without relying on array position. Optional so pre-Task-35 callers/tests that construct this
   // payload by hand still type-check; consumers should treat a missing id defensively.
-  'growth:spawn': { kind: 'tree' | 'field' | 'house' | 'building'; x: number; z: number; rot: number; id?: number };
+  'growth:spawn': { kind: 'tree' | 'field' | 'house' | 'building' | 'park'; x: number; z: number; rot: number; id?: number };
   // Task 35: a house record upgraded in place to a building (same id, cell dev >= 1.35 with >= 2
   // developed neighbor cells). Renderer swaps the house instance for a building instance with a
   // pop animation; houseCount decrements. Fires at most once per record.

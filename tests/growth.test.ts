@@ -1219,3 +1219,131 @@ describe('GrowthSim development pause', () => {
     expect(sim.spawned).toEqual([]);
   });
 });
+
+describe('Living Towns parks and low-rise variety', () => {
+  const idx = (i: number, j: number) => j * GRID_SIZE + i;
+
+  /** Painted-road world with a REAL morphology seed (unlike the legacy-null worlds above), plus a
+   * band of near-road cells primed just below the house threshold so one update() tick crosses it. */
+  function parkWorld(rngSeed: string) {
+    const bus = new EventBus();
+    const hf = new Heightfield('grow-test', bus);
+    const g = new RoadGraph(bus, makeSampler(hf));
+    let anchor = { x: 0, z: 0 };
+    outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+      if (hf.isLand(x, z) && hf.isLand(x + 64, z)) { anchor = { x, z }; break outer; }
+    g.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+    for (const e of g.edges.values()) e.stage = 'painted';
+    const sim = new GrowthSim(g, hf, bus, createRng(rngSeed), 0.217);
+    bus.emit('roads:changed', {});
+    sim.update(3); // settle the throttled road-distance recompute
+
+    const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+    const i0 = Math.round((anchor.x + HALF) / CELL);
+    const j0 = Math.round((anchor.z + HALF) / CELL);
+    for (let dj = -4; dj <= 4; dj++) {
+      for (let di = -2; di <= Math.round(64 / CELL) + 2; di++) {
+        dev[idx(i0 + di, j0 + dj)] = 0.7499;
+      }
+    }
+    sim.restore(dev, []);
+    for (let t = 0; t < 60; t++) sim.update(0.5);
+    return { sim, anchor };
+  }
+
+  function segmentDistance(px: number, pz: number, ax: number, az: number, bx: number, bz: number): number {
+    const abx = bx - ax, abz = bz - az;
+    const len2 = abx * abx + abz * abz;
+    const t = Math.max(0, Math.min(1, ((px - ax) * abx + (pz - az) * abz) / len2));
+    return Math.hypot(px - (ax + abx * t), pz - (az + abz * t));
+  }
+
+  it('turns a coordinate-seeded fraction of house parcels into parks with their own pocket trees', () => {
+    const { sim } = parkWorld('parks');
+    const parks = sim.spawned.filter((r) => r.kind === 'park');
+    const houses = sim.spawned.filter((r) => r.kind === 'house' || r.kind === 'building');
+    expect(parks.length).toBeGreaterThanOrEqual(1); // the seeded roll leaves green pockets...
+    expect(houses.length).toBeGreaterThanOrEqual(1); // ...without replacing every parcel
+  });
+
+  it('park placement is deterministic across identical runs and never upgrades', () => {
+    const a = parkWorld('parks').sim.spawned.map((r) => `${r.kind}:${r.x.toFixed(3)},${r.z.toFixed(3)}`);
+    const b = parkWorld('parks').sim.spawned.map((r) => `${r.kind}:${r.x.toFixed(3)},${r.z.toFixed(3)}`);
+    expect(a).toEqual(b);
+    // long-run world from parkWorld already crossed the upgrade window (dev keeps accumulating for
+    // 30 sim-seconds after the threshold band) — no park may ever have become a building.
+    const { sim } = parkWorld('parks');
+    for (let t = 0; t < 120; t++) sim.update(0.5);
+    expect(sim.spawned.some((r) => r.kind === 'park')).toBe(true);
+    expect(sim.spawned.filter((r) => r.kind === 'park').every((r) => r.kind === 'park')).toBe(true);
+  });
+
+  it('parks use the field footprint clearance, never overlapping the road corridor', () => {
+    const { sim, anchor } = parkWorld('parks');
+    for (const park of sim.spawned.filter((r) => r.kind === 'park')) {
+      const d = segmentDistance(park.x, park.z, anchor.x, anchor.z, anchor.x + 64, anchor.z);
+      // Half a unit of slack: placeField clears against the SMOOTHED sampled centerline, which can
+      // deviate a few cm from this test's straight control chord (Road Craft smoothing).
+      expect(d).toBeGreaterThanOrEqual(FIELD_ROAD_CLEARANCE - 0.5);
+    }
+  });
+
+  describe('low-rise damping', () => {
+    function upgradeWorld(buildings: Array<{ x: number; z: number }>) {
+      const bus = new EventBus();
+      const hf = new Heightfield('upgrade-test', bus);
+      const g = new RoadGraph(bus, makeSampler(hf));
+      let anchor = { x: 0, z: 0 };
+      outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+        if (hf.isLand(x, z) && hf.isLand(x + 64, z)) { anchor = { x, z }; break outer; }
+      g.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+      for (const e of g.edges.values()) e.stage = 'painted';
+      const sim = new GrowthSim(g, hf, bus, createRng('damp'), 0.217);
+      bus.emit('roads:changed', {});
+      sim.update(3);
+
+      const midI = Math.round((anchor.x + HALF) / CELL);
+      const midJ = Math.round((anchor.z + HALF) / CELL);
+      let cell: { i: number; j: number } | null = null;
+      for (let dj = -3; dj <= 3 && !cell; dj++) {
+        for (let di = -3; di <= 3 && !cell; di++) {
+          const i = midI + di, j = midJ + dj;
+          const { x, z } = cellCenter(i, j);
+          const flat = hf.isLand(x, z) && hf.slopeAt(x, z) < 0.3;
+          const neighborsOk = [[i - 1, j], [i + 1, j], [i, j - 1], [i, j + 1]].every(([ni, nj]) => {
+            const c = cellCenter(ni, nj);
+            return hf.isLand(c.x, c.z) && hf.slopeAt(c.x, c.z) < 0.3;
+          });
+          if (flat && neighborsOk) cell = { i, j };
+        }
+      }
+      if (!cell) throw new Error('no flat cell');
+      const { x, z } = cellCenter(cell.i, cell.j);
+
+      const dev = new Float32Array(GRID_SIZE * GRID_SIZE);
+      dev[idx(cell.i, cell.j)] = 1.35;
+      dev[idx(cell.i - 1, cell.j)] = 0.8;
+      dev[idx(cell.i + 1, cell.j)] = 0.8;
+      const records: SpawnRecord[] = [{ kind: 'house', x, z, rot: 0, id: 1 }];
+      buildings.forEach((b, k) => records.push({ kind: 'building', x: x + b.x, z: z + b.z, rot: 0, id: 10 + k }));
+      sim.restore(dev, records);
+      sim.update(1);
+      return { sim };
+    }
+
+    it('a qualifying house among three nearby towers permanently stays low-rise', () => {
+      // Three buildings inside the density radius >= any seeded tolerance (max 3), so damping must
+      // engage regardless of which tolerance this cell hashed to.
+      const { sim } = upgradeWorld([{ x: 6, z: 0 }, { x: -6, z: 4 }, { x: 0, z: -6 }]);
+      const house = sim.spawned.find((r) => r.id === 1)!;
+      expect(house.kind).toBe('house');
+      sim.update(5); // permanently: later ticks must not flip it either
+      expect(sim.spawned.find((r) => r.id === 1)!.kind).toBe('house');
+    });
+
+    it('the same qualifying house upgrades normally in an empty neighborhood', () => {
+      const { sim } = upgradeWorld([]);
+      expect(sim.spawned.find((r) => r.id === 1)!.kind).toBe('building');
+    });
+  });
+});

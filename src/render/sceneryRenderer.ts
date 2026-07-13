@@ -50,6 +50,10 @@ const RESCUE_RECOVERY_DURATION = 1;
 // same InstancedMesh pool.
 const TREE_CAPACITY = 6000;
 const FIELD_CAPACITY = 600;
+// Living Towns pocket parks: same 10x10 footprint as fields, rendered as a single mown-green
+// patch (no crop stripes) — the park's trees are ordinary tree records the sim spawns alongside.
+const PARK_CAPACITY = 128;
+const PARK_COLOR = '#5f9455';
 const HOUSE_CAPACITY = 800;
 const BUILDING_CAPACITY = 300;
 const WINDOW_CAPACITY = HOUSE_CAPACITY + BUILDING_CAPACITY; // 1 emissive window quad per house/building
@@ -256,6 +260,8 @@ export class SceneryRenderer {
   private field: THREE.InstancedMesh;
   private fieldStripe: THREE.InstancedMesh;
   private fieldCount = 0;
+  private park: THREE.InstancedMesh;
+  private parkCount = 0;
   private stripeCount = 0;
 
   private windows: THREE.InstancedMesh;
@@ -341,6 +347,15 @@ export class SceneryRenderer {
     this.fieldStripe.receiveShadow = true;
     this.fieldStripe.frustumCulled = false;
     this.scene.add(this.fieldStripe);
+
+    const parkGeo = new THREE.PlaneGeometry(FIELD_SIZE, FIELD_SIZE);
+    parkGeo.rotateX(-Math.PI / 2);
+    const parkMat = new THREE.MeshStandardMaterial({ color: PARK_COLOR, roughness: 0.95 });
+    this.park = new THREE.InstancedMesh(parkGeo, parkMat, PARK_CAPACITY);
+    this.park.count = 0;
+    this.park.receiveShadow = true;
+    this.park.frustumCulled = false;
+    this.scene.add(this.park);
 
     this.windowGeo = new THREE.PlaneGeometry(WINDOW_SIZE, WINDOW_SIZE);
     this.windowMat = new THREE.MeshStandardMaterial({
@@ -684,17 +699,31 @@ export class SceneryRenderer {
   private place(rec: PlaceableRecord, animate: boolean, id: number | null = null): Instance | null {
     const y = this.hf.heightAt(rec.x, rec.z);
 
-    if (rec.kind === 'field') {
-      if (this.fieldCount >= this.field.instanceMatrix.count) return null;
-      const slot = this.fieldCount++;
+    if (rec.kind === 'field' || rec.kind === 'park') {
+      // Parks share the field's plane-patch machinery (same footprint, own mesh/counter) but skip
+      // the crop-stripe decoration below — a park is a single mown surface.
+      const patchMesh = rec.kind === 'field' ? this.field : this.park;
+      const patchCount = rec.kind === 'field' ? this.fieldCount : this.parkCount;
+      if (patchCount >= patchMesh.instanceMatrix.count) return null;
+      const slot = rec.kind === 'field' ? this.fieldCount++ : this.parkCount++;
       dummyPos.set(rec.x, y + 0.01, rec.z);
       dummyQuat.setFromAxisAngle(upAxis, rec.rot);
       const s = animate ? 0.001 : 1;
       dummyScale.set(s, s, s);
       dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
-      this.field.setMatrixAt(slot, dummyMatrix);
-      this.field.count = this.fieldCount;
-      this.field.instanceMatrix.needsUpdate = true;
+      patchMesh.setMatrixAt(slot, dummyMatrix);
+      patchMesh.count = rec.kind === 'field' ? this.fieldCount : this.parkCount;
+      patchMesh.instanceMatrix.needsUpdate = true;
+
+      if (rec.kind === 'park') {
+        const instance: Instance = { kind: rec.kind, id, variant: { mesh: this.park, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlot: null };
+        this.instances.push(instance);
+        this.ownersFor(this.park)[slot] = instance;
+        if (id !== null) this.byId.set(id, instance);
+        if (animate) this.animating.push({ instance, elapsed: 0 });
+        if (id !== null) this.applyPendingFadeIfAny(instance, id);
+        return instance;
+      }
 
       // 3 stripe quads per field, offset along local Z, sharing the field's transform.
       // Minor 6: unlike the field's own instance (tracked in `this.animating` and rescaled every
@@ -1053,6 +1082,8 @@ export class SceneryRenderer {
     const mesh = instance.variant.mesh;
     if (mesh === this.field) {
       this.fieldCount = this.compactMeshSlot(mesh, instance.slot, this.fieldCount);
+    } else if (mesh === this.park) {
+      this.parkCount = this.compactMeshSlot(mesh, instance.slot, this.parkCount);
     } else {
       this.compactMeshSlot(mesh, instance.slot, mesh.count);
     }
@@ -1326,6 +1357,9 @@ export class SceneryRenderer {
     this.scene.remove(this.fieldStripe);
     this.fieldStripe.geometry.dispose();
     (this.fieldStripe.material as THREE.Material).dispose();
+    this.scene.remove(this.park);
+    this.park.geometry.dispose();
+    (this.park.material as THREE.Material).dispose();
     this.scene.remove(this.windows);
     this.windowGeo.dispose();
     this.windowMat.dispose();
