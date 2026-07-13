@@ -36,6 +36,11 @@ type Settlement = Pick<SpawnRecord, 'id' | 'kind' | 'x' | 'z'>;
 
 const DETAIL_OFFSET = ROAD_WIDTH / 2 + 2.1;
 const SAMPLE_SPACING = 12;
+// Road-to-bridge approach rails: every transition onto a deck gets guardrail segments on BOTH
+// verges of the land run leading up to it (the classic paired approach rails), stepped back from
+// the transition sample by these arclengths — one rail centered just before the deck, one behind
+// it, matching the 5.5u guardrail segment the pool already draws.
+const APPROACH_RAIL_SETBACKS = [2.75, 8.25];
 
 function headingAt(samples: RoadSample[], i: number): number {
   const a = samples[Math.max(0, i - 1)];
@@ -55,6 +60,36 @@ function developed(stage: string, atLeast: 'graded' | 'painted'): boolean {
   return STAGES.indexOf(stage as (typeof STAGES)[number]) >= STAGES.indexOf(atLeast);
 }
 
+/**
+ * Guardrails for every road-to-bridge transition on `samples`: walks back onto the LAND side of
+ * each bridge boundary and rails both verges at APPROACH_RAIL_SETBACKS. The station loop in
+ * `planRoadsideDetails` skips bridge samples entirely (and only rails drops/water it happens to
+ * sample), so without this pass the most safety-critical stretch of the road — the lip where the
+ * embankment meets the deck — was the one place guaranteed to have no rail.
+ */
+function planBridgeApproachRails(samples: RoadSample[], terrain: TerrainProbe, out: DetailPose[]): void {
+  for (let i = 1; i < samples.length; i++) {
+    if (!!samples[i].bridge === !!samples[i - 1].bridge) continue;
+    // land side of this transition: index i-1 when the deck starts at i, index i when it ends
+    const landIdx = samples[i].bridge ? i - 1 : i;
+    const step = samples[i].bridge ? -1 : 1; // walking direction that stays on land
+    for (const setback of APPROACH_RAIL_SETBACKS) {
+      // walk `setback` arclength from the transition along the land run
+      let acc = 0;
+      let j = landIdx;
+      while (acc < setback) {
+        const next = j + step;
+        if (next < 0 || next >= samples.length || samples[next].bridge) break;
+        acc += Math.hypot(samples[next].x - samples[j].x, samples[next].z - samples[j].z);
+        j = next;
+      }
+      if (samples[j].bridge) continue; // degenerate: no land run to stand on
+      const heading = headingAt(samples, j);
+      out.push(poseAt(samples[j], heading, 1, terrain), poseAt(samples[j], heading, -1, terrain));
+    }
+  }
+}
+
 /** Pure deterministic context planner. It samples fixed arclength intervals and never consumes
  * random state, so rebuilding the same road/terrain/settlement state produces identical props. */
 export function planRoadsideDetails(
@@ -69,6 +104,7 @@ export function planRoadsideDetails(
 
   for (const edge of graph.edges.values()) {
     if (!developed(edge.stage, 'graded') || edge.samples.length < 2) continue;
+    planBridgeApproachRails(edge.samples, terrain, plan.guardrails);
     let walked = 0;
     let nextStation = SAMPLE_SPACING;
     let stationIndex = 0;
