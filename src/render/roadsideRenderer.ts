@@ -22,6 +22,9 @@ export interface RoadsidePlan {
   signs: DetailPose[];
   utilityPoles: DetailPose[];
   gravelScatter: DetailPose[];
+  /** Night-glowing lamps on painted stretches near settlements — the town's own side of the
+   * street (utility poles take the other side/parity, so the two never stack on one station). */
+  streetlamps: DetailPose[];
 }
 
 export interface TerrainProbe {
@@ -61,7 +64,7 @@ export function planRoadsideDetails(
 ): RoadsidePlan {
   const plan: RoadsidePlan = {
     culverts: [], retainingWalls: [], guardrails: [], reflectors: [], signs: [], utilityPoles: [],
-    gravelScatter: [],
+    gravelScatter: [], streetlamps: [],
   };
 
   for (const edge of graph.edges.values()) {
@@ -114,6 +117,7 @@ export function planRoadsideDetails(
           (s.kind === 'house' || s.kind === 'building') && Math.hypot(s.x - sample.x, s.z - sample.z) <= 24,
         );
         if (nearSettlement && stationIndex % 2 === 0) plan.utilityPoles.push(left);
+        if (nearSettlement && stationIndex % 2 === 1) plan.streetlamps.push(right);
       }
     }
   }
@@ -152,10 +156,17 @@ function material(color: number, emissive = 0): THREE.MeshStandardMaterial {
 
 /** Bounded, fixed-draw-call roadside furniture renderer. Every pool is rewritten only when graph
  * stage/topology or settlement context changes—not per frame. */
+const LAMP_HEAD_NIGHT_INTENSITY = 1.6;
+const LAMP_HEAD_DAY_INTENSITY = 0.08;
+const LAMP_GLOW_NIGHT_OPACITY = 0.3;
+
 export class RoadsideRenderer {
   private readonly group = new THREE.Group();
   private readonly pools: PoolSpec[] = [];
   private readonly settlements = new Map<number, Settlement>();
+  private readonly lampHeadMat: THREE.MeshStandardMaterial;
+  private readonly lampGlowMat: THREE.MeshBasicMaterial;
+  private night = false;
 
   constructor(
     private scene: THREE.Scene,
@@ -189,6 +200,35 @@ export class RoadsideRenderer {
     add(new THREE.BoxGeometry(1.6, 0.1, 0.1), material(0x403328), 420, (p) => p.utilityPoles, 5.0, new THREE.Vector3(1, 1, 1), yaw);
     add(new THREE.IcosahedronGeometry(0.16, 0), material(0x8f8879), 900, (p) => p.gravelScatter, 0.12, new THREE.Vector3(1, 0.55, 1), yaw);
 
+    // Streetlamps (Living Towns atmosphere): pole + warm emissive head + a fake additive ground
+    // light pool. Real lights stay out of budget — the glow is a flat disc whose opacity (and the
+    // head's emissive) gates on the day/night phase via `setNight`, exactly like the scenery
+    // renderer's window glow.
+    this.lampHeadMat = new THREE.MeshStandardMaterial({
+      color: 0xffe9c4, roughness: 0.5, emissive: 0xffc873, emissiveIntensity: LAMP_HEAD_DAY_INTENSITY,
+      toneMapped: false,
+    });
+    this.lampGlowMat = new THREE.MeshBasicMaterial({
+      color: 0xffc873, transparent: true, opacity: 0, depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    add(new THREE.CylinderGeometry(0.055, 0.085, 3.4, 6), material(0x36393c), 260, (p) => p.streetlamps, 1.7, new THREE.Vector3(1, 1, 1));
+    const headMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.46, 0.13, 0.2), this.lampHeadMat, 260);
+    headMesh.name = 'streetlamp-heads';
+    headMesh.castShadow = true;
+    headMesh.count = 0;
+    this.group.add(headMesh);
+    this.pools.push({ mesh: headMesh, poses: (p) => p.streetlamps, yOffset: 3.42, scale: new THREE.Vector3(1, 1, 1), rotate: yaw });
+    const glowGeo = new THREE.CircleGeometry(2.4, 18);
+    glowGeo.rotateX(-Math.PI / 2);
+    const glowMesh = new THREE.InstancedMesh(glowGeo, this.lampGlowMat, 260);
+    glowMesh.name = 'streetlamp-glow';
+    glowMesh.count = 0;
+    this.group.add(glowMesh);
+    this.pools.push({ mesh: glowMesh, poses: (p) => p.streetlamps, yOffset: 0.07, scale: new THREE.Vector3(1, 1, 1) });
+
+    bus.on('atmosphere:phase', ({ night }) => this.setNight(night));
+
     const rebuild = () => this.rebuild();
     bus.on('roads:edgeAdded', rebuild);
     bus.on('roads:edgeRemoved', rebuild);
@@ -206,6 +246,15 @@ export class RoadsideRenderer {
     bus.on('growth:remove', ({ id }) => {
       if (this.settlements.delete(id)) this.rebuild();
     });
+  }
+
+  /** Day/night gate for the lamp heads + ground pools (also driven by the `atmosphere:phase`
+   * event; public so tests and manual callers can flip it directly). */
+  setNight(night: boolean): void {
+    if (night === this.night) return;
+    this.night = night;
+    this.lampHeadMat.emissiveIntensity = night ? LAMP_HEAD_NIGHT_INTENSITY : LAMP_HEAD_DAY_INTENSITY;
+    this.lampGlowMat.opacity = night ? LAMP_GLOW_NIGHT_OPACITY : 0;
   }
 
   setSettlements(records: ReadonlyArray<Settlement>): void {

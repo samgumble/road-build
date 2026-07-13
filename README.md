@@ -4,9 +4,11 @@ Groundwork is a small zen toy about watching roads get built. You drag a line ac
 a low-poly island and a construction crew takes it from there — an excavator grades
 the earth, a truck lays gravel, a paver lays asphalt with a roller trailing behind it,
 a line truck paints the stripes. There's no score, no failure state, nothing to lose.
-Cars start using the roads once they're finished, and over time trees, fields, and
-small houses grow up along the corridors you've carved, so the island slowly turns
-from bare terrain into something that looks lived-in. Day turns to night, it rains
+Cars start using the roads once they're finished, and over time trees, fields, pocket
+parks, and small houses grow up along the corridors you've carved — a few blocks rise
+into buildings while seeded low-rise streets stay low — so the island slowly turns
+from bare terrain into something that looks lived-in. Villagers stroll the painted
+streets by day; streetlamps glow along them at night. Day turns to night, it rains
 occasionally, and you can just let it run.
 
 The game opens on an original illustrated title screen, with separate desktop and mobile crops;

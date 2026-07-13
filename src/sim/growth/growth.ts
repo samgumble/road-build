@@ -178,7 +178,27 @@ export function settlementMorphology(
   return Math.max(pocket, junction);
 }
 
-export type GrowthKind = 'tree' | 'field' | 'house' | 'building';
+export type GrowthKind = 'tree' | 'field' | 'house' | 'building' | 'park';
+
+// Living Towns parcel variety: a coordinate-seeded fraction of house-threshold parcels become
+// pocket parks (a green field-footprint patch plus a couple of its own tree records) instead of
+// yet another house. Like the morphology field above, the roll derives from cell coordinates +
+// the world seed — no rng stream consumption, no save field, and old saves gain the same parks
+// deterministically wherever their cells hadn't spawned a house yet. The salts just decorrelate
+// these rolls from the morphology noise that shares `morphologyHash`.
+const PARK_CHANCE = 0.2;
+const PARK_SALT_I = 15485863;
+const PARK_SALT_J = 32452843;
+const PARK_TREES = 2; // pocket trees spawned as ordinary tree records (full decay/clearing lifecycle)
+
+// Living Towns low-rise damping: not every qualifying block goes high-rise. When a cell first
+// passes the upgrade neighbor gate, it rolls a seeded tolerance for how many buildings it accepts
+// within LOWRISE_DENSITY_RADIUS before permanently staying a house — scattering towers through
+// low-rise streets instead of extruding continuous walls. Coordinate-seeded for the same reasons
+// as PARK_* above.
+const LOWRISE_DENSITY_RADIUS = 20; // u
+const LOWRISE_SALT_I = 7919;
+const LOWRISE_SALT_J = 104729;
 
 interface Threshold {
   value: number;
@@ -224,6 +244,10 @@ const NEIGHBOR_DEVELOPED_DEV = THRESHOLDS[2].value;
  * still carries the 'house' bit from before the upgrade) clears BOTH bits, since the house-stage
  * record is gone too (it became this same building record, not a separate one still present). */
 function bitsForKind(kind: GrowthKind): number {
+  // A park occupies the cell's house slot (it spawned INSTEAD of the house at that threshold), so
+  // removing it frees the house bit — the parcel can regrow a house later, same as any other
+  // removed record freeing its own slot.
+  if (kind === 'park') return THRESHOLDS.find((t) => t.kind === 'house')!.bit;
   if (kind === 'building') {
     const buildingBit = THRESHOLDS.find((t) => t.kind === 'building')!.bit;
     const houseBit = THRESHOLDS.find((t) => t.kind === 'house')!.bit;
@@ -724,7 +748,9 @@ export class GrowthSim {
     let x: number, z: number, rot: number;
     if (kind === 'house' || kind === 'building') {
       ({ x, z, rot } = this.placeFacingRoad(cx + jx, cz + jz));
-    } else if (kind === 'field') {
+    } else if (kind === 'field' || kind === 'park') {
+      // Parks share the field's 10x10 footprint and therefore its footprint-aware clearance
+      // (HANDOFF "Scenery footprints" invariant) — same placement, different dressing.
       ({ x, z, rot } = this.placeField(cx + jx, cz + jz));
     } else {
       // trees: unchanged — clearOfRoads + random rotation.
@@ -788,6 +814,14 @@ export class GrowthSim {
             if (this.rng() >= TREE_SPAWN_CHANCE) continue;
             const count = TREE_COUNT_MIN + Math.floor(this.rng() * (TREE_COUNT_MAX - TREE_COUNT_MIN + 1));
             for (let k = 0; k < count; k++) this.spawn('tree', x, z);
+          } else if (
+            th.kind === 'house' && this.morphologySeed !== null &&
+            morphologyHash(i + PARK_SALT_I, j + PARK_SALT_J, this.morphologySeed) < PARK_CHANCE
+          ) {
+            // Living Towns parcel variety (see PARK_* above): this parcel greens over instead of
+            // housing — the park takes the house slot, plus a couple of its own pocket trees.
+            this.spawn('park', x, z);
+            for (let k = 0; k < PARK_TREES; k++) this.spawn('tree', x, z);
           } else {
             this.spawn(th.kind, x, z);
           }
@@ -837,6 +871,25 @@ export class GrowthSim {
       if (this.dev[cellIndex(ni, nj)] >= NEIGHBOR_DEVELOPED_DEV) developedNeighbors++;
     }
     if (developedNeighbors < HOUSE_UPGRADE_MIN_NEIGHBORS) return; // not yet — recheck next tick
+
+    // Living Towns low-rise damping (see LOWRISE_* above): the moment the neighbor gate first
+    // passes, check the built mass already standing nearby against this cell's seeded tolerance
+    // (1..3 buildings). At or over tolerance, the cell is PERMANENTLY marked handled — this block
+    // stays low-rise, breaking up continuous tower walls. Deterministic: same seed and event order
+    // reach this check with the same records every time.
+    if (this.morphologySeed !== null) {
+      const tolerance = 1 + Math.floor(morphologyHash(i + LOWRISE_SALT_I, j + LOWRISE_SALT_J, this.morphologySeed) * 3);
+      const center = cellCenter(i, j);
+      let nearbyBuildings = 0;
+      for (const r of this.records) {
+        if (r.kind !== 'building') continue;
+        if (Math.hypot(r.x - center.x, r.z - center.z) <= LOWRISE_DENSITY_RADIUS) nearbyBuildings++;
+      }
+      if (nearbyBuildings >= tolerance) {
+        this.upgradedCell[idx] = 1;
+        return;
+      }
+    }
 
     let target: SpawnRecord | null = null;
     let targetSkippedForDecay = false;

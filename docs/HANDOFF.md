@@ -105,6 +105,31 @@ assuming a green build means the page is live.
 - Share: the toolbar Share button copies `islandShareUrl(location.href, seed)` — origin+path with
   exactly one `?seed=` param, any prior query/hash replaced — falling back to showing the link in
   a notice when clipboard access is denied.
+- Living Towns parcel variety (partial R2, this session): a coordinate-seeded fraction of
+  house-threshold parcels become pocket **parks** (`GrowthKind 'park'`: a field-footprint green
+  patch record plus a couple of ordinary tree records — full decay/clearing/save lifecycle for
+  free), and **low-rise damping** gives each cell a seeded tolerance (1–3) for buildings within
+  20u before it permanently stays a house — towers scatter through low-rise streets instead of
+  extruding walls. Both rolls use `morphologyHash` on cell coordinates + world seed (salted), so
+  they consume no rng state and old saves gain them deterministically. `PARK_*`/`LOWRISE_*`
+  constants in `growth.ts`; park rendering is a third field-style instanced patch in
+  `sceneryRenderer.ts`.
+- Streetlamps: `planRoadsideDetails` now also plans `streetlamps` — painted stations near
+  settlements on the opposite side/parity to utility poles. Three more instanced pools in
+  `RoadsideRenderer` (post, emissive head, additive ground-glow disc); `setNight` (driven by
+  `atmosphere:phase`) gates head emissive + pool opacity, same pattern as window glow. No real
+  lights — the budget stays flat.
+- Villagers: `src/render/villagerRenderer.ts` — up to `VILLAGER_CAP` (12) strolling figures on
+  painted verges near settlements, three shared InstancedMeshes total (legs/torso/head).
+  `planVillagerRoutes` is the pure deterministic planner (one route per painted-edge × nearby
+  settlement pair); phases are hash-seeded, walking uses render dt (theater ambles at any sim
+  speed), and the whole group hides at night via `atmosphere:phase`. Pure render theater — no sim
+  contract, no save state.
+- Instancing audit (2026-07-13): every population-scaled renderer is instanced (cars, scenery GLB
+  variants, roadside pools, construction cone/floodlight/particle pools, villagers). The only
+  per-object draws are the three bounded construction crew rigs (cheap primitives per the Task 25
+  ruling) and one-off landmarks. The "instanced rendering" improvement bet is closed — R5's asset
+  budgets are the next lever, not more instancing.
 
 ## Invariants worth protecting
 
