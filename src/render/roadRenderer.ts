@@ -64,7 +64,9 @@ export function wetRoadAppearance(
   };
 }
 
-const STAGE_YLIFT: Record<Stage, number> = {
+// Exported: roadsideRenderer's bridge-approach rails anchor to the road surface (sample.y +
+// STAGE_YLIFT.paved) so their bars line up with the deck rails instead of dropping to terrain.
+export const STAGE_YLIFT: Record<Stage, number> = {
   surveyed: 0.02,
   graded: 0.06,
   gravel: 0.12,
@@ -80,6 +82,9 @@ const CENTERLINE_WIDTH = 0.5;
 const CENTERLINE_COLOR = '#e8e4d8';
 const CENTERLINE_YLIFT = 0.24;
 const JUNCTION_REACH = 5;
+// Drainage stops this much further from a junction than the surface trim: converging ditch strips
+// from every arm otherwise butt right up against the apron edge, pointing into the intersection.
+const DITCH_JUNCTION_SETBACK = 4;
 const BRIDGE_APPROACH_LENGTH = 6;
 
 /** Removes center paint from the compact asphalt apron at a true connected intersection. Ordinary
@@ -91,14 +96,15 @@ export function trimJunctionStripeRange(
   total: number,
   startDegree: number,
   endDegree: number,
+  reach = JUNCTION_REACH,
 ): { from: number; to: number } {
   let trimmedFrom = from;
   let trimmedTo = to;
-  if (startDegree >= 3 && from < JUNCTION_REACH) {
-    trimmedFrom = Math.max(from, Math.min(total, JUNCTION_REACH));
+  if (startDegree >= 3 && from < reach) {
+    trimmedFrom = Math.max(from, Math.min(total, reach));
   }
-  if (endDegree >= 3 && to > total - JUNCTION_REACH) {
-    trimmedTo = Math.min(to, Math.max(0, total - JUNCTION_REACH));
+  if (endDegree >= 3 && to > total - reach) {
+    trimmedTo = Math.min(to, Math.max(0, total - reach));
   }
   return { from: trimmedFrom, to: Math.max(trimmedFrom, trimmedTo) };
 }
@@ -184,6 +190,10 @@ export function puddleOpacity(rainAmount: number, maxOpacity = 0.34): number {
 const BRIDGE_COLOR = '#7a7a72';
 const BRIDGE_RAIL_WIDTH = 0.4;
 const BRIDGE_RAIL_HEIGHT = 0.8;
+// Exported: the deck rails and roadsideRenderer's bridge-approach rails share this one lateral
+// offset from the road centerline, so the approach rail line continues straight onto the deck
+// (same pattern as BRIDGE_PYLON_SPACING below — one constant instead of two that can drift).
+export const BRIDGE_RAIL_OFFSET = ROAD_WIDTH / 2 - 0.2;
 const BRIDGE_PYLON_RADIUS = 0.9;
 // Exported (Task 22): constructionRenderer.ts's crane choreography lowers deck segments in the
 // same 16u increments pylons are spaced at, so the two files share this one constant rather than
@@ -438,7 +448,7 @@ function mergeGeometries(geos: THREE.BufferGeometry[]): THREE.BufferGeometry {
   return merged;
 }
 
-interface JunctionPoint { x: number; z: number }
+interface JunctionPoint { x: number; z: number; y: number }
 
 function convexHull(points: JunctionPoint[]): JunctionPoint[] {
   const unique = [...new Map(points.map((point) => [`${point.x.toFixed(5)},${point.z.toFixed(5)}`, point])).values()]
@@ -462,30 +472,41 @@ function convexHull(points: JunctionPoint[]): JunctionPoint[] {
   return [...lower, ...upper];
 }
 
+/** One incident arm of a junction, as seen from the node: the tangent and patch height at the
+ * node itself, plus the arm's ACTUAL trimmed-end cross-section (position, height, and local
+ * tangent at JUNCTION_REACH arclength along the real samples). Feeding the true end cross-section
+ * in — rather than projecting a straight ray from the node heading — keeps the patch flush with
+ * each trimmed ribbon end even when the arm curves or climbs inside the trim reach. */
+export interface JunctionArm {
+  heading: number;
+  y: number;
+  far: { x: number; z: number; y: number; heading: number };
+}
+
 /** Builds one topology-owned intersection polygon from the cross-sections of its incident arms.
  * Unlike overlapping circular end caps, the convex perimeter follows the actual connected road
- * headings and leaves no independent strip competing for the center. Geometry is world-space so
- * all incident edge groups can terminate cleanly at the same JUNCTION_REACH boundary. */
+ * geometry and leaves no independent strip competing for the center. Every hull vertex carries the
+ * height of the arm cross-section it came from, so the patch drapes across a sloped junction
+ * instead of floating as one flat plane at the tallest arm. */
 export function buildJunctionPatchGeometry(
   x: number,
   y: number,
   z: number,
-  headings: readonly number[],
+  arms: readonly JunctionArm[],
   width = ROAD_WIDTH,
-  reach = JUNCTION_REACH,
 ): THREE.BufferGeometry {
   const geometry = new THREE.BufferGeometry();
-  if (!headings.length) return geometry;
+  if (!arms.length) return geometry;
   const half = width / 2;
   const candidates: JunctionPoint[] = [];
-  for (const heading of headings) {
-    const dx = Math.cos(heading), dz = Math.sin(heading);
-    const px = -dz, pz = dx;
+  for (const arm of arms) {
+    const px = -Math.sin(arm.heading), pz = Math.cos(arm.heading);
+    const fpx = -Math.sin(arm.far.heading), fpz = Math.cos(arm.far.heading);
     candidates.push(
-      { x: x + px * half, z: z + pz * half },
-      { x: x - px * half, z: z - pz * half },
-      { x: x + dx * reach + px * half, z: z + dz * reach + pz * half },
-      { x: x + dx * reach - px * half, z: z + dz * reach - pz * half },
+      { x: x + px * half, z: z + pz * half, y: arm.y },
+      { x: x - px * half, z: z - pz * half, y: arm.y },
+      { x: arm.far.x + fpx * half, z: arm.far.z + fpz * half, y: arm.far.y },
+      { x: arm.far.x - fpx * half, z: arm.far.z - fpz * half, y: arm.far.y },
     );
   }
   const hull = convexHull(candidates);
@@ -493,7 +514,7 @@ export function buildJunctionPatchGeometry(
   const positions = [x, y, z];
   const normals = [0, 1, 0];
   for (const point of hull) {
-    positions.push(point.x, y, point.z);
+    positions.push(point.x, point.y, point.z);
     normals.push(0, 1, 0);
   }
   const indices: number[] = [];
@@ -871,17 +892,42 @@ export class RoadRenderer {
     });
   }
 
-  private edgeArmAtNode(edge: RoadEdge, nodeId: number): { heading: number; y: number } | null {
+  /** The arm's node-end tangent/height plus its ACTUAL cross-section at `reach` arclength from
+   * the node (walked along the real samples, so curved/climbing arms report where their trimmed
+   * ribbon end truly sits). Heights are raw sample heights — the caller adds stage lift. */
+  private edgeArmAtNode(edge: RoadEdge, nodeId: number, reach = JUNCTION_REACH): JunctionArm | null {
     if (edge.samples.length < 2) return null;
-    if (edge.a === nodeId) {
-      const a = edge.samples[0], b = edge.samples[1];
-      return { heading: Math.atan2(b.z - a.z, b.x - a.x), y: a.y };
+    const fromStart = edge.a === nodeId;
+    if (!fromStart && edge.b !== nodeId) return null;
+    // Order samples walking AWAY from the node so the same forward walk serves both ends.
+    const ordered = fromStart ? edge.samples : [...edge.samples].reverse();
+    const a = ordered[0], b = ordered[1];
+    const heading = Math.atan2(b.z - a.z, b.x - a.x);
+
+    let acc = 0;
+    let far: JunctionArm['far'] | null = null;
+    for (let i = 1; i < ordered.length; i++) {
+      const prev = ordered[i - 1], next = ordered[i];
+      const seg = Math.hypot(next.x - prev.x, next.z - prev.z);
+      const segHeading = Math.atan2(next.z - prev.z, next.x - prev.x);
+      if (seg > 0 && acc + seg >= reach) {
+        const u = (reach - acc) / seg;
+        far = {
+          x: prev.x + (next.x - prev.x) * u,
+          z: prev.z + (next.z - prev.z) * u,
+          y: prev.y + (next.y - prev.y) * u,
+          heading: segHeading,
+        };
+        break;
+      }
+      acc += seg;
     }
-    if (edge.b === nodeId) {
-      const a = edge.samples[edge.samples.length - 1], b = edge.samples[edge.samples.length - 2];
-      return { heading: Math.atan2(b.z - a.z, b.x - a.x), y: a.y };
+    if (!far) {
+      // arm shorter than the reach: its whole run sits inside the apron; end at the last sample
+      const last = ordered[ordered.length - 1], beforeLast = ordered[ordered.length - 2];
+      far = { x: last.x, z: last.z, y: last.y, heading: Math.atan2(last.z - beforeLast.z, last.x - beforeLast.x) };
     }
-    return null;
+    return { heading, y: a.y, far };
   }
 
   /** Rebuilds all completed degree-3+ conflict areas as topology-owned meshes. Mixed-stage
@@ -908,12 +954,41 @@ export class RoadRenderer {
       });
       const stages = [...new Set(arms.map((arm) => arm.stage))]
         .sort((a, b) => junctionSurfaceRank(a) - junctionSurfaceRank(b));
+      const lifted = (arm: JunctionArm, lift: number): JunctionArm => ({
+        heading: arm.heading,
+        y: arm.y + lift,
+        far: { ...arm.far, y: arm.far.y + lift },
+      });
+
+      // Verge apron first (drawn under every stage patch): one shoulder-width hull at the lowest
+      // present stage's shoulder color, so each arm's trimmed shoulder stub blends into a
+      // continuous junction verge instead of ending raw against bare terrain.
+      if (stages.length) {
+        const apronStage = stages[0];
+        const apronLift = Math.max(0.015, STAGE_YLIFT[apronStage] - SHOULDER_Y_GAP) + 0.002;
+        const apronY = Math.max(...arms.map((arm) => arm.y)) + apronLift;
+        const apronGeometry = buildJunctionPatchGeometry(
+          node.x, apronY, node.z, arms.map((arm) => lifted(arm, apronLift)), SHOULDER_WIDTH,
+        );
+        if (apronGeometry.getAttribute('position')) {
+          const apronMaterial = makeStandardMaterial(SHOULDER_COLOR[apronStage], 1, 'shoulder');
+          apronMaterial.roughness = 1;
+          const apron = new THREE.Mesh(apronGeometry, apronMaterial);
+          apron.receiveShadow = true;
+          apron.userData.roadDetail = 'junctionVerge';
+          tagWeatherSurface(apron, apronStage === 'graded' ? 'earth' : 'gravel');
+          this.junctionGroup.add(apron);
+          this.junctionMeshes.push(apron);
+        }
+      }
+
       for (const stage of stages) {
         const eligible = arms.filter((arm) => junctionSurfaceRank(arm.stage) >= junctionSurfaceRank(stage));
         if (!eligible.length) continue;
-        const y = Math.max(...eligible.map((arm) => arm.y)) + STAGE_YLIFT[stage] + 0.003;
+        const lift = STAGE_YLIFT[stage] + 0.003;
+        const y = Math.max(...eligible.map((arm) => arm.y)) + lift;
         const geometry = buildJunctionPatchGeometry(
-          node.x, y, node.z, eligible.map((arm) => arm.heading), ROAD_WIDTH, JUNCTION_REACH,
+          node.x, y, node.z, eligible.map((arm) => lifted(arm, lift)), ROAD_WIDTH,
         );
         if (!geometry.getAttribute('position')) continue;
         const material = makeStandardMaterial(STAGE_COLOR[stage], 1, 'ribbon');
@@ -942,6 +1017,7 @@ export class RoadRenderer {
     from: number,
     to: number,
     total: number,
+    reach = JUNCTION_REACH,
   ): { from: number; to: number } {
     return trimJunctionStripeRange(
       from,
@@ -949,6 +1025,7 @@ export class RoadRenderer {
       total,
       this.junctionOwnsEdgeEnd(edge, edge.a, stage) ? 3 : 0,
       this.junctionOwnsEdgeEnd(edge, edge.b, stage) ? 3 : 0,
+      reach,
     );
   }
 
@@ -1269,7 +1346,11 @@ export class RoadRenderer {
       if (to <= from) return;
     }
 
-    this.buildShoulders(v, samples, stage, from, to);
+    // Drainage keeps extra distance from owned junctions so ditch strips never point into the apron.
+    const ditchRange = edge
+      ? this.trimToJunctionOwnership(edge, stage, from, to, total, JUNCTION_REACH + DITCH_JUNCTION_SETBACK)
+      : { from, to };
+    this.buildShoulders(v, samples, stage, from, to, ditchRange);
 
     if (stage === 'paved' && advancing) {
       // Roller trails the paver by ROLLER_TRAIL_DISTANCE (see constructionRenderer.ts): everything
@@ -1388,7 +1469,14 @@ export class RoadRenderer {
     }
   }
 
-  private buildShoulders(v: EdgeVisual, samples: RoadSample[], stage: Exclude<Stage, 'surveyed'>, from: number, to: number): void {
+  private buildShoulders(
+    v: EdgeVisual,
+    samples: RoadSample[],
+    stage: Exclude<Stage, 'surveyed'>,
+    from: number,
+    to: number,
+    ditchRange: { from: number; to: number } = { from, to },
+  ): void {
     const weatherKind: RoadSurfaceKind = stage === 'graded' ? 'earth' : 'gravel';
     const yLift = Math.max(0.015, STAGE_YLIFT[stage] - SHOULDER_Y_GAP);
     const shoulderBuffer = stage === 'graded' ? 0 : BRIDGE_APPROACH_LENGTH;
@@ -1406,7 +1494,9 @@ export class RoadRenderer {
 
     // The tapered bridge approach owns the full verge-to-deck transition. End drainage before
     // that zone so ditch ribbons cannot float beside the deck or cut diagonally through the taper.
-    for (const range of groundRanges(samples, from, to, BRIDGE_APPROACH_LENGTH)) {
+    // `ditchRange` is additionally set back from owned junctions (see buildStageRange).
+    if (ditchRange.to <= ditchRange.from) return;
+    for (const range of groundRanges(samples, ditchRange.from, ditchRange.to, BRIDGE_APPROACH_LENGTH)) {
       const left = buildRibbonGeometry(samples, DITCH_WIDTH, Math.max(0.005, yLift - 0.04), range.from, range.to, DITCH_OFFSET, false, false, undefined, drape);
       const right = buildRibbonGeometry(samples, DITCH_WIDTH, Math.max(0.005, yLift - 0.04), range.from, range.to, -DITCH_OFFSET, false, false, undefined, drape);
       const ditchGeo = mergeGeometries([left, right]);
@@ -1571,11 +1661,10 @@ export class RoadRenderer {
         const settleU = easeOutCubic(clamp01(settleState.elapsed / RAIL_SETTLE_DURATION));
         if (settleU <= 0.001) continue; // not settled yet — no rail drawn (deliverable 4/5 coordination)
 
-        const railOffset = ROAD_WIDTH / 2 - 0.2;
         for (const side of [-1, 1]) {
           const railGeo = buildRailBoxGeometry(
             samples,
-            side * railOffset,
+            side * BRIDGE_RAIL_OFFSET,
             BRIDGE_RAIL_WIDTH,
             BRIDGE_RAIL_HEIGHT,
             STAGE_YLIFT.paved,

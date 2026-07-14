@@ -3,6 +3,7 @@ import { ROAD_WIDTH } from '../core/constants';
 import { EventBus } from '../core/events';
 import { STAGES } from '../core/types';
 import type { RoadSample } from '../core/types';
+import { BRIDGE_RAIL_OFFSET, STAGE_YLIFT } from './roadRenderer';
 import type { SpawnRecord } from '../sim/growth/growth';
 import type { RoadGraph } from '../sim/roads/graph';
 
@@ -41,6 +42,9 @@ const SAMPLE_SPACING = 12;
 // the transition sample by these arclengths — one rail centered just before the deck, one behind
 // it, matching the 5.5u guardrail segment the pool already draws.
 const APPROACH_RAIL_SETBACKS = [2.75, 8.25];
+// Keep cosmetic props (gravel, reflectors, poles, lamps, culverts) at least this far from a
+// degree-3+ node: the junction apron (5u reach + shoulder width) plus a small margin.
+const JUNCTION_PROP_CLEARANCE = 10;
 
 function headingAt(samples: RoadSample[], i: number): number {
   const a = samples[Math.max(0, i - 1)];
@@ -60,6 +64,22 @@ function developed(stage: string, atLeast: 'graded' | 'painted'): boolean {
   return STAGES.indexOf(stage as (typeof STAGES)[number]) >= STAGES.indexOf(atLeast);
 }
 
+/** An approach rail anchored to the ROAD, not the terrain: it continues the deck rails' exact
+ * lateral line (BRIDGE_RAIL_OFFSET from the centerline) at road-surface height, so the rail run
+ * leads onto the bridge instead of standing 2u further out and partway down the embankment. */
+function approachRailPoseAt(samples: RoadSample[], i: number, side: number): DetailPose {
+  const heading = headingAt(samples, i);
+  const px = -Math.sin(heading);
+  const pz = Math.cos(heading);
+  const sample = samples[i];
+  return {
+    x: sample.x + px * BRIDGE_RAIL_OFFSET * side,
+    y: sample.y + STAGE_YLIFT.paved,
+    z: sample.z + pz * BRIDGE_RAIL_OFFSET * side,
+    heading,
+  };
+}
+
 /**
  * Guardrails for every road-to-bridge transition on `samples`: walks back onto the LAND side of
  * each bridge boundary and rails both verges at APPROACH_RAIL_SETBACKS. The station loop in
@@ -67,7 +87,7 @@ function developed(stage: string, atLeast: 'graded' | 'painted'): boolean {
  * sample), so without this pass the most safety-critical stretch of the road — the lip where the
  * embankment meets the deck — was the one place guaranteed to have no rail.
  */
-function planBridgeApproachRails(samples: RoadSample[], terrain: TerrainProbe, out: DetailPose[]): void {
+function planBridgeApproachRails(samples: RoadSample[], out: DetailPose[]): void {
   for (let i = 1; i < samples.length; i++) {
     if (!!samples[i].bridge === !!samples[i - 1].bridge) continue;
     // land side of this transition: index i-1 when the deck starts at i, index i when it ends
@@ -84,8 +104,7 @@ function planBridgeApproachRails(samples: RoadSample[], terrain: TerrainProbe, o
         j = next;
       }
       if (samples[j].bridge) continue; // degenerate: no land run to stand on
-      const heading = headingAt(samples, j);
-      out.push(poseAt(samples[j], heading, 1, terrain), poseAt(samples[j], heading, -1, terrain));
+      out.push(approachRailPoseAt(samples, j, 1), approachRailPoseAt(samples, j, -1));
     }
   }
 }
@@ -102,9 +121,15 @@ export function planRoadsideDetails(
     gravelScatter: [], streetlamps: [],
   };
 
+  // Cosmetic furniture stays out of intersection aprons: RoadRenderer owns everything inside a
+  // degree-3+ node's conflict area, and props planted there read as construction debris.
+  const junctionNodes = [...graph.nodes.values()].filter((node) => graph.edgesAtNode(node.id).length >= 3);
+  const nearJunction = (x: number, z: number) =>
+    junctionNodes.some((node) => Math.hypot(node.x - x, node.z - z) <= JUNCTION_PROP_CLEARANCE);
+
   for (const edge of graph.edges.values()) {
     if (!developed(edge.stage, 'graded') || edge.samples.length < 2) continue;
-    planBridgeApproachRails(edge.samples, terrain, plan.guardrails);
+    planBridgeApproachRails(edge.samples, plan.guardrails);
     let walked = 0;
     let nextStation = SAMPLE_SPACING;
     let stationIndex = 0;
@@ -131,14 +156,18 @@ export function planRoadsideDetails(
       const crossSlope = Math.abs(left.y - right.y);
       if (crossSlope > 1.6) plan.retainingWalls.push(left.y < right.y ? left : right);
 
-      if ((!leftLand || !rightLand) && stationIndex % 2 === 1) {
+      // Safety furniture (rails, walls) stands wherever the terrain demands it; everything below
+      // is cosmetic and stays out of intersection aprons.
+      const inApron = nearJunction(sample.x, sample.z);
+
+      if (!inApron && (!leftLand || !rightLand) && stationIndex % 2 === 1) {
         plan.culverts.push(
           { ...left, y: left.y + 0.18 },
           { ...right, y: right.y + 0.18 },
         );
       }
 
-      if (i > 1 && i < edge.samples.length - 1) {
+      if (!inApron && i > 1 && i < edge.samples.length - 1) {
         const h0 = headingAt(edge.samples, i - 1);
         let turn = heading - h0;
         turn = Math.atan2(Math.sin(turn), Math.cos(turn));
@@ -147,7 +176,7 @@ export function planRoadsideDetails(
         }
       }
 
-      if (developed(edge.stage, 'painted')) {
+      if (developed(edge.stage, 'painted') && !inApron) {
         plan.gravelScatter.push({ ...left, scale: 0.7 }, { ...right, scale: 0.55 });
         const nearSettlement = settlements.some((s) =>
           (s.kind === 'house' || s.kind === 'building') && Math.hypot(s.x - sample.x, s.z - sample.z) <= 24,

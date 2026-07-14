@@ -5,10 +5,12 @@ import type { P2, RoadSample } from '../src/core/types';
 import { ConstructionRenderer } from '../src/render/constructionRenderer';
 import {
   bridgeApproachRanges,
+  buildJunctionPatchGeometry,
   buildRibbonGeometry,
   RoadRenderer,
   trimJunctionStripeRange,
 } from '../src/render/roadRenderer';
+import { ROAD_SHOULDER_EXTRA_PER_SIDE, ROAD_WIDTH } from '../src/core/constants';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { Heightfield } from '../src/sim/terrain/heightfield';
 
@@ -99,6 +101,137 @@ describe('road and bridge continuity', () => {
       }
       expect(nearest).toBeGreaterThanOrEqual(5 - 1e-6);
     }
+  });
+
+  it('follows each arm profile height across a sloped junction patch instead of one flat plane', () => {
+    // roads climb with +x (y = 2 + 0.1x); the junction at (24, 0) has arms whose trimmed ends sit
+    // at different heights, so a flat max-height patch would float above the downhill arm.
+    const slopedSampler = (ctrl: P2[]): RoadSample[] => {
+      const out: RoadSample[] = [];
+      for (let segment = 0; segment < ctrl.length - 1; segment++) {
+        const a = ctrl[segment], b = ctrl[segment + 1];
+        const length = Math.round(Math.hypot(b.x - a.x, b.z - a.z));
+        for (let i = 0; i < length; i++) {
+          const u = i / length;
+          const x = a.x + (b.x - a.x) * u;
+          out.push({ x, y: 2 + 0.1 * x, z: a.z + (b.z - a.z) * u, bridge: false });
+        }
+      }
+      const last = ctrl[ctrl.length - 1];
+      out.push({ x: last.x, y: 2 + 0.1 * last.x, z: last.z, bridge: false });
+      return out;
+    };
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, slopedSampler);
+    const scene = new THREE.Scene();
+    new RoadRenderer(scene, graph, bus, new Heightfield('sloped-junction', bus));
+    graph.commitChain([{ x: 0, z: 0 }, { x: 48, z: 0 }]);
+    graph.commitChain([{ x: 24, z: 0 }, { x: 24, z: 32 }]);
+    for (const edge of graph.edges.values()) {
+      edge.stage = 'painted';
+      bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
+    }
+
+    const junctionGroup = scene.getObjectByName('road-junction-surfaces') as THREE.Group;
+    const patch = junctionGroup.children.find(
+      (child) => child.userData.roadDetail === 'junctionSurface' && child.userData.junctionStage === 'paved',
+    ) as THREE.Mesh;
+    expect(patch).toBeTruthy();
+
+    // painted patch lift is 0.18 + 0.003; each hull corner must carry ITS arm's profile height.
+    const lift = 0.183;
+    const positions = patch.geometry.getAttribute('position') as THREE.BufferAttribute;
+    let sawWest = false, sawEast = false, sawNorth = false;
+    for (let i = 0; i < positions.count; i++) {
+      const x = positions.getX(i), y = positions.getY(i), z = positions.getZ(i);
+      if (x < 19.5) { sawWest = true; expect(y).toBeCloseTo(2 + 0.1 * 19 + lift, 2); }
+      if (x > 28.5) { sawEast = true; expect(y).toBeCloseTo(2 + 0.1 * 29 + lift, 2); }
+      if (z > 4.5) { sawNorth = true; expect(y).toBeCloseTo(2 + 0.1 * 24 + lift, 2); }
+    }
+    expect(sawWest && sawEast && sawNorth).toBe(true);
+  });
+
+  it('anchors junction patch corners to the actual trimmed arm cross-sections, not straight heading rays', () => {
+    // one arm curves north within the trim reach: its real end cross-section sits at (4, 2) facing
+    // +z, so the patch must reach the corners (1, 2) and (7, 2) at that arm's end height.
+    const arms = [
+      { heading: 0, y: 1, far: { x: 4, z: 2, y: 1.5, heading: Math.PI / 2 } },
+      { heading: Math.PI, y: 1, far: { x: -5, z: 0, y: 1, heading: Math.PI } },
+    ];
+    const geo = buildJunctionPatchGeometry(0, 1, 0, arms, 6);
+    const positions = geo.getAttribute('position') as THREE.BufferAttribute;
+    const has = (x: number, z: number, y: number) => {
+      for (let i = 0; i < positions.count; i++) {
+        if (Math.abs(positions.getX(i) - x) < 1e-3
+          && Math.abs(positions.getZ(i) - z) < 1e-3
+          && Math.abs(positions.getY(i) - y) < 1e-3) return true;
+      }
+      return false;
+    };
+    expect(has(7, 2, 1.5)).toBe(true); // real trimmed-end corner of the curved arm
+    expect(has(5, 3, 1.5) || has(5, -3, 1.5) || has(5, 3, 1) || has(5, -3, 1)).toBe(false); // no straight-ray ghost corner
+  });
+
+  it('sets drainage ditches back from owned junctions further than the surface trim', () => {
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, junctionSampler);
+    const scene = new THREE.Scene();
+    new RoadRenderer(scene, graph, bus, new Heightfield('junction-ditch-setback', bus));
+    graph.commitChain([{ x: 0, z: 0 }, { x: 48, z: 0 }]);
+    graph.commitChain([{ x: 24, z: 0 }, { x: 24, z: 32 }]);
+    for (const edge of graph.edges.values()) {
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId: edge.id, stage: 'graded', crew: 0 });
+    }
+
+    const junction = [...graph.nodes.values()].find((node) => graph.edgesAtNode(node.id).length === 3)!;
+    for (const edgeId of graph.edgesAtNode(junction.id)) {
+      const edgeGroup = scene.children.find((child) => child.userData.edgeId === edgeId) as THREE.Group;
+      let nearestDitch = Infinity;
+      let nearestShoulder = Infinity;
+      for (const child of edgeGroup.children) {
+        if (!(child instanceof THREE.Mesh)) continue;
+        const detail = child.userData.roadDetail;
+        if (detail !== 'ditch' && detail !== 'shoulder') continue;
+        const positions = child.geometry.getAttribute('position');
+        for (let i = 0; i < positions.count; i++) {
+          const d = Math.hypot(positions.getX(i) - junction.x, positions.getZ(i) - junction.z);
+          if (detail === 'ditch') nearestDitch = Math.min(nearestDitch, d);
+          else nearestShoulder = Math.min(nearestShoulder, d);
+        }
+      }
+      // ditches stop well before the apron; shoulders still meet the surface trim boundary
+      expect(nearestDitch).toBeGreaterThanOrEqual(9.5);
+      expect(nearestShoulder).toBeLessThanOrEqual(7.5);
+    }
+  });
+
+  it('lays a shoulder-width verge apron under every junction patch', () => {
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, junctionSampler);
+    const scene = new THREE.Scene();
+    new RoadRenderer(scene, graph, bus, new Heightfield('junction-verge-apron', bus));
+    graph.commitChain([{ x: 0, z: 0 }, { x: 48, z: 0 }]);
+    graph.commitChain([{ x: 24, z: 0 }, { x: 24, z: 32 }]);
+    for (const edge of graph.edges.values()) {
+      edge.stage = 'painted';
+      bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
+    }
+
+    const junctionGroup = scene.getObjectByName('road-junction-surfaces') as THREE.Group;
+    const apron = junctionGroup.children.find((child) => child.userData.roadDetail === 'junctionVerge') as THREE.Mesh;
+    expect(apron).toBeTruthy();
+    expect(apron.userData.weatherSurface).toBe('gravel'); // painted arms -> gravel verge, like buildShoulders
+    apron.geometry.computeBoundingBox();
+    const bounds = apron.geometry.boundingBox!;
+    const shoulderWidth = ROAD_WIDTH + ROAD_SHOULDER_EXTRA_PER_SIDE * 2;
+    // wide enough that each arm's shoulder stub blends into the apron instead of ending raw
+    expect(bounds.max.z - bounds.min.z).toBeGreaterThanOrEqual(shoulderWidth - 1e-6);
+    expect(bounds.max.x - bounds.min.x).toBeGreaterThanOrEqual(shoulderWidth - 1e-6);
+    // and it sits under the surface patch, not over it
+    const patch = junctionGroup.children.find((child) => child.userData.roadDetail === 'junctionSurface') as THREE.Mesh;
+    patch.geometry.computeBoundingBox();
+    expect(bounds.max.y).toBeLessThan(patch.geometry.boundingBox!.max.y);
   });
 
   it('defines tapered ground-to-deck ownership on both sides of a bridge run', () => {
