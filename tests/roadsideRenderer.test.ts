@@ -129,6 +129,44 @@ describe('context-sensitive roadside detail planning', () => {
       // …and vertically anchored to the road surface, not the terrain 1u below
       expect(rail.y).toBeCloseTo(4 + STAGE_YLIFT.paved, 5);
     }
+    // Stations sit at the EXACT setbacks measured from the deck joints (first/last bridge samples
+    // at x=22/58), interpolated between samples — so the 5.5u bars span [joint-11, joint] with no
+    // hole at the deck lip and no snap to the sampler's 2u spacing.
+    const xs = [...new Set(plan.guardrails.map((rail) => Math.round(rail.x * 100) / 100))].sort((a, b) => a - b);
+    expect(xs).toEqual([13.75, 19.25, 60.75, 66.25]);
+  });
+
+  it('rails approaches when the bridge occupies a whole edge (transition exactly at a node)', () => {
+    const bus = new EventBus();
+    // three chained edges (endpoints on the graph's 8u snap grid): land 0-16, deck 16-64 (EVERY
+    // sample bridge), land 64-80. No bridge-flag flip exists inside any single edge, so per-edge
+    // flip detection alone leaves this unrailed.
+    const nodeBridgeSampler = (ctrl: P2[]): RoadSample[] => {
+      const a = ctrl[0], b = ctrl[ctrl.length - 1];
+      const bridge = Math.min(a.x, b.x) >= 16 && Math.max(a.x, b.x) <= 64;
+      const steps = Math.round(Math.hypot(b.x - a.x, b.z - a.z) / 2);
+      const out: RoadSample[] = [];
+      for (let i = 0; i <= steps; i++) {
+        const u = i / steps;
+        out.push({ x: a.x + (b.x - a.x) * u, y: 4, z: a.z + (b.z - a.z) * u, bridge });
+      }
+      return out;
+    };
+    const graph = new RoadGraph(bus, nodeBridgeSampler);
+    graph.commitChain([{ x: 0, z: 0 }, { x: 16, z: 0 }]);
+    graph.commitChain([{ x: 16, z: 0 }, { x: 64, z: 0 }]);
+    graph.commitChain([{ x: 64, z: 0 }, { x: 80, z: 0 }]);
+    for (const edge of graph.edges.values()) edge.stage = 'painted';
+    const flat = { heightAt: () => 3, isLand: () => true };
+
+    const plan = planRoadsideDetails(graph, flat, []);
+    const xs = [...new Set(plan.guardrails.map((rail) => Math.round(rail.x * 100) / 100))].sort((a, b) => a - b);
+    expect(xs).toEqual([7.75, 13.25, 66.75, 72.25]); // setbacks measured from the node joints at x=16/64
+    for (const rail of plan.guardrails) {
+      expect(Math.abs(rail.z)).toBeCloseTo(BRIDGE_RAIL_OFFSET, 5);
+      expect(rail.y).toBeCloseTo(4 + STAGE_YLIFT.paved, 5);
+    }
+    expect(planRoadsideDetails(graph, flat, [])).toEqual(plan); // deterministic like every other detail
   });
 
   it('keeps cosmetic roadside props out of intersection aprons', () => {
