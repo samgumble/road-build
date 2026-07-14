@@ -4,7 +4,6 @@ import type { P2, RoadSample } from '../src/core/types';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { planRoadsideDetails } from '../src/render/roadsideRenderer';
 import { RoadsideRenderer } from '../src/render/roadsideRenderer';
-import { BRIDGE_RAIL_OFFSET, STAGE_YLIFT } from '../src/render/roadRenderer';
 import * as THREE from 'three';
 
 const sampler = (ctrl: P2[]): RoadSample[] => {
@@ -60,51 +59,10 @@ describe('context-sensitive roadside detail planning', () => {
     expect(plan.streetlamps).toEqual([]);
   });
 
-  it('rails both verges of every road-to-bridge approach, on the land side only', () => {
+  it('plans NO guardrails at road-to-bridge transitions — bridge decks carry their own rails', () => {
     const bus = new EventBus();
-    // straight 80u road along x with a bridge span between x=20 and x=60; flat land everywhere so
-    // no drop/water guardrails muddy the assertion — every rail must come from the approaches.
-    // Sampled at 2u (the real sampler's spacing) so the setback walk lands where it would in game.
-    const bridgeSampler = (ctrl: P2[]): RoadSample[] => {
-      const out: RoadSample[] = [];
-      const a = ctrl[0], b = ctrl[ctrl.length - 1];
-      const length = Math.hypot(b.x - a.x, b.z - a.z);
-      const steps = Math.round(length / 2);
-      for (let i = 0; i <= steps; i++) {
-        const u = i / steps;
-        const x = a.x + (b.x - a.x) * u;
-        const z = a.z + (b.z - a.z) * u;
-        out.push({ x, y: 0, z, bridge: x > 20 && x < 60 });
-      }
-      return out;
-    };
-    const graph = new RoadGraph(bus, bridgeSampler);
-    graph.commitChain([{ x: 0, z: 0 }, { x: 80, z: 0 }]);
-    for (const edge of graph.edges.values()) edge.stage = 'painted';
-    const flat = { heightAt: () => 0, isLand: () => true };
-
-    const plan = planRoadsideDetails(graph, flat, []);
-    expect(plan.guardrails.length).toBeGreaterThanOrEqual(8); // 2 rails x 2 verges x 2 approaches
-
-    for (const rail of plan.guardrails) {
-      // never out on the deck: every approach rail stands on the land run
-      expect(rail.x <= 20 + 1e-6 || rail.x >= 60 - 1e-6).toBe(true);
-      // and hugs one of the two transitions rather than scattering down the road
-      const nearTransition = Math.min(Math.abs(rail.x - 20), Math.abs(rail.x - 60));
-      expect(nearTransition).toBeLessThanOrEqual(12);
-    }
-    // both verges of the road are railed (road runs along x, so verges sit at +/-z)
-    expect(plan.guardrails.some((rail) => rail.z > 0)).toBe(true);
-    expect(plan.guardrails.some((rail) => rail.z < 0)).toBe(true);
-    // deterministic like every other detail
-    expect(planRoadsideDetails(graph, flat, [])).toEqual(plan);
-  });
-
-  it('poses approach rails on the bridge rail line at road height, never down on the terrain', () => {
-    const bus = new EventBus();
-    // road on a 4u embankment; terrain sits 1u below (too shallow for drop rails, so every rail
-    // in the plan comes from the bridge approaches). The deck's own rails run at BRIDGE_RAIL_OFFSET
-    // from the centerline at deck height — the approach rails must continue that exact line.
+    // flat, safe land (no drops, no water) with a mid-edge bridge span: the only historical
+    // source of guardrails here was the approach-rail pass, which is removed per player request.
     const bridgeSampler = (ctrl: P2[]): RoadSample[] => {
       const out: RoadSample[] = [];
       const a = ctrl[0], b = ctrl[ctrl.length - 1];
@@ -121,52 +79,21 @@ describe('context-sensitive roadside detail planning', () => {
     for (const edge of graph.edges.values()) edge.stage = 'painted';
     const embankment = { heightAt: () => 3, isLand: () => true };
 
-    const plan = planRoadsideDetails(graph, embankment, []);
-    expect(plan.guardrails.length).toBeGreaterThanOrEqual(8);
-    for (const rail of plan.guardrails) {
-      // laterally on the deck-rail line (road runs along x, so the offset shows up in z)…
-      expect(Math.abs(rail.z)).toBeCloseTo(BRIDGE_RAIL_OFFSET, 5);
-      // …and vertically anchored to the road surface, not the terrain 1u below
-      expect(rail.y).toBeCloseTo(4 + STAGE_YLIFT.paved, 5);
-    }
-    // Stations sit at the EXACT setbacks measured from the deck joints (first/last bridge samples
-    // at x=22/58), interpolated between samples — so the 5.5u bars span [joint-11, joint] with no
-    // hole at the deck lip and no snap to the sampler's 2u spacing.
-    const xs = [...new Set(plan.guardrails.map((rail) => Math.round(rail.x * 100) / 100))].sort((a, b) => a - b);
-    expect(xs).toEqual([13.75, 19.25, 60.75, 66.25]);
+    expect(planRoadsideDetails(graph, embankment, []).guardrails).toEqual([]);
   });
 
-  it('rails approaches when the bridge occupies a whole edge (transition exactly at a node)', () => {
+  it('still rails drops and waterside verges from the station loop', () => {
     const bus = new EventBus();
-    // three chained edges (endpoints on the graph's 8u snap grid): land 0-16, deck 16-64 (EVERY
-    // sample bridge), land 64-80. No bridge-flag flip exists inside any single edge, so per-edge
-    // flip detection alone leaves this unrailed.
-    const nodeBridgeSampler = (ctrl: P2[]): RoadSample[] => {
-      const a = ctrl[0], b = ctrl[ctrl.length - 1];
-      const bridge = Math.min(a.x, b.x) >= 16 && Math.max(a.x, b.x) <= 64;
-      const steps = Math.round(Math.hypot(b.x - a.x, b.z - a.z) / 2);
-      const out: RoadSample[] = [];
-      for (let i = 0; i <= steps; i++) {
-        const u = i / steps;
-        out.push({ x: a.x + (b.x - a.x) * u, y: 4, z: a.z + (b.z - a.z) * u, bridge });
-      }
-      return out;
-    };
-    const graph = new RoadGraph(bus, nodeBridgeSampler);
-    graph.commitChain([{ x: 0, z: 0 }, { x: 16, z: 0 }]);
-    graph.commitChain([{ x: 16, z: 0 }, { x: 64, z: 0 }]);
-    graph.commitChain([{ x: 64, z: 0 }, { x: 80, z: 0 }]);
+    const graph = new RoadGraph(bus, sampler);
+    graph.commitChain([{ x: 0, z: 0 }, { x: 40, z: 0 }, { x: 80, z: 0 }]);
     for (const edge of graph.edges.values()) edge.stage = 'painted';
-    const flat = { heightAt: () => 3, isLand: () => true };
 
-    const plan = planRoadsideDetails(graph, flat, []);
-    const xs = [...new Set(plan.guardrails.map((rail) => Math.round(rail.x * 100) / 100))].sort((a, b) => a - b);
-    expect(xs).toEqual([7.75, 13.25, 66.75, 72.25]); // setbacks measured from the node joints at x=16/64
-    for (const rail of plan.guardrails) {
-      expect(Math.abs(rail.z)).toBeCloseTo(BRIDGE_RAIL_OFFSET, 5);
-      expect(rail.y).toBeCloseTo(4 + STAGE_YLIFT.paved, 5);
-    }
-    expect(planRoadsideDetails(graph, flat, [])).toEqual(plan); // deterministic like every other detail
+    // the shared `terrain` stub drops 3u on the -z verge and turns to water past z <= -5:
+    // those safety rails are unrelated to bridges and must survive the approach-rail removal
+    const plan = planRoadsideDetails(graph, terrain, []);
+    expect(plan.guardrails.length).toBeGreaterThan(0);
+    expect(plan.guardrails.every((rail) => rail.z < 0)).toBe(true); // only the hazardous verge
+    expect(planRoadsideDetails(graph, terrain, [])).toEqual(plan); // deterministic
   });
 
   it('keeps cosmetic roadside props out of intersection aprons', () => {

@@ -206,6 +206,42 @@ describe('road and bridge continuity', () => {
     }
   });
 
+  it('keeps shoulders and ditches off neighboring asphalt even at acute junction angles', () => {
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, junctionSampler);
+    const scene = new THREE.Scene();
+    new RoadRenderer(scene, graph, bus, new Heightfield('acute-junction-verges', bus));
+    // 45-degree Y-junction at (24, 0): the fixed-length verge trims that clear a 90-degree
+    // crossing are NOT enough here — a strip 4.35-5u wide trimmed at 5u/9u still lies across the
+    // 45-degree neighbor's 6u-wide road surface.
+    graph.commitChain([{ x: 0, z: 0 }, { x: 48, z: 0 }]);
+    graph.commitChain([{ x: 24, z: 0 }, { x: 56, z: 32 }]);
+    for (const edge of graph.edges.values()) {
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId: edge.id, stage: 'graded', crew: 0 });
+    }
+
+    // no shoulder/ditch vertex of one edge may sit inside another edge's road corridor
+    for (const edge of graph.edges.values()) {
+      const group = scene.children.find((child) => child.userData.edgeId === edge.id) as THREE.Group;
+      for (const child of group.children) {
+        if (!(child instanceof THREE.Mesh)) continue;
+        const detail = child.userData.roadDetail;
+        if (detail !== 'shoulder' && detail !== 'ditch') continue;
+        const positions = child.geometry.getAttribute('position');
+        for (let i = 0; i < positions.count; i++) {
+          const vx = positions.getX(i), vz = positions.getZ(i);
+          for (const other of graph.edges.values()) {
+            if (other.id === edge.id) continue;
+            for (const s of other.samples) {
+              expect(Math.hypot(s.x - vx, s.z - vz)).toBeGreaterThanOrEqual(ROAD_WIDTH / 2 - 1e-6);
+            }
+          }
+        }
+      }
+    }
+  });
+
   it('lays a shoulder-width verge apron under every junction patch', () => {
     const bus = new EventBus();
     const graph = new RoadGraph(bus, junctionSampler);
