@@ -40,6 +40,18 @@ the delivered morphology layer is intentionally migration-free infrastructure fo
 > Coordination note: the slices above are merged work — do not re-implement parks/low-rise variety
 > from scratch; extend them (e.g. into `SettlementCenter` characters) instead.
 
+## Delivered skyline-variety slice — 2026-07-14 (Claude session)
+
+- [x] Render-only skyline shaping in `SceneryRenderer`: per-building vertical stretch via
+  `skylineHeightScale` (downtown-tall within 10u of a road, damped to ~70% past 34u, deterministic
+  jitter) driven by a `roadDistanceAt` probe wired from `main.ts`, plus per-instance facade tints
+  through `instanceColor`. Player feedback: dense settlements read as one flat-topped tower wall.
+
+> Coordination note: this is merged render-side work with no sim/save impact — the sim's upgrade
+> rules and any future `SettlementCenter` character system remain free to reshape WHICH parcels
+> become buildings; extend `skylineHeightScale`/the tint palette rather than adding a second
+> per-building scale path.
+
 ## Task 1: Seed settlement pockets instead of continuous roadside walls
 
 **Files:** `src/sim/growth/growth.ts`, `src/sim/save.ts`, `tests/growth.test.ts`, `tests/save.test.ts`

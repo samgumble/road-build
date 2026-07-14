@@ -330,6 +330,23 @@ production-build, artifact-upload, and deploy jobs:
   - Coverage: sloped-junction patch heights, curved-arm corner anchoring, ditch setback, apron
     presence/size, road-anchored approach-rail poses, and junction prop exclusion (6 new tests in
     `roadContinuity.test.ts` / `roadsideRenderer.test.ts`).
+- Calm lighting at fast-forward (2026-07-14): the day/night cycle caps at
+  `ATMOSPHERE_MAX_TIMESCALE` (4x, exported with `atmosphereTimeScale` from `solarTime.ts` — NOT
+  atmosphere.ts, so tests can import it without DOM-touching sky/quality modules). At 16x the sim,
+  crews, traffic, and growth still run full speed; only the lighting stops strobing noon->midnight
+  every couple of minutes.
+- Skyline variety (2026-07-14, player feedback "dense settlements read as a uniform wall"):
+  buildings get a per-instance vertical stretch from `skylineHeightScale(roadDistance, jitter)` —
+  full downtown height inside 10u of a road, damped to ~70% past 34u, times deterministic
+  per-tower jitter — plus a subtle per-instance facade tint via `InstancedMesh.instanceColor` (no
+  extra draw calls). `main.ts` wires a `roadDistanceAt` probe (nearest road sample; called once
+  per building spawn); without the probe (tests/tools) buildings vary by jitter alone. The
+  stretch persists through pop-in/fade/recover transforms and slot compaction (which now also
+  moves `instanceColor`); window quads sit at the scaled height. Restore replays placement, so
+  existing saves pick the variety up on load. Test hooks: `verticalStretchOf(id)` /
+  `facadeTintOf(id)`; coverage in `tests/skylineVariety.test.ts`. NOTE for test authors: a second
+  SceneryRenderer in one test process never resolves its GLTF load (three.js FileLoader in-flight
+  dedup) — share one instance per file, like sceneryDecay.test.ts.
 - Crane deck-segment orientation fix (2026-07-14): the lowered slab's scale axes were swapped —
   `rotation.y = -spanHeading` maps local +X onto the road direction, but the 16u span length was
   applied to Z (across the road) and the 5.4u width to X, so every dropped segment appeared ~3x
