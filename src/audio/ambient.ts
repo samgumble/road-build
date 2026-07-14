@@ -109,6 +109,17 @@ const BEEPER_DUTY = 0.5;
 
 const PAN_CLAMP = 0.7;
 const PAN_DIVISOR = 120;
+
+// Construction theater one-shots (2026-07-14): a low settle THUNK when the crane lands a bridge
+// deck span, and a soft leafy rustle-crack as corridor trees fall ahead of the excavator. Both
+// are strictly self-contained one-shots (attack -> exponential decay, disconnect onended) —
+// nothing here may loop or sustain, per the "no sustained synthesized tones, ever" invariant.
+const DECK_THUNK_GAIN_DB = -14;
+const DECK_THUNK_DUR = 0.32;
+const TREE_FALL_GAIN_DB = -21;
+const TREE_FALL_DUR = 0.24;
+const TREE_FALL_MIN_INTERVAL = 0.09; // s between rustles — a clearing sweep rustles, not machine-guns
+const TREE_FALL_MAX_QUEUE = 8; // batch clears (fast-forward) collapse to at most this many rustles
 const CREW_SWITCH_MARGIN = 20; // units a competitor must beat the followed crew by before we switch
 const PAN_EASE_TAU = 0.15; // seconds, damped-lerp time constant for the beeper pan
 
@@ -235,11 +246,24 @@ export class AmbientAudio {
     if (detail) this.pendingScrapes.push(detail.x);
   };
 
+  // Construction theater one-shot queues (see DECK_THUNK_*/TREE_FALL_* constants): events land
+  // here and update() drains them with camera context, mirroring pendingScrapes above.
+  private pendingDeckThunks: number[] = []; // world x per landed span, for panning
+  private pendingTreeFalls = 0;
+  private treeFallCooldown = 0;
+
   constructor(private bus: EventBus) {
     this.bus.on('construction:stage', (payload) => this.onConstructionStage(payload));
     this.bus.on('construction:progress', (payload) => this.onConstructionProgress(payload));
     this.bus.on('traffic:edgeEntered', ({ firstUse }) => {
       if (firstUse) this.playFirstUseChime();
+    });
+    this.bus.on('construction:deckSettled', ({ x }) => this.pendingDeckThunks.push(x));
+    this.bus.on('wilderness:cleared', ({ indices }) => {
+      this.pendingTreeFalls = Math.min(TREE_FALL_MAX_QUEUE, this.pendingTreeFalls + indices.length);
+    });
+    this.bus.on('growth:cleared', ({ kind }) => {
+      if (kind === 'tree') this.pendingTreeFalls = Math.min(TREE_FALL_MAX_QUEUE, this.pendingTreeFalls + 1);
     });
     window.addEventListener('construction:graderScrape', this.onGraderScrape);
   }
@@ -520,7 +544,126 @@ export class AmbientAudio {
     this.updateConstruction(dt, cameraX);
     this.updateRadioChatter(dt, cameraX);
     this.drainGraderScrapes(cameraX);
+    this.drainDeckThunks(cameraX);
+    this.drainTreeFalls(dt);
     this.musicPlayer?.update();
+  }
+
+  private drainDeckThunks(cameraX: number): void {
+    if (this.pendingDeckThunks.length === 0) return;
+    const xs = this.pendingDeckThunks;
+    this.pendingDeckThunks = [];
+    for (const x of xs) this.playDeckThunkOneShot(x, cameraX);
+  }
+
+  private drainTreeFalls(dt: number): void {
+    this.treeFallCooldown = Math.max(0, this.treeFallCooldown - dt);
+    if (this.pendingTreeFalls <= 0 || this.treeFallCooldown > 0) return;
+    this.pendingTreeFalls--;
+    this.treeFallCooldown = TREE_FALL_MIN_INTERVAL;
+    this.playTreeFallOneShot();
+  }
+
+  /** Low settle thunk for a landed bridge deck span: a pitch-dropping sine thump plus a short
+   * lowpassed noise slap, panned by world x like the grader scrapes. Strictly one-shot. */
+  private playDeckThunkOneShot(spanX: number, cameraX: number): void {
+    const ctx = this.ctx;
+    const sfxBus = this.sfxBus;
+    if (!ctx || !sfxBus || !this.noiseBuffer) return;
+
+    const now = ctx.currentTime;
+    const pan = clamp((spanX - cameraX) / PAN_DIVISOR, -PAN_CLAMP, PAN_CLAMP);
+    const panner = ctx.createStereoPanner();
+    panner.pan.value = pan;
+    panner.connect(sfxBus);
+
+    const gainLin = dbToGain(DECK_THUNK_GAIN_DB);
+
+    const thump = ctx.createOscillator();
+    thump.type = 'sine';
+    thump.frequency.setValueAtTime(110, now);
+    thump.frequency.exponentialRampToValueAtTime(48, now + DECK_THUNK_DUR);
+    const thumpGain = ctx.createGain();
+    thumpGain.gain.setValueAtTime(0, now);
+    thumpGain.gain.linearRampToValueAtTime(gainLin, now + 0.012);
+    thumpGain.gain.exponentialRampToValueAtTime(0.0001, now + DECK_THUNK_DUR);
+    thump.connect(thumpGain);
+    thumpGain.connect(panner);
+    thump.start(now);
+    thump.stop(now + DECK_THUNK_DUR + 0.02);
+
+    const slap = ctx.createBufferSource();
+    slap.buffer = this.noiseBuffer;
+    const slapFilter = ctx.createBiquadFilter();
+    slapFilter.type = 'lowpass';
+    slapFilter.frequency.value = 320;
+    const slapGain = ctx.createGain();
+    slapGain.gain.setValueAtTime(0, now);
+    slapGain.gain.linearRampToValueAtTime(gainLin * 0.8, now + 0.008);
+    slapGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.15);
+    slap.connect(slapFilter);
+    slapFilter.connect(slapGain);
+    slapGain.connect(panner);
+    slap.start(now);
+    slap.stop(now + 0.17);
+
+    slap.onended = () => {
+      thump.disconnect();
+      thumpGain.disconnect();
+      slap.disconnect();
+      slapFilter.disconnect();
+      slapGain.disconnect();
+      panner.disconnect();
+    };
+  }
+
+  /** Soft leafy crack-rustle for one corridor tree felled by the grading front: a bandpassed
+   * noise burst with a fast attack and a quicker low knock underneath. Strictly one-shot,
+   * rate-limited by `drainTreeFalls`. */
+  private playTreeFallOneShot(): void {
+    const ctx = this.ctx;
+    const sfxBus = this.sfxBus;
+    if (!ctx || !sfxBus || !this.noiseBuffer) return;
+
+    const now = ctx.currentTime;
+    const gainLin = dbToGain(TREE_FALL_GAIN_DB);
+
+    const rustle = ctx.createBufferSource();
+    rustle.buffer = this.noiseBuffer;
+    const band = ctx.createBiquadFilter();
+    band.type = 'bandpass';
+    band.frequency.value = 950;
+    band.Q.value = 0.7;
+    const rustleGain = ctx.createGain();
+    rustleGain.gain.setValueAtTime(0, now);
+    rustleGain.gain.linearRampToValueAtTime(gainLin, now + 0.015);
+    rustleGain.gain.exponentialRampToValueAtTime(0.0001, now + TREE_FALL_DUR);
+    rustle.connect(band);
+    band.connect(rustleGain);
+    rustleGain.connect(sfxBus);
+    rustle.start(now);
+    rustle.stop(now + TREE_FALL_DUR + 0.02);
+
+    const knock = ctx.createOscillator();
+    knock.type = 'sine';
+    knock.frequency.setValueAtTime(95, now);
+    knock.frequency.exponentialRampToValueAtTime(60, now + 0.08);
+    const knockGain = ctx.createGain();
+    knockGain.gain.setValueAtTime(0, now);
+    knockGain.gain.linearRampToValueAtTime(gainLin * 0.6, now + 0.008);
+    knockGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.09);
+    knock.connect(knockGain);
+    knockGain.connect(sfxBus);
+    knock.start(now);
+    knock.stop(now + 0.11);
+
+    rustle.onended = () => {
+      rustle.disconnect();
+      band.disconnect();
+      rustleGain.disconnect();
+      knock.disconnect();
+      knockGain.disconnect();
+    };
   }
 
   private isNightFromTimeOfDay(timeOfDay: number): boolean {

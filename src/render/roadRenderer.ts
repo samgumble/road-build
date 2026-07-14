@@ -961,19 +961,23 @@ export class RoadRenderer {
    * computed against every OTHER arm at each of the edge's nodes, at ANY degree >= 2: acute
    * junction arms and sharp corners both put a wide verge across the neighbor's asphalt. */
   private vergeSetbacksFor(edge: RoadEdge, stripHalf: number): { a: number; b: number } {
-    const setbackAt = (nodeId: number): number => {
-      const own = this.edgeArmAtNode(edge, nodeId);
-      if (!own) return 0;
-      const others: number[] = [];
-      for (const id of this.graph.edgesAtNode(nodeId)) {
-        if (id === edge.id) continue;
-        const other = this.graph.edges.get(id);
-        const arm = other ? this.edgeArmAtNode(other, nodeId) : null;
-        if (arm) others.push(arm.heading);
-      }
-      return vergeJunctionSetback(own.heading, others, stripHalf);
+    return {
+      a: this.vergeSetbackAtNode(edge, edge.a, stripHalf),
+      b: this.vergeSetbackAtNode(edge, edge.b, stripHalf),
     };
-    return { a: setbackAt(edge.a), b: setbackAt(edge.b) };
+  }
+
+  private vergeSetbackAtNode(edge: RoadEdge, nodeId: number, stripHalf: number): number {
+    const own = this.edgeArmAtNode(edge, nodeId);
+    if (!own) return 0;
+    const others: number[] = [];
+    for (const id of this.graph.edgesAtNode(nodeId)) {
+      if (id === edge.id) continue;
+      const other = this.graph.edges.get(id);
+      const arm = other ? this.edgeArmAtNode(other, nodeId) : null;
+      if (arm) others.push(arm.heading);
+    }
+    return vergeJunctionSetback(own.heading, others, stripHalf);
   }
 
   /** Rebuilds all completed degree-3+ conflict areas as topology-owned meshes. Mixed-stage
@@ -996,7 +1000,7 @@ export class RoadRenderer {
         if (!edge) return [];
         const stage = junctionSurfaceStage(edge.stage);
         const arm = this.edgeArmAtNode(edge, node.id);
-        return stage && arm ? [{ ...arm, stage }] : [];
+        return stage && arm ? [{ ...arm, stage, edge }] : [];
       });
       const stages = [...new Set(arms.map((arm) => arm.stage))]
         .sort((a, b) => junctionSurfaceRank(a) - junctionSurfaceRank(b));
@@ -1008,13 +1012,24 @@ export class RoadRenderer {
 
       // Verge apron first (drawn under every stage patch): one shoulder-width hull at the lowest
       // present stage's shoulder color, so each arm's trimmed shoulder stub blends into a
-      // continuous junction verge instead of ending raw against bare terrain.
+      // continuous junction verge instead of ending raw against bare terrain. Each apron arm
+      // extends to that arm's ACTUAL shoulder start (the angle-aware verge setback — see
+      // vergeJunctionSetback), so acute junctions get a continuous verge wedge instead of bare
+      // terrain between the fixed-reach apron edge and where the shoulder strip finally begins.
       if (stages.length) {
         const apronStage = stages[0];
         const apronLift = Math.max(0.015, STAGE_YLIFT[apronStage] - SHOULDER_Y_GAP) + 0.002;
         const apronY = Math.max(...arms.map((arm) => arm.y)) + apronLift;
+        const apronArms = arms.map((arm) => {
+          const reach = Math.max(
+            JUNCTION_REACH,
+            this.vergeSetbackAtNode(arm.edge, node.id, SHOULDER_WIDTH / 2),
+          );
+          const extended = reach > JUNCTION_REACH ? this.edgeArmAtNode(arm.edge, node.id, reach) : null;
+          return lifted(extended ?? arm, apronLift);
+        });
         const apronGeometry = buildJunctionPatchGeometry(
-          node.x, apronY, node.z, arms.map((arm) => lifted(arm, apronLift)), SHOULDER_WIDTH,
+          node.x, apronY, node.z, apronArms, SHOULDER_WIDTH,
         );
         if (apronGeometry.getAttribute('position')) {
           const apronMaterial = makeStandardMaterial(SHOULDER_COLOR[apronStage], 1, 'shoulder');
@@ -1392,21 +1407,22 @@ export class RoadRenderer {
       if (to <= from) return;
     }
 
+    // Angle-aware verge clearance (see vergeJunctionSetback): clamps a range's ends back by the
+    // per-end setbacks a strip of a given half-width needs so it can never lie on another arm's
+    // road surface — applied to every detail strip below, each with its own width.
+    const clampEnds = (range: { from: number; to: number }, ends: { a: number; b: number }) => ({
+      from: Math.max(range.from, ends.a),
+      to: Math.min(range.to, total - ends.b),
+    });
+
     // Drainage keeps extra distance from owned junctions so ditch strips never point into the apron.
     let ditchRange = edge
       ? this.trimToJunctionOwnership(edge, stage, from, to, total, JUNCTION_REACH + DITCH_JUNCTION_SETBACK)
       : { from, to };
-    // Angle-aware verge clearance: at acute junction arms (and sharp corners, which the ownership
-    // trims above never touch) a shoulder/ditch trimmed at the fixed reaches still lies across the
-    // neighboring arm's road surface. Push each strip's ends back by its own width's requirement.
     let shoulderRange = { from, to };
     if (edge) {
-      const clamp = (range: { from: number; to: number }, ends: { a: number; b: number }) => ({
-        from: Math.max(range.from, ends.a),
-        to: Math.min(range.to, total - ends.b),
-      });
-      shoulderRange = clamp(shoulderRange, this.vergeSetbacksFor(edge, SHOULDER_WIDTH / 2));
-      ditchRange = clamp(ditchRange, this.vergeSetbacksFor(edge, DITCH_OFFSET + DITCH_WIDTH / 2));
+      shoulderRange = clampEnds(shoulderRange, this.vergeSetbacksFor(edge, SHOULDER_WIDTH / 2));
+      ditchRange = clampEnds(ditchRange, this.vergeSetbacksFor(edge, DITCH_OFFSET + DITCH_WIDTH / 2));
     }
     this.buildShoulders(v, samples, stage, shoulderRange.from, shoulderRange.to, ditchRange);
 
@@ -1462,9 +1478,15 @@ export class RoadRenderer {
     this.buildBridgeApproaches(v, samples, stage, from, to);
 
     if (stage === 'painted') {
-      this.buildTireWear(v, samples, from, to);
-      this.buildSurfaceLife(v, samples, from, to);
-      const stripeRange = edge
+      // Painted-on details never cross onto a neighboring arm's asphalt: each strip family is
+      // clamped by its own lateral extent (tire wear reaches ~2.1u out, surface-life details span
+      // the full half road, dashes hug the centerline).
+      const wearHalf = Math.max(...TRAFFIC_WEAR_OFFSETS.map(Math.abs)) + TIRE_WEAR_WIDTH / 2;
+      const wearRange = edge ? clampEnds({ from, to }, this.vergeSetbacksFor(edge, wearHalf)) : { from, to };
+      if (wearRange.to > wearRange.from) this.buildTireWear(v, samples, wearRange.from, wearRange.to);
+      const lifeRange = edge ? clampEnds({ from, to }, this.vergeSetbacksFor(edge, ROAD_WIDTH / 2)) : { from, to };
+      if (lifeRange.to > lifeRange.from) this.buildSurfaceLife(v, samples, lifeRange.from, lifeRange.to);
+      let stripeRange = edge
         ? trimJunctionStripeRange(
           from,
           to,
@@ -1473,6 +1495,7 @@ export class RoadRenderer {
           this.graph.edgesAtNode(edge.b).length,
         )
         : { from, to };
+      if (edge) stripeRange = clampEnds(stripeRange, this.vergeSetbacksFor(edge, CENTERLINE_WIDTH / 2));
       if (stripeRange.to > stripeRange.from) {
         const dashGeo = buildDashedRibbonGeometry(
           samples, CENTERLINE_WIDTH, CENTERLINE_YLIFT, stripeRange.from, stripeRange.to, 2,

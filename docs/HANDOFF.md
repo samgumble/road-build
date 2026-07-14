@@ -327,6 +327,21 @@ production-build, artifact-upload, and deploy jobs:
   - Coverage: sloped-junction patch heights, curved-arm corner anchoring, ditch setback, apron
     presence/size, road-anchored approach-rail poses, and junction prop exclusion (6 new tests in
     `roadContinuity.test.ts` / `roadsideRenderer.test.ts`).
+- Construction theater one-shots (2026-07-14): a low settle THUNK when a bridge deck span lands
+  (`construction:deckSettled` event, emitted by `constructionRenderer.settleBridgeSpan` with the
+  span's world x for panning) and a soft crack-rustle per corridor tree felled by the grading
+  front (`wilderness:cleared` batches + `growth:cleared` with the new optional `kind` payload —
+  only `kind: 'tree'` rustles). Rustles are rate-limited (>= 90ms apart, queue capped at 8 so 16x
+  clears don't machine-gun). Both are strictly self-contained one-shots per the invariant below.
+- Junction cleanup, third pass (2026-07-14, "10x the junction cleanup"):
+  - The verge apron's arms extend to each arm's ACTUAL angle-aware shoulder start (not the fixed
+    5u reach), so acute junctions get a continuous verge wedge instead of bare gaps.
+  - Painted-on details are clamped by their own lateral extent via `vergeSetbacksFor`: tire wear
+    (~2.1u), surface-life patches/puddles/edge wear (half road), and centerline dashes — nothing
+    painted on one road can cross onto a neighboring arm's asphalt.
+  - `planRoadsideDetails` ends with a corridor guard: every planned pose (all pools) within
+    ROAD_WIDTH/2 + 0.3 of any developed edge's sample is dropped; the junction sign instead picks
+    the first side of the node that stands clear.
 - Progressive corridor clearing (2026-07-14, player request "trees removed during the step after
   surveying"): both `WildernessSim` and `GrowthSim` now ALSO listen to `construction:progress`
   (stage `'graded'`, non-demolish) and sweep their corridor up to the front's arclength `t` — trees

@@ -242,6 +242,69 @@ describe('road and bridge continuity', () => {
     }
   });
 
+  it('extends the junction verge apron out to each arm shoulder start, closing acute-angle wedges', () => {
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, junctionSampler);
+    const scene = new THREE.Scene();
+    new RoadRenderer(scene, graph, bus, new Heightfield('apron-extension', bus));
+    // 45-degree Y at (24, 0): the acute arms' shoulders start ~9u out (angle-aware setback), so a
+    // fixed 5u apron leaves a bare wedge between the apron edge and the shoulder start.
+    graph.commitChain([{ x: 0, z: 0 }, { x: 48, z: 0 }]);
+    graph.commitChain([{ x: 24, z: 0 }, { x: 56, z: 32 }]);
+    for (const edge of graph.edges.values()) {
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId: edge.id, stage: 'graded', crew: 0 });
+    }
+
+    const junctionGroup = scene.getObjectByName('road-junction-surfaces') as THREE.Group;
+    const apron = junctionGroup.children.find((child) => child.userData.roadDetail === 'junctionVerge') as THREE.Mesh;
+    expect(apron).toBeTruthy();
+    const positions = apron.geometry.getAttribute('position') as THREE.BufferAttribute;
+    let maxDist = 0;
+    for (let i = 0; i < positions.count; i++) {
+      maxDist = Math.max(maxDist, Math.hypot(positions.getX(i) - 24, positions.getZ(i)));
+    }
+    // far apron corners must reach the acute arms' shoulder starts (~9u along + half width),
+    // not stop at the fixed 5u reach (whose corners cap out at ~6.6u from the node)
+    expect(maxDist).toBeGreaterThanOrEqual(8.5);
+  });
+
+  it('keeps center dashes, tire wear, and surface details off neighboring asphalt at acute junctions', () => {
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, junctionSampler);
+    const scene = new THREE.Scene();
+    new RoadRenderer(scene, graph, bus, new Heightfield('acute-junction-paint', bus));
+    // ~27-degree fork: even the narrow centerline (0.5u) and tire-wear strips (up to 2.07u out)
+    // cross the neighbor's 6u road when trimmed at the fixed 5u reach.
+    graph.commitChain([{ x: 0, z: 0 }, { x: 48, z: 0 }]);
+    graph.commitChain([{ x: 24, z: 0 }, { x: 56, z: 16 }]);
+    for (const edge of graph.edges.values()) {
+      edge.stage = 'painted';
+      bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
+    }
+
+    for (const edge of graph.edges.values()) {
+      const group = scene.children.find((child) => child.userData.edgeId === edge.id) as THREE.Group;
+      for (const child of group.children) {
+        if (!(child instanceof THREE.Mesh)) continue;
+        const detail = child.userData.roadDetail;
+        const isPaint = child.userData.wetPaint === true;
+        const isWear = detail === 'tireWear' || detail === 'surfaceWear' || detail === 'puddles';
+        if (!isPaint && !isWear) continue;
+        const positions = child.geometry.getAttribute('position');
+        for (let i = 0; i < positions.count; i++) {
+          const vx = positions.getX(i), vz = positions.getZ(i);
+          for (const other of graph.edges.values()) {
+            if (other.id === edge.id) continue;
+            for (const s of other.samples) {
+              expect(Math.hypot(s.x - vx, s.z - vz)).toBeGreaterThanOrEqual(ROAD_WIDTH / 2 - 1e-6);
+            }
+          }
+        }
+      }
+    }
+  });
+
   it('lays a shoulder-width verge apron under every junction patch', () => {
     const bus = new EventBus();
     const graph = new RoadGraph(bus, junctionSampler);
