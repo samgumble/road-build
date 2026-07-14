@@ -3,7 +3,6 @@ import { ROAD_WIDTH } from '../core/constants';
 import { EventBus } from '../core/events';
 import { STAGES } from '../core/types';
 import type { RoadSample } from '../core/types';
-import { BRIDGE_RAIL_OFFSET, STAGE_YLIFT } from './roadRenderer';
 import type { SpawnRecord } from '../sim/growth/growth';
 import type { RoadGraph } from '../sim/roads/graph';
 
@@ -37,11 +36,6 @@ type Settlement = Pick<SpawnRecord, 'id' | 'kind' | 'x' | 'z'>;
 
 const DETAIL_OFFSET = ROAD_WIDTH / 2 + 2.1;
 const SAMPLE_SPACING = 12;
-// Road-to-bridge approach rails: every transition onto a deck gets guardrail segments on BOTH
-// verges of the land run leading up to it (the classic paired approach rails), stepped back from
-// the transition sample by these arclengths — one rail centered just before the deck, one behind
-// it, matching the 5.5u guardrail segment the pool already draws.
-const APPROACH_RAIL_SETBACKS = [2.75, 8.25];
 // Keep cosmetic props (gravel, reflectors, poles, lamps, culverts) at least this far from a
 // degree-3+ node: the junction apron (5u reach + shoulder width) plus a small margin.
 const JUNCTION_PROP_CLEARANCE = 10;
@@ -64,76 +58,6 @@ function developed(stage: string, atLeast: 'graded' | 'painted'): boolean {
   return STAGES.indexOf(stage as (typeof STAGES)[number]) >= STAGES.indexOf(atLeast);
 }
 
-interface RailStation { x: number; y: number; z: number; heading: number }
-
-/** Walks `setback` arclength along the land run starting AT the deck-joint sample `jointIdx`
- * (stepping `step` toward land), interpolating the exact station between samples. Measuring from
- * the joint — where the deck rails begin — makes the 5.5u bars at setbacks 2.75/8.25 span a
- * continuous [joint-11, joint] run with no hole at the lip; snapping to whole samples used to
- * plant them up to 1.5u short AND leave the sampler-spacing gap right at the deck edge. Returns
- * null when the land run ends first (skip the rail rather than clamp it somewhere misleading). */
-function railStationAt(samples: RoadSample[], jointIdx: number, step: 1 | -1, setback: number): RailStation | null {
-  let acc = 0;
-  let j = jointIdx;
-  while (true) {
-    const next = j + step;
-    if (next < 0 || next >= samples.length || samples[next].bridge) return null;
-    const a = samples[j], b = samples[next];
-    const seg = Math.hypot(b.x - a.x, b.z - a.z);
-    if (seg > 0 && acc + seg >= setback) {
-      const u = (setback - acc) / seg;
-      return {
-        x: a.x + (b.x - a.x) * u,
-        y: a.y + (b.y - a.y) * u,
-        z: a.z + (b.z - a.z) * u,
-        heading: Math.atan2(b.z - a.z, b.x - a.x),
-      };
-    }
-    acc += seg;
-    j = next;
-  }
-}
-
-/** Both verges' rail poses for one station, anchored to the ROAD, not the terrain: they continue
- * the deck rails' exact lateral line (BRIDGE_RAIL_OFFSET from the centerline) at road-surface
- * height, so the rail run leads onto the bridge instead of standing 2u further out and partway
- * down the embankment. */
-function approachRailPoses(station: RailStation, out: DetailPose[]): void {
-  const px = -Math.sin(station.heading);
-  const pz = Math.cos(station.heading);
-  for (const side of [1, -1]) {
-    out.push({
-      x: station.x + px * BRIDGE_RAIL_OFFSET * side,
-      y: station.y + STAGE_YLIFT.paved,
-      z: station.z + pz * BRIDGE_RAIL_OFFSET * side,
-      heading: station.heading,
-    });
-  }
-}
-
-/**
- * Guardrails for every road-to-bridge transition on `samples`: walks back onto the LAND side of
- * each bridge boundary and rails both verges at APPROACH_RAIL_SETBACKS. The station loop in
- * `planRoadsideDetails` skips bridge samples entirely (and only rails drops/water it happens to
- * sample), so without this pass the most safety-critical stretch of the road — the lip where the
- * embankment meets the deck — was the one place guaranteed to have no rail.
- *
- * This only sees transitions INSIDE one edge's samples; bridges that occupy a whole edge (their
- * transitions sitting exactly on nodes) are railed by the node pass in `planRoadsideDetails`.
- */
-function planBridgeApproachRails(samples: RoadSample[], out: DetailPose[]): void {
-  for (let i = 1; i < samples.length; i++) {
-    if (!!samples[i].bridge === !!samples[i - 1].bridge) continue;
-    // the deck-joint sample of this transition; walk toward the land side
-    const jointIdx = samples[i].bridge ? i : i - 1;
-    const step: 1 | -1 = samples[i].bridge ? -1 : 1;
-    for (const setback of APPROACH_RAIL_SETBACKS) {
-      const station = railStationAt(samples, jointIdx, step, setback);
-      if (station) approachRailPoses(station, out);
-    }
-  }
-}
-
 /** Pure deterministic context planner. It samples fixed arclength intervals and never consumes
  * random state, so rebuilding the same road/terrain/settlement state produces identical props. */
 export function planRoadsideDetails(
@@ -154,7 +78,6 @@ export function planRoadsideDetails(
 
   for (const edge of graph.edges.values()) {
     if (!developed(edge.stage, 'graded') || edge.samples.length < 2) continue;
-    planBridgeApproachRails(edge.samples, plan.guardrails);
     let walked = 0;
     let nextStation = SAMPLE_SPACING;
     let stationIndex = 0;
@@ -208,34 +131,6 @@ export function planRoadsideDetails(
         );
         if (nearSettlement && stationIndex % 2 === 0) plan.utilityPoles.push(left);
         if (nearSettlement && stationIndex % 2 === 1) plan.streetlamps.push(right);
-      }
-    }
-  }
-
-  // Node-boundary approach rails: when a bridge occupies its WHOLE edge, both transitions sit
-  // exactly on nodes — no bridge-flag flip exists inside any single edge's samples, so the
-  // per-edge pass above cannot see them (the classic "some bridges have no rails" hole). Rail
-  // every developed land arm of any node that also anchors a developed deck-end arm, measuring
-  // the setbacks from the node itself (which IS the deck joint there).
-  for (const node of graph.nodes.values()) {
-    const arms = graph.edgesAtNode(node.id).flatMap((id) => {
-      const edge = graph.edges.get(id);
-      if (!edge || !developed(edge.stage, 'graded') || edge.samples.length < 2) return [];
-      const atStart = edge.a === node.id;
-      const jointIdx = atStart ? 0 : edge.samples.length - 1;
-      return [{
-        samples: edge.samples,
-        jointIdx,
-        step: (atStart ? 1 : -1) as 1 | -1,
-        bridge: !!edge.samples[jointIdx].bridge,
-      }];
-    });
-    if (!arms.some((arm) => arm.bridge)) continue;
-    for (const arm of arms) {
-      if (arm.bridge) continue;
-      for (const setback of APPROACH_RAIL_SETBACKS) {
-        const station = railStationAt(arm.samples, arm.jointIdx, arm.step, setback);
-        if (station) approachRailPoses(station, plan.guardrails);
       }
     }
   }

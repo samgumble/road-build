@@ -85,6 +85,33 @@ const JUNCTION_REACH = 5;
 // Drainage stops this much further from a junction than the surface trim: converging ditch strips
 // from every arm otherwise butt right up against the apron edge, pointing into the intersection.
 const DITCH_JUNCTION_SETBACK = 4;
+
+// A verge strip (shoulder/ditch) is wider than the asphalt it flanks, so a fixed-length junction
+// trim that clears a 90-degree crossing still leaves the strip lying across a neighboring arm's
+// ROAD SURFACE when the arms meet at an acute angle — and a sharp degree-2 corner has the same
+// geometry with no junction trim at all. For a strip reaching `stripHalf` from its own centerline,
+// the arclength needed to clear a neighbor whose direction differs by `phi` grows as
+// (roadClear + stripHalf*cos(phi)) / sin(phi); past ~135 degrees the neighbor bends away behind
+// this arm and can't be reached at all.
+const VERGE_SETBACK_MAX = 22; // hairpin clamp — beyond this the strips simply stay clear entirely
+
+/** Arclength a verge strip of half-width `stripHalf` must stay back from a node so it can never
+ * lie on any other arm's road surface. `ownHeading`/`otherHeadings` all point AWAY from the node. */
+export function vergeJunctionSetback(
+  ownHeading: number,
+  otherHeadings: readonly number[],
+  stripHalf: number,
+): number {
+  const roadClear = ROAD_WIDTH / 2 + 0.3;
+  let setback = 0;
+  for (const other of otherHeadings) {
+    const phi = Math.abs(Math.atan2(Math.sin(other - ownHeading), Math.cos(other - ownHeading)));
+    if (phi >= Math.PI * 0.75) continue;
+    const required = (roadClear + stripHalf * Math.max(0, Math.cos(phi))) / Math.max(Math.sin(phi), 0.15);
+    setback = Math.max(setback, Math.min(required, VERGE_SETBACK_MAX));
+  }
+  return setback;
+}
 const BRIDGE_APPROACH_LENGTH = 6;
 
 /** Removes center paint from the compact asphalt apron at a true connected intersection. Ordinary
@@ -930,6 +957,25 @@ export class RoadRenderer {
     return { heading, y: a.y, far };
   }
 
+  /** Per-end verge setbacks for `edge`'s shoulder/ditch strips (see `vergeJunctionSetback`) —
+   * computed against every OTHER arm at each of the edge's nodes, at ANY degree >= 2: acute
+   * junction arms and sharp corners both put a wide verge across the neighbor's asphalt. */
+  private vergeSetbacksFor(edge: RoadEdge, stripHalf: number): { a: number; b: number } {
+    const setbackAt = (nodeId: number): number => {
+      const own = this.edgeArmAtNode(edge, nodeId);
+      if (!own) return 0;
+      const others: number[] = [];
+      for (const id of this.graph.edgesAtNode(nodeId)) {
+        if (id === edge.id) continue;
+        const other = this.graph.edges.get(id);
+        const arm = other ? this.edgeArmAtNode(other, nodeId) : null;
+        if (arm) others.push(arm.heading);
+      }
+      return vergeJunctionSetback(own.heading, others, stripHalf);
+    };
+    return { a: setbackAt(edge.a), b: setbackAt(edge.b) };
+  }
+
   /** Rebuilds all completed degree-3+ conflict areas as topology-owned meshes. Mixed-stage
    * junctions layer cumulatively: a newly graded branch expands the dirt foundation while the
    * already-paved through road gets its own narrower asphalt patch on top. No edge-end strip owns
@@ -1347,10 +1393,22 @@ export class RoadRenderer {
     }
 
     // Drainage keeps extra distance from owned junctions so ditch strips never point into the apron.
-    const ditchRange = edge
+    let ditchRange = edge
       ? this.trimToJunctionOwnership(edge, stage, from, to, total, JUNCTION_REACH + DITCH_JUNCTION_SETBACK)
       : { from, to };
-    this.buildShoulders(v, samples, stage, from, to, ditchRange);
+    // Angle-aware verge clearance: at acute junction arms (and sharp corners, which the ownership
+    // trims above never touch) a shoulder/ditch trimmed at the fixed reaches still lies across the
+    // neighboring arm's road surface. Push each strip's ends back by its own width's requirement.
+    let shoulderRange = { from, to };
+    if (edge) {
+      const clamp = (range: { from: number; to: number }, ends: { a: number; b: number }) => ({
+        from: Math.max(range.from, ends.a),
+        to: Math.min(range.to, total - ends.b),
+      });
+      shoulderRange = clamp(shoulderRange, this.vergeSetbacksFor(edge, SHOULDER_WIDTH / 2));
+      ditchRange = clamp(ditchRange, this.vergeSetbacksFor(edge, DITCH_OFFSET + DITCH_WIDTH / 2));
+    }
+    this.buildShoulders(v, samples, stage, shoulderRange.from, shoulderRange.to, ditchRange);
 
     if (stage === 'paved' && advancing) {
       // Roller trails the paver by ROLLER_TRAIL_DISTANCE (see constructionRenderer.ts): everything
@@ -1483,13 +1541,15 @@ export class RoadRenderer {
     // Drape verge strips onto the terrain (never below road height): on a cross-slope the old
     // flat-at-road-height strips floated above the grass downhill and vanished under it uphill.
     const drape = (x: number, z: number) => this.hf.heightAt(x, z);
-    for (const range of groundRanges(samples, from, to, shoulderBuffer)) {
-      const geo = buildRibbonGeometry(samples, SHOULDER_WIDTH, yLift, range.from, range.to, 0, false, false, undefined, drape);
-      const mat = makeStandardMaterial(SHOULDER_COLOR[stage], 1, 'shoulder');
-      mat.roughness = 1;
-      const mesh = this.addMesh(v, geo, mat);
-      mesh.userData.roadDetail = 'shoulder';
-      tagWeatherSurface(mesh, weatherKind);
+    if (to > from) {
+      for (const range of groundRanges(samples, from, to, shoulderBuffer)) {
+        const geo = buildRibbonGeometry(samples, SHOULDER_WIDTH, yLift, range.from, range.to, 0, false, false, undefined, drape);
+        const mat = makeStandardMaterial(SHOULDER_COLOR[stage], 1, 'shoulder');
+        mat.roughness = 1;
+        const mesh = this.addMesh(v, geo, mat);
+        mesh.userData.roadDetail = 'shoulder';
+        tagWeatherSurface(mesh, weatherKind);
+      }
     }
 
     // The tapered bridge approach owns the full verge-to-deck transition. End drainage before

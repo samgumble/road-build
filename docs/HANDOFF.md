@@ -133,24 +133,13 @@ assuming a green build means the page is live.
   settlement pair); phases are hash-seeded, walking uses render dt (theater ambles at any sim
   speed), and the whole group hides at night via `atmosphere:phase`. Pure render theater — no sim
   contract, no save state.
-- Bridge approach rails: `planBridgeApproachRails` (in `roadsideRenderer.ts`, called per edge by
-  the planner) rails BOTH verges of every road-to-bridge transition at two setbacks on the land
-  run. The station loop skips bridge samples entirely, so without this pass the embankment-to-deck
-  lip was guaranteed unrailed. Poses feed the existing guardrail pool — no new draw calls.
-  Alignment fix (2026-07-13): approach rails are ROAD-anchored, not terrain-anchored — they stand
-  at `BRIDGE_RAIL_OFFSET` (exported by `roadRenderer.ts` and shared with the deck rails, same
-  pattern as `BRIDGE_PYLON_SPACING`) at `sample.y + STAGE_YLIFT.paved`, so the rail line runs
-  straight onto the deck instead of jumping 2.3u outboard and dropping down the embankment.
-  Round 2 (2026-07-14, player: rails missing on some bridges / still misplaced):
-  - Stations are interpolated to their EXACT setbacks measured from the deck-joint sample (where
-    the deck rails begin), not snapped to the sampler's 2u spacing from the last land sample — the
-    two 5.5u bars now span a continuous [joint-11, joint] run butted flush against the deck rails
-    (verified end-to-end: bar tops and deck-rail tops both at surface+0.98, same ±2.8 offset).
-  - A bridge occupying its WHOLE edge (both transitions exactly on nodes — any draw that starts or
-    ends at a shore node, or an edge split there) has no bridge-flag flip inside any single edge's
-    samples, so the per-edge pass could never rail it. `planRoadsideDetails` now runs a node pass:
-    every developed land arm of a node that anchors a deck-end arm gets the setback rails, measured
-    from the node itself. If a land run is shorter than a setback the rail is skipped, not clamped.
+- Bridge approach rails: REMOVED (2026-07-14, player request "remove the guard rails between
+  roads and bridges") after two alignment iterations — the deck's own rails plus the tapered
+  approach slab now own the transition visually. `planRoadsideDetails` plans guardrails ONLY from
+  the station loop's terrain context (drops > 1.35u and waterside verges); a regression test pins
+  a flat-land road-to-bridge transition to ZERO planned guardrails. `BRIDGE_RAIL_OFFSET` /
+  `STAGE_YLIFT` stay exported from `roadRenderer.ts` (deck rails still use the former). Do not
+  reintroduce approach rails without a fresh player request.
 - Instancing audit (2026-07-13): every population-scaled renderer is instanced (cars, scenery GLB
   variants, roadside pools, construction cone/floodlight/particle pools, villagers). The only
   per-object draws are the three bounded construction crew rigs (cheap primitives per the Task 25
@@ -324,6 +313,14 @@ production-build, artifact-upload, and deploy jobs:
     every junction patch so arm shoulder stubs blend instead of ending raw on terrain.
   - Drainage ditches trim back 9u (surface trim 5u + `DITCH_JUNCTION_SETBACK` 4u) at junction-owned
     ends so ditch strips never point into the apron.
+  - Angle-aware verge clearance (2026-07-14, player: "ditches and sides of road must never overlap
+    the actual road on intersections"): the fixed trims above only clear ~90-degree crossings — at
+    acute arm angles (and sharp degree-2 corners, which ownership trims never touched) a 4.35-5u
+    half-width strip still lay across the neighbor's 6u road. `vergeJunctionSetback(ownHeading,
+    otherHeadings, stripHalf)` (exported, `roadRenderer.ts`) grows each strip's end setback as
+    `(roadClear + stripHalf*cos(phi)) / sin(phi)`, clamped at 22u, skipping arms past 135 degrees;
+    it applies per strip width at ANY node with 2+ edges. Regression: a 45-degree Y-junction where
+    no shoulder/ditch vertex may come within ROAD_WIDTH/2 of another edge's samples.
   - `planRoadsideDetails` keeps cosmetic props (gravel, reflectors, poles, lamps, culverts) at
     least 10u (`JUNCTION_PROP_CLEARANCE`) from degree-3+ nodes; safety rails/walls and the
     junction sign are unaffected.
