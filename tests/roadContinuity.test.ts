@@ -305,6 +305,46 @@ describe('road and bridge continuity', () => {
     }
   });
 
+  it('paints stop lines and crosswalk bars on every PAINTED arm of a junction, and none before paint', () => {
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, junctionSampler);
+    const scene = new THREE.Scene();
+    new RoadRenderer(scene, graph, bus, new Heightfield('junction-crosswalks', bus));
+    graph.commitChain([{ x: 0, z: 0 }, { x: 48, z: 0 }]);
+    graph.commitChain([{ x: 24, z: 0 }, { x: 24, z: 32 }]);
+    for (const edge of graph.edges.values()) {
+      edge.stage = 'graded';
+      bus.emit('construction:stage', { edgeId: edge.id, stage: 'graded', crew: 0 });
+    }
+    const junctionGroup = scene.getObjectByName('road-junction-surfaces') as THREE.Group;
+    // graded junction: no paint yet
+    expect(junctionGroup.children.some((child) => child.userData.roadDetail === 'junctionPaint')).toBe(false);
+
+    for (const edge of graph.edges.values()) {
+      edge.stage = 'painted';
+      bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
+    }
+    const paint = junctionGroup.children.find((child) => child.userData.roadDetail === 'junctionPaint') as THREE.Mesh;
+    expect(paint).toBeTruthy();
+    expect(paint.userData.weatherSurface).toBe('paint');
+    // one stop line + crosswalk cluster per arm: geometry near each of the three arm mouths,
+    // 5-8u from the node, inside the road width, floating just above the asphalt
+    const positions = paint.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const armHits = { west: false, east: false, north: false };
+    for (let i = 0; i < positions.count; i++) {
+      const x = positions.getX(i), y = positions.getY(i), z = positions.getZ(i);
+      expect(y).toBeGreaterThan(2.2); // sits above the deck (sampler y=2), never on the terrain
+      const dx = x - 24, dz = z;
+      const d = Math.hypot(dx, dz);
+      expect(d).toBeGreaterThanOrEqual(5 - 1e-6);
+      expect(d).toBeLessThanOrEqual(8.5);
+      if (dx < -4.9) armHits.west = true;
+      if (dx > 4.9) armHits.east = true;
+      if (dz > 4.9) armHits.north = true;
+    }
+    expect(armHits).toEqual({ west: true, east: true, north: true });
+  });
+
   it('lays a shoulder-width verge apron under every junction patch', () => {
     const bus = new EventBus();
     const graph = new RoadGraph(bus, junctionSampler);

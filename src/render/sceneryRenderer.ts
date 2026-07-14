@@ -56,7 +56,9 @@ const PARK_CAPACITY = 128;
 const PARK_COLOR = '#5f9455';
 const HOUSE_CAPACITY = 800;
 const BUILDING_CAPACITY = 300;
-const WINDOW_CAPACITY = HOUSE_CAPACITY + BUILDING_CAPACITY; // 1 emissive window quad per house/building
+// Window grids (night polish pass): houses plant 1-2 quads, buildings a 3-6 row grid scaled by
+// their skyline-stretched height — capacity covers the worst case in one draw call.
+const WINDOW_CAPACITY = HOUSE_CAPACITY * 2 + BUILDING_CAPACITY * 6;
 
 const TREE_FILES = ['nature/tree_default.glb', 'nature/tree_pineRoundC.glb', 'nature/tree_pineTallA.glb'];
 const HOUSE_FILES = ['suburban/building-type-a.glb', 'suburban/building-type-c.glb'];
@@ -163,7 +165,9 @@ interface Instance {
   y: number;
   z: number;
   rot: number;
-  windowSlot: number | null; // index into the window InstancedMesh, if this instance has windows
+  /** Indices into the shared window InstancedMesh — a GRID of quads per house/building (night
+   * polish pass: more rows for taller towers), empty for windowless kinds. */
+  windowSlots: number[];
   /** Skyline variety: per-instance vertical stretch baked into every matrix write for this
    * instance (place, pop-in, fade, recover). 1 for everything except buildings. */
   hScale: number;
@@ -775,7 +779,7 @@ export class SceneryRenderer {
       patchMesh.instanceMatrix.needsUpdate = true;
 
       if (rec.kind === 'park') {
-        const instance: Instance = { kind: rec.kind, id, variant: { mesh: this.park, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlot: null, hScale: 1 };
+        const instance: Instance = { kind: rec.kind, id, variant: { mesh: this.park, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlots: [], hScale: 1 };
         this.instances.push(instance);
         this.ownersFor(this.park)[slot] = instance;
         if (id !== null) this.byId.set(id, instance);
@@ -810,7 +814,7 @@ export class SceneryRenderer {
       this.fieldStripe.instanceMatrix.needsUpdate = true;
       this.fieldStripeOwners[slot] = stripeSlots;
 
-      const instance: Instance = { kind: rec.kind, id, variant: { mesh: this.field, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlot: null, hScale: 1 };
+      const instance: Instance = { kind: rec.kind, id, variant: { mesh: this.field, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlots: [], hScale: 1 };
       this.instances.push(instance);
       this.ownersFor(this.field)[slot] = instance;
       if (id !== null) this.byId.set(id, instance);
@@ -857,28 +861,44 @@ export class SceneryRenderer {
       variant.mesh.instanceColor!.needsUpdate = true;
     }
 
-    let windowSlot: number | null = null;
+    const windowSlots: number[] = [];
     if (rec.kind === 'house' || rec.kind === 'building') {
-      if (this.windowCount < this.windows.instanceMatrix.count) {
-        windowSlot = this.windowCount++;
-        const wy = finalY + variant.baseHeight * 0.5 * hScale;
-        const fx = Math.cos(rec.rot), fz = Math.sin(rec.rot);
-        const wx = rec.x + fx * (rec.kind === 'building' ? 2.51 : 2.01);
-        const wz = rec.z + fz * (rec.kind === 'building' ? 2.51 : 2.01);
-        dummyPos.set(wx, wy, wz);
-        dummyQuat.setFromAxisAngle(upAxis, rec.rot + Math.PI / 2);
+      // Window grid (night polish pass): buildings get 3-6 rows scaled by their stretched height,
+      // alternating front/side faces with along-face jitter and (for tall towers) the occasional
+      // dark flat; houses keep 1-2 modest quads. All deterministic from coordinates.
+      const fx = Math.cos(rec.rot), fz = Math.sin(rec.rot);
+      const sxd = -Math.sin(rec.rot), szd = Math.cos(rec.rot);
+      const faceOffset = rec.kind === 'building' ? 2.51 : 2.01;
+      const height = variant.baseHeight * hScale;
+      const quads = rec.kind === 'building'
+        ? Math.min(6, Math.max(3, Math.round(height / 2.6)))
+        : 1 + (sceneryHash01(rec.x + 5, rec.z - 5) < 0.5 ? 1 : 0);
+      for (let i = 0; i < quads; i++) {
+        if (rec.kind === 'building' && i >= 4 && sceneryHash01(rec.x + i * 7.3, rec.z + i * 3.1) > 0.7) continue; // dark flat
+        if (this.windowCount >= this.windows.instanceMatrix.count) break;
+        const windowSlot = this.windowCount++;
+        const frac = rec.kind !== 'building' ? 0.4 : quads === 1 ? 0.5 : 0.22 + 0.6 * (i / (quads - 1));
+        const side = rec.kind === 'building' && i % 2 === 1;
+        const jitter = (sceneryHash01(rec.x - i * 2.7, rec.z + i * 5.9) - 0.5) * 2.2;
+        const wx = rec.x + (side ? sxd * faceOffset + fx * jitter : fx * faceOffset + sxd * jitter);
+        const wz = rec.z + (side ? szd * faceOffset + fz * jitter : fz * faceOffset + szd * jitter);
+        dummyPos.set(wx, finalY + height * frac, wz);
+        dummyQuat.setFromAxisAngle(upAxis, side ? rec.rot : rec.rot + Math.PI / 2);
         dummyScale.set(1, 1, 1);
         dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
         this.windows.setMatrixAt(windowSlot, dummyMatrix);
+        windowSlots.push(windowSlot);
+      }
+      if (windowSlots.length) {
         this.windows.count = this.windowCount;
         this.windows.instanceMatrix.needsUpdate = true;
       }
     }
 
-    const instance: Instance = { kind: rec.kind, id, variant, slot, x: rec.x, y: finalY, z: rec.z, rot: rec.rot, windowSlot, hScale };
+    const instance: Instance = { kind: rec.kind, id, variant, slot, x: rec.x, y: finalY, z: rec.z, rot: rec.rot, windowSlots, hScale };
     this.instances.push(instance);
     this.ownersFor(variant.mesh)[slot] = instance;
-    if (windowSlot !== null) this.ownersFor(this.windows)[windowSlot] = instance;
+    for (const windowSlot of windowSlots) this.ownersFor(this.windows)[windowSlot] = instance;
     if (id !== null) this.byId.set(id, instance);
     if (animate) this.animating.push({ instance, elapsed: 0 });
     if (id !== null) this.applyPendingFadeIfAny(instance, id);
@@ -1162,13 +1182,19 @@ export class SceneryRenderer {
       this.compactMeshSlot(mesh, instance.slot, mesh.count);
     }
 
-    if (instance.windowSlot !== null) {
-      this.windowCount = this.compactMeshSlot(this.windows, instance.windowSlot, this.windowCount, (moved) => {
-        // The window mesh's swapped-in owner is a house/building Instance — its own `windowSlot`
-        // must follow the swap.
-        moved.windowSlot = instance.windowSlot;
-      });
-      instance.windowSlot = null;
+    if (instance.windowSlots.length) {
+      // Free the grid's slots in DESCENDING order: each compaction swaps the pool's LAST slot
+      // into the freed one, and descending order guarantees the swapped-in slot never belongs to
+      // this same instance's not-yet-freed windows. The moved owner's own array entry (whichever
+      // element held the old last slot) is retargeted to the freed index.
+      for (const freed of [...instance.windowSlots].sort((a, b) => b - a)) {
+        const lastSlot = this.windowCount - 1;
+        this.windowCount = this.compactMeshSlot(this.windows, freed, this.windowCount, (moved) => {
+          const idx = moved.windowSlots.indexOf(lastSlot);
+          if (idx >= 0) moved.windowSlots[idx] = freed;
+        });
+      }
+      instance.windowSlots = [];
     }
 
     if (instance.kind === 'field') {
@@ -1341,12 +1367,12 @@ export class SceneryRenderer {
     dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
     f.instance.variant.mesh.setMatrixAt(f.instance.slot, dummyMatrix);
     f.instance.variant.mesh.instanceMatrix.needsUpdate = true;
-    if (f.instance.windowSlot !== null) {
-      // Task 35: a stranded house/building fades its window quad out too (scale to ~0) rather
-      // than leaving a lit window floating over a sunk, near-invisible husk.
+    if (f.instance.windowSlots.length) {
+      // Task 35: a stranded house/building fades its window quads out too (scale to ~0) rather
+      // than leaving lit windows floating over a sunk, near-invisible husk.
       dummyScale.set(s, s, s);
       dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
-      this.windows.setMatrixAt(f.instance.windowSlot, dummyMatrix);
+      for (const windowSlot of f.instance.windowSlots) this.windows.setMatrixAt(windowSlot, dummyMatrix);
       this.windows.instanceMatrix.needsUpdate = true;
     }
     return t;
@@ -1366,10 +1392,10 @@ export class SceneryRenderer {
     dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
     r.instance.variant.mesh.setMatrixAt(r.instance.slot, dummyMatrix);
     r.instance.variant.mesh.instanceMatrix.needsUpdate = true;
-    if (r.instance.windowSlot !== null) {
+    if (r.instance.windowSlots.length) {
       dummyScale.set(s, s, s);
       dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
-      this.windows.setMatrixAt(r.instance.windowSlot, dummyMatrix);
+      for (const windowSlot of r.instance.windowSlots) this.windows.setMatrixAt(windowSlot, dummyMatrix);
       this.windows.instanceMatrix.needsUpdate = true;
     }
     return t;

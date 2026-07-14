@@ -175,13 +175,41 @@ export class Atmosphere {
     return this.rainIntensity;
   }
 
+  /** Soft radial falloff for the cloud cards, drawn once and shared. `alphaMap` reads the GREEN
+   * channel, so the gradient runs white-center -> black-edge on an opaque canvas. Returns null in
+   * canvas-less test environments (the clouds then render as plain soft quads — never exercised
+   * visually in tests anyway). */
+  private buildCloudTexture(): THREE.CanvasTexture | null {
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 128;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    const gradient = ctx.createRadialGradient(64, 64, 8, 64, 64, 64);
+    gradient.addColorStop(0, 'rgb(255,255,255)');
+    gradient.addColorStop(0.55, 'rgb(140,140,140)');
+    gradient.addColorStop(1, 'rgb(0,0,0)');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, 128, 128);
+    return new THREE.CanvasTexture(canvas);
+  }
+
+  /** Graphics-plan Task 4 slice (claimed 2026-07-14, Claude session): the old hard flat-shaded
+   * icosahedron puffs read as floating rocks. Clouds are now merged SOFT CARDS — horizontal
+   * quads with a shared radial alpha falloff — one mesh/draw call per group, same rng consumption,
+   * same positions/drift, still lit (Lambert) so they dim through the night like everything else. */
   private buildClouds(): void {
+    const texture = this.buildCloudTexture();
     for (let i = 0; i < CLOUD_GROUP_COUNT; i++) {
       const puffCount = 3 + Math.floor(this.rng() * 3); // 3-5
       const geoms: THREE.BufferGeometry[] = [];
       for (let p = 0; p < puffCount; p++) {
-        const geo = new THREE.IcosahedronGeometry(3 + this.rng() * 2.5, 0);
-        geo.scale(1.6 + this.rng() * 0.8, 0.7 + this.rng() * 0.3, 1.2 + this.rng() * 0.6);
+        const radius = 3 + this.rng() * 2.5;
+        const sx = 1.6 + this.rng() * 0.8;
+        this.rng(); // (was icosahedron y-scale — consumed to keep the rng sequence identical)
+        const sz = 1.2 + this.rng() * 0.6;
+        const geo = new THREE.PlaneGeometry(radius * 2 * sx * 1.6, radius * 2 * sz * 1.6);
+        geo.rotateX(-Math.PI / 2);
         const ox = (this.rng() - 0.5) * 8;
         const oy = (this.rng() - 0.5) * 2;
         const oz = (this.rng() - 0.5) * 6;
@@ -189,14 +217,13 @@ export class Atmosphere {
         geoms.push(geo);
       }
       const merged = mergeGeometries(geoms, false) ?? geoms[0];
-      const mat = new THREE.MeshStandardMaterial({
+      const mat = new THREE.MeshLambertMaterial({
         color: '#ffffff',
         transparent: true,
-        opacity: 0.85,
-        flatShading: true,
-        roughness: 1,
+        opacity: 0.55,
         depthWrite: false,
       });
+      if (texture) mat.alphaMap = texture;
       const mesh = new THREE.Mesh(merged, mat);
       mesh.position.set(
         (this.rng() - 0.5) * WORLD_SIZE * 1.4,

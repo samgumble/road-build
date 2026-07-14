@@ -42,7 +42,10 @@
 **Files:** `src/render/sceneryRenderer.ts`, `src/render/sky.ts`, `src/render/atmosphere.ts`, `tests/atmosphere.test.ts`
 
 - [ ] Add vertex-shader wind to trees/grass using world position and weather strength.
-- [ ] Replace hard polyhedron clouds with layered soft cards/impostors and deterministic drift.
+- [x] Replace hard polyhedron clouds with layered soft cards/impostors and deterministic drift.
+      (Delivered 2026-07-14, Claude session: merged soft-card groups with a shared radial alpha
+      falloff, Lambert-lit so they dim at night; same rng consumption, positions, and drift as
+      before — one mesh per group. Extend these rather than re-implementing.)
 - [ ] Add subtle birds/insects near appropriate biomes with shared bounded pools.
 - [ ] Respect reduced motion and low-tier density.
 

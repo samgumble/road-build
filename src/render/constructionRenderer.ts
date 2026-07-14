@@ -1187,6 +1187,11 @@ class StakePool {
     this.posZ[i] = z;
     this.edgeId[i] = edgeId;
     this.bucket[i] = bucket;
+    // Polish pass: deterministic per-stake weathering tint, same trick as the cone pool.
+    const wear = 0.8 + (Math.abs(Math.imul(Math.round(x * 4) * 374761393
+      + Math.round(z * 4) * 668265263, 1274126177)) % 512) / 512 * 0.28;
+    this.mesh.setColorAt(i, coneTint.setScalar(wear));
+    if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
   }
 
   /** Eases out (and eventually frees) every stake on `edgeId` at or behind arclength `t` — used
@@ -1242,6 +1247,7 @@ class StakePool {
 }
 
 const coneDummy = new THREE.Object3D();
+const coneTint = new THREE.Color();
 const CONE_SPACING = 14; // target arclength (u) between successive flanking pairs
 const CONE_PERP_OFFSET = ROAD_WIDTH_HALF + 0.8; // ± units from the centerline, per spec
 const CONE_CAP = 48; // per-crew instance budget (Addendum C, Task 27) — 24 pairs max
@@ -1337,9 +1343,15 @@ class ConePool {
         this.posX[idx] = x + perpX * side * CONE_PERP_OFFSET;
         this.posY[idx] = groundY;
         this.posZ[idx] = z + perpZ * side * CONE_PERP_OFFSET;
+        // Polish pass: deterministic per-cone weathering tint (sun-bleached vs fresh orange) via
+        // instanceColor — pure multiplier over the shared material, no extra draw calls.
+        const wear = 0.82 + (Math.abs(Math.imul(Math.round(this.posX[idx] * 4) * 668265263
+          + Math.round(this.posZ[idx] * 4) * 374761393, 1274126177)) % 512) / 512 * 0.24;
+        this.mesh.setColorAt(idx, coneTint.setScalar(wear));
         idx++;
       }
     }
+    if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
     this.liveCount = idx;
   }
 

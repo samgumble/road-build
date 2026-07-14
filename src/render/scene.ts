@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { PIXEL_RATIO_CAP, SHADOW_MAP_SIZE } from './quality';
+import { buildHorizonSkirt } from './horizonSkirt';
 
 export interface SceneRig {
   renderer: THREE.WebGLRenderer;
@@ -23,6 +24,7 @@ export function createScene(canvas: HTMLCanvasElement): SceneRig {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color('#bcd9e8');
   scene.fog = new THREE.Fog('#bcd9e8', 400, 900);
+  scene.add(buildHorizonSkirt());
 
   const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 2, 2000);
   camera.position.set(340, 260, 340);
