@@ -330,6 +330,13 @@ production-build, artifact-upload, and deploy jobs:
   - Coverage: sloped-junction patch heights, curved-arm corner anchoring, ditch setback, apron
     presence/size, road-anchored approach-rail poses, and junction prop exclusion (6 new tests in
     `roadContinuity.test.ts` / `roadsideRenderer.test.ts`).
+- Progressive corridor clearing (2026-07-14, player request "trees removed during the step after
+  surveying"): both `WildernessSim` and `GrowthSim` now ALSO listen to `construction:progress`
+  (stage `'graded'`, non-demolish) and sweep their corridor up to the front's arclength `t` — trees
+  and grown records fall AS the excavator passes them, not all at once when grading completes.
+  `clearCorridor(edgeId, upTo)` tracks a per-edge `sweptTo` arclength so each stretch is scanned
+  exactly once; the original `construction:stage >= graded` listener remains as the tail sweep and
+  the restore path (restored edges replay no progress events). Demolition progress never clears.
 - Calm lighting at fast-forward (2026-07-14): the day/night cycle caps at
   `ATMOSPHERE_MAX_TIMESCALE` (4x, exported with `atmosphereTimeScale` from `solarTime.ts` — NOT
   atmosphere.ts, so tests can import it without DOM-touching sky/quality modules). At 16x the sim,

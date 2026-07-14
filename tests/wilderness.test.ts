@@ -131,6 +131,50 @@ describe('WildernessSim clearing', () => {
     expect(sim.active.some((t) => t.x === trees[3].x)).toBe(true);
   });
 
+  it('clears corridor trees progressively as the grading front passes, not only at stage completion', () => {
+    const { bus, hf, graph } = buildGraph('wild-progressive');
+    let anchor = { x: 0, z: 0 };
+    outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
+      if (hf.isLand(x, z) && hf.isLand(x + 64, z)) { anchor = { x, z }; break outer; }
+    const [edgeId] = graph.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+    const edge = graph.edges.get(edgeId)!;
+
+    // 2D arclength per sample so trees can sit at known stations along the run
+    const d: number[] = [0];
+    for (let i = 1; i < edge.samples.length; i++) {
+      d.push(d[i - 1] + Math.hypot(
+        edge.samples[i].x - edge.samples[i - 1].x,
+        edge.samples[i].z - edge.samples[i - 1].z,
+      ));
+    }
+    const total = d[d.length - 1];
+    const early = edge.samples[d.findIndex((v) => v >= total * 0.25)];
+    const late = edge.samples[d.findIndex((v) => v >= total * 0.75)];
+    const trees = [
+      { x: early.x, z: early.z, rot: 0, count: 1 },
+      { x: late.x, z: late.z, rot: 0, count: 1 },
+    ];
+    const sim = new WildernessSim(trees, bus, graph);
+
+    const progress = (t: number, demolish = false) => bus.emit('construction:progress', {
+      edgeId, stage: 'graded', t, pos: { x: 0, y: 0, z: 0 }, heading: 0,
+      vehicle: 'excavator', demolish, crew: 0, onBreak: false,
+    });
+
+    // demolition progress must never fell trees
+    progress(total, true);
+    expect(sim.active.length).toBe(2);
+
+    // the grading front reaching halfway clears the tree it has passed — mid-stage, before any
+    // 'graded' stage-completion event exists
+    progress(total * 0.5);
+    expect(sim.active).toEqual([trees[1]]);
+
+    // the front finishing the run clears the rest
+    progress(total);
+    expect(sim.active).toEqual([]);
+  });
+
   it('does not clear trees near a bridge sample', () => {
     const bus = new EventBus();
     const hf = new Heightfield('wild-bridge', bus);

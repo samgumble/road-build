@@ -346,6 +346,8 @@ export class GrowthSim {
   // `updateStrandedDecay`'s guard against a record already clearing) and is never rescuable (no
   // `growth:rescued` path touches this map at all).
   private clearingSince = new Map<number, number>();
+  /** Per-edge arclength the grading front has already swept (progressive corridor clearing). */
+  private corridorSweptTo = new Map<number, number>();
 
   constructor(
     private graph: RoadGraph,
@@ -365,8 +367,18 @@ export class GrowthSim {
     // event, e.g. 'gravel'/'paved'/'painted'), never 'removed'/'surveyed'. Any stage at/past
     // 'graded' implies the corridor was already cut, so it must clear regardless of which exact
     // stage triggered this event.
+    // Progressive clearing (player request "trees are removed during the step after surveying"):
+    // corridor records start their quick clearing fade AS the grading front passes them, not all
+    // at once when the stage completes. Demolition progress never clears records.
+    this.bus.on('construction:progress', (e) => {
+      if (e.demolish || e.stage !== 'graded') return;
+      this.clearCorridor(e.edgeId, e.t);
+    });
     this.bus.on('construction:stage', (e) => {
-      if (e.stage === 'removed') return;
+      if (e.stage === 'removed') {
+        this.corridorSweptTo.delete(e.edgeId);
+        return;
+      }
       if (STAGES.indexOf(e.stage) < GRADED_INDEX) return;
       this.clearCorridor(e.edgeId);
     });
@@ -1022,14 +1034,31 @@ export class GrowthSim {
    * timed fade (`clearingSince`) rather than an immediate boolean flip, so the renderer gets a
    * chance to play the fade before the record actually disappears (see `updateClearing`).
    */
-  private clearCorridor(edgeId: number): void {
+  /** Clears records near the edge's non-bridge samples up to arclength `upTo` (the grading
+   * front's position; Infinity = the whole corridor, used by the stage-completion/restore paths).
+   * Each (edge, sample) stretch is swept at most once via `corridorSweptTo`, so per-tick progress
+   * events only ever test the newly passed stretch. */
+  private clearCorridor(edgeId: number, upTo = Infinity): void {
     const edge = this.graph.edges.get(edgeId);
     if (!edge) return;
+    const from = this.corridorSweptTo.get(edgeId) ?? -1;
+    if (upTo <= from) return;
+    this.corridorSweptTo.set(edgeId, upTo);
 
-    for (const r of this.records) {
-      if (this.clearingSince.has(r.id)) continue; // already clearing — don't restart its fade
-      for (const s of edge.samples) {
-        if (s.bridge) continue;
+    let d = 0;
+    for (let i = 0; i < edge.samples.length; i++) {
+      if (i > 0) {
+        d += Math.hypot(
+          edge.samples[i].x - edge.samples[i - 1].x,
+          edge.samples[i].z - edge.samples[i - 1].z,
+        );
+      }
+      if (d > upTo) break;
+      if (d <= from) continue; // already swept by an earlier progress event
+      const s = edge.samples[i];
+      if (s.bridge) continue;
+      for (const r of this.records) {
+        if (this.clearingSince.has(r.id)) continue; // already clearing — don't restart its fade
         const footprintRadius = r.kind === 'field' ? FIELD_FOOTPRINT_RADIUS : 0;
         if (Math.hypot(s.x - r.x, s.z - r.z) <= CLEAR_RADIUS + footprintRadius) {
           // Task 42: corridor clearing pre-empts stranded-decay outright — a record that happened
@@ -1040,7 +1069,6 @@ export class GrowthSim {
           this.fadingSince.delete(r.id);
           this.clearingSince.set(r.id, this.simTime);
           this.bus.emit('growth:cleared', { id: r.id });
-          break;
         }
       }
     }
