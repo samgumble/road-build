@@ -37,7 +37,7 @@ describe('context-sensitive roadside detail planning', () => {
     const first = planRoadsideDetails(graph, terrain, settlements);
     const second = planRoadsideDetails(graph, terrain, settlements);
     expect(first).toEqual(second);
-    expect(first.guardrails.length).toBeGreaterThan(0);
+    expect('guardrails' in first).toBe(false); // rails removed entirely per repeated player request
     expect(first.retainingWalls.length).toBeGreaterThan(0);
     expect(first.culverts.length).toBeGreaterThan(0);
     expect(first.signs.length).toBeGreaterThan(0);
@@ -51,7 +51,6 @@ describe('context-sensitive roadside detail planning', () => {
     graph.commitChain([{ x: 0, z: 0 }, { x: 80, z: 0 }]);
     for (const edge of graph.edges.values()) edge.stage = 'painted';
     const plan = planRoadsideDetails(graph, terrain, []);
-    expect(plan.guardrails).toEqual([]);
     expect(plan.retainingWalls).toEqual([]);
     expect(plan.culverts).toEqual([]);
     expect(plan.reflectors).toEqual([]);
@@ -79,20 +78,21 @@ describe('context-sensitive roadside detail planning', () => {
     for (const edge of graph.edges.values()) edge.stage = 'painted';
     const embankment = { heightAt: () => 3, isLand: () => true };
 
-    expect(planRoadsideDetails(graph, embankment, []).guardrails).toEqual([]);
+    expect('guardrails' in planRoadsideDetails(graph, embankment, [])).toBe(false);
   });
 
-  it('still rails drops and waterside verges from the station loop', () => {
+  it('plants no guardrails anywhere — not even on drops or waterside verges', () => {
     const bus = new EventBus();
     const graph = new RoadGraph(bus, sampler);
     graph.commitChain([{ x: 0, z: 0 }, { x: 40, z: 0 }, { x: 80, z: 0 }]);
     for (const edge of graph.edges.values()) edge.stage = 'painted';
 
-    // the shared `terrain` stub drops 3u on the -z verge and turns to water past z <= -5:
-    // those safety rails are unrelated to bridges and must survive the approach-rail removal
+    // the shared `terrain` stub drops 3u on the -z verge and turns to water past z <= -5 — the
+    // exact geometry (embankment beside water) that kept re-planting rails at bridge approaches
+    // after the dedicated approach-rail pass was removed. Rails are gone as a feature.
     const plan = planRoadsideDetails(graph, terrain, []);
-    expect(plan.guardrails.length).toBeGreaterThan(0);
-    expect(plan.guardrails.every((rail) => rail.z < 0)).toBe(true); // only the hazardous verge
+    expect('guardrails' in plan).toBe(false);
+    expect(plan.retainingWalls.length).toBeGreaterThan(0); // cross-slope walls survive
     expect(planRoadsideDetails(graph, terrain, [])).toEqual(plan); // deterministic
   });
 
@@ -110,7 +110,7 @@ describe('context-sensitive roadside detail planning', () => {
     const plan = planRoadsideDetails(graph, flat, settlements);
     const props = [
       ...plan.gravelScatter, ...plan.reflectors, ...plan.utilityPoles, ...plan.streetlamps,
-      ...plan.culverts, ...plan.signs, ...plan.guardrails, ...plan.retainingWalls,
+      ...plan.culverts, ...plan.signs, ...plan.retainingWalls,
     ];
     expect(props.length).toBeGreaterThan(0);
     for (const prop of props) {
@@ -193,7 +193,7 @@ describe('context-sensitive roadside detail planning', () => {
     bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
     const group = scene.getObjectByName('roadside-context-details')!;
     expect(group.children.every((child) => child instanceof THREE.InstancedMesh)).toBe(true);
-    expect(group.children.length).toBe(13); // 10 context-furniture pools + lamp post/head/glow
+    expect(group.children.length).toBe(11); // 8 context-furniture pools + lamp post/head/glow
     renderer.dispose();
   });
 });
