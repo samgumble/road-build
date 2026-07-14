@@ -853,6 +853,7 @@ function buildCraneSegment(): { mesh: THREE.Mesh; mat: THREE.MeshStandardMateria
     opacity: 0,
   });
   const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 0.4, 1), mat);
+  mesh.name = 'crane-deck-segment';
   mesh.visible = false;
   return { mesh, mat };
 }
@@ -4059,7 +4060,9 @@ export class ConstructionRenderer {
     this.craneSegment.rotation.y = -spanHeading;
     this.craneSegmentMat.opacity = damp(this.craneSegmentMat.opacity, 0.95, 1 / 0.3, dt);
     const segLen = crossing.segmentTo - crossing.segmentFrom;
-    this.craneSegment.scale.set(ROAD_WIDTH * 0.9, 1, Math.max(1, segLen));
+    // rotation.y = -spanHeading maps local +X onto the road direction: X is the slab's LENGTH
+    // along the run, Z its width across the deck (was swapped — a 16u-wide plank over a 6u road).
+    this.craneSegment.scale.set(Math.max(1, segLen), 1, ROAD_WIDTH * 0.9);
   }
 
   /**

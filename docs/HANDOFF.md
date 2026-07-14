@@ -141,6 +141,16 @@ assuming a green build means the page is live.
   at `BRIDGE_RAIL_OFFSET` (exported by `roadRenderer.ts` and shared with the deck rails, same
   pattern as `BRIDGE_PYLON_SPACING`) at `sample.y + STAGE_YLIFT.paved`, so the rail line runs
   straight onto the deck instead of jumping 2.3u outboard and dropping down the embankment.
+  Round 2 (2026-07-14, player: rails missing on some bridges / still misplaced):
+  - Stations are interpolated to their EXACT setbacks measured from the deck-joint sample (where
+    the deck rails begin), not snapped to the sampler's 2u spacing from the last land sample — the
+    two 5.5u bars now span a continuous [joint-11, joint] run butted flush against the deck rails
+    (verified end-to-end: bar tops and deck-rail tops both at surface+0.98, same ±2.8 offset).
+  - A bridge occupying its WHOLE edge (both transitions exactly on nodes — any draw that starts or
+    ends at a shore node, or an edge split there) has no bridge-flag flip inside any single edge's
+    samples, so the per-edge pass could never rail it. `planRoadsideDetails` now runs a node pass:
+    every developed land arm of a node that anchors a deck-end arm gets the setback rails, measured
+    from the node itself. If a land run is shorter than a setback the rail is skipped, not clamped.
 - Instancing audit (2026-07-13): every population-scaled renderer is instanced (cars, scenery GLB
   variants, roadside pools, construction cone/floodlight/particle pools, villagers). The only
   per-object draws are the three bounded construction crew rigs (cheap primitives per the Task 25
@@ -320,3 +330,8 @@ production-build, artifact-upload, and deploy jobs:
   - Coverage: sloped-junction patch heights, curved-arm corner anchoring, ditch setback, apron
     presence/size, road-anchored approach-rail poses, and junction prop exclusion (6 new tests in
     `roadContinuity.test.ts` / `roadsideRenderer.test.ts`).
+- Crane deck-segment orientation fix (2026-07-14): the lowered slab's scale axes were swapped —
+  `rotation.y = -spanHeading` maps local +X onto the road direction, but the 16u span length was
+  applied to Z (across the road) and the 5.4u width to X, so every dropped segment appeared ~3x
+  too wide. The mesh is named `crane-deck-segment` for test reach; `roadContinuity.test.ts` locks
+  the along-road length vs across-road width mid-descend.

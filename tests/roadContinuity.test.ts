@@ -294,6 +294,31 @@ describe('road and bridge continuity', () => {
     expect(normalY).toBeGreaterThan(0);
   });
 
+  it('lowers deck segments span-length LONG along the road and road-width wide across it', () => {
+    const bus = new EventBus();
+    const hf = new Heightfield('deck-segment-size', bus);
+    const graph = new RoadGraph(bus, bridgeSampler);
+    const scene = new THREE.Scene();
+    const roadRenderer = new RoadRenderer(scene, graph, bus, hf);
+    const constructionRenderer = new ConstructionRenderer(scene, bus, graph, hf, roadRenderer);
+    const [edgeId] = graph.commitChain([{ x: 0, z: 0 }, { x: 40, z: 0 }]);
+    const edge = graph.edges.get(edgeId)!;
+    edge.stage = 'graded';
+    bus.emit('construction:stage', { edgeId, stage: 'graded', crew: 0 });
+
+    progress(bus, edgeId, 10);
+    progress(bus, edgeId, 18); // mid first 16u span [10,26]: the segment is descending
+    for (let i = 0; i < 12; i++) constructionRenderer.update(1 / 60, false);
+
+    const segment = scene.getObjectByName('crane-deck-segment') as THREE.Mesh;
+    expect(segment).toBeTruthy();
+    expect(segment.visible).toBe(true);
+    // The road runs along +x (heading 0), so local X is the along-road axis: the slab must be
+    // 16u LONG along the run and ~one road width ACROSS it — not a 16u-wide plank over a 6u deck.
+    expect(segment.scale.x).toBeCloseTo(16, 3);
+    expect(segment.scale.z).toBeCloseTo(ROAD_WIDTH * 0.9, 3);
+  });
+
   it('finishes and unmasks a short final bridge span after the gravel front leaves the run', () => {
     const bus = new EventBus();
     const hf = new Heightfield('bridge-final-span', bus);
