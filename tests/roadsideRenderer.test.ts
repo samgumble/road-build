@@ -4,6 +4,7 @@ import type { P2, RoadSample } from '../src/core/types';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { planRoadsideDetails } from '../src/render/roadsideRenderer';
 import { RoadsideRenderer } from '../src/render/roadsideRenderer';
+import { BRIDGE_RAIL_OFFSET, STAGE_YLIFT } from '../src/render/roadRenderer';
 import * as THREE from 'three';
 
 const sampler = (ctrl: P2[]): RoadSample[] => {
@@ -97,6 +98,57 @@ describe('context-sensitive roadside detail planning', () => {
     expect(plan.guardrails.some((rail) => rail.z < 0)).toBe(true);
     // deterministic like every other detail
     expect(planRoadsideDetails(graph, flat, [])).toEqual(plan);
+  });
+
+  it('poses approach rails on the bridge rail line at road height, never down on the terrain', () => {
+    const bus = new EventBus();
+    // road on a 4u embankment; terrain sits 1u below (too shallow for drop rails, so every rail
+    // in the plan comes from the bridge approaches). The deck's own rails run at BRIDGE_RAIL_OFFSET
+    // from the centerline at deck height — the approach rails must continue that exact line.
+    const bridgeSampler = (ctrl: P2[]): RoadSample[] => {
+      const out: RoadSample[] = [];
+      const a = ctrl[0], b = ctrl[ctrl.length - 1];
+      const steps = Math.round(Math.hypot(b.x - a.x, b.z - a.z) / 2);
+      for (let i = 0; i <= steps; i++) {
+        const u = i / steps;
+        const x = a.x + (b.x - a.x) * u;
+        out.push({ x, y: 4, z: a.z + (b.z - a.z) * u, bridge: x > 20 && x < 60 });
+      }
+      return out;
+    };
+    const graph = new RoadGraph(bus, bridgeSampler);
+    graph.commitChain([{ x: 0, z: 0 }, { x: 80, z: 0 }]);
+    for (const edge of graph.edges.values()) edge.stage = 'painted';
+    const embankment = { heightAt: () => 3, isLand: () => true };
+
+    const plan = planRoadsideDetails(graph, embankment, []);
+    expect(plan.guardrails.length).toBeGreaterThanOrEqual(8);
+    for (const rail of plan.guardrails) {
+      // laterally on the deck-rail line (road runs along x, so the offset shows up in z)…
+      expect(Math.abs(rail.z)).toBeCloseTo(BRIDGE_RAIL_OFFSET, 5);
+      // …and vertically anchored to the road surface, not the terrain 1u below
+      expect(rail.y).toBeCloseTo(4 + STAGE_YLIFT.paved, 5);
+    }
+  });
+
+  it('keeps cosmetic roadside props out of intersection aprons', () => {
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, sampler);
+    graph.commitChain([{ x: 0, z: 0 }, { x: 24, z: 0 }, { x: 48, z: 0 }]);
+    graph.commitChain([{ x: 24, z: 0 }, { x: 24, z: 40 }]);
+    for (const edge of graph.edges.values()) edge.stage = 'painted';
+    const flat = { heightAt: () => 0, isLand: () => true };
+    const settlements = [{ id: 1, kind: 'building' as const, x: 24, z: 8 }];
+
+    const plan = planRoadsideDetails(graph, flat, settlements);
+    const props = [
+      ...plan.gravelScatter, ...plan.reflectors, ...plan.utilityPoles,
+      ...plan.streetlamps, ...plan.culverts,
+    ];
+    expect(props.length).toBeGreaterThan(0); // stations away from the junction still get furniture
+    for (const prop of props) {
+      expect(Math.hypot(prop.x - 24, prop.z - 0)).toBeGreaterThan(9);
+    }
   });
 
   it('plans streetlamps only on painted stretches near settlements, on the opposite station parity to utility poles', () => {

@@ -137,6 +137,10 @@ assuming a green build means the page is live.
   the planner) rails BOTH verges of every road-to-bridge transition at two setbacks on the land
   run. The station loop skips bridge samples entirely, so without this pass the embankment-to-deck
   lip was guaranteed unrailed. Poses feed the existing guardrail pool — no new draw calls.
+  Alignment fix (2026-07-13): approach rails are ROAD-anchored, not terrain-anchored — they stand
+  at `BRIDGE_RAIL_OFFSET` (exported by `roadRenderer.ts` and shared with the deck rails, same
+  pattern as `BRIDGE_PYLON_SPACING`) at `sample.y + STAGE_YLIFT.paved`, so the rail line runs
+  straight onto the deck instead of jumping 2.3u outboard and dropping down the embankment.
 - Instancing audit (2026-07-13): every population-scaled renderer is instanced (cars, scenery GLB
   variants, roadside pools, construction cone/floodlight/particle pools, villagers). The only
   per-object draws are the three bounded construction crew rigs (cheap primitives per the Task 25
@@ -299,3 +303,20 @@ production-build, artifact-upload, and deploy jobs:
 - Verification: 36 Vitest files / 304 tests pass; `npm run build` passes with only the existing
   bundle-size advisory. A local saved-world smoke check showed clean connected intersections and
   no browser warnings/errors.
+- Junction alignment + deep-clean rework (2026-07-13, Claude session, player feedback "out of
+  alignment / not cleaned up enough"):
+  - `buildJunctionPatchGeometry` now takes `JunctionArm[]` (node tangent/height + the arm's ACTUAL
+    cross-section at the 5u trim reach, walked along real samples by `edgeArmAtNode`). Hull
+    vertices carry per-arm heights, so the patch drapes across sloped junctions and its corners
+    meet each trimmed ribbon end exactly even when arms curve inside the reach — no more flat
+    max-height plane floating over downhill arms.
+  - A shoulder-width `junctionVerge` apron (lowest present stage's shoulder color) is drawn under
+    every junction patch so arm shoulder stubs blend instead of ending raw on terrain.
+  - Drainage ditches trim back 9u (surface trim 5u + `DITCH_JUNCTION_SETBACK` 4u) at junction-owned
+    ends so ditch strips never point into the apron.
+  - `planRoadsideDetails` keeps cosmetic props (gravel, reflectors, poles, lamps, culverts) at
+    least 10u (`JUNCTION_PROP_CLEARANCE`) from degree-3+ nodes; safety rails/walls and the
+    junction sign are unaffected.
+  - Coverage: sloped-junction patch heights, curved-arm corner anchoring, ditch setback, apron
+    presence/size, road-anchored approach-rail poses, and junction prop exclusion (6 new tests in
+    `roadContinuity.test.ts` / `roadsideRenderer.test.ts`).
