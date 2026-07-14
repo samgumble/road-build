@@ -291,6 +291,11 @@ export function buildRibbonGeometry(
   capStart = false,
   capEnd = false,
   widthProfile?: (u: number) => number,
+  /** When set, each vertex drapes onto max(road height, terrain height at that exact vertex) —
+   * verge strips (shoulders/ditches) sit ON the grass up-slope instead of getting buried, and
+   * clamp to road height down-slope instead of sinking under the asphalt edge. Without it,
+   * vertices stay at the road sample's own height (correct for the deck/ribbon itself). */
+  conformTo?: (x: number, z: number) => number,
 ): THREE.BufferGeometry {
   const geo = new THREE.BufferGeometry();
   if (samples.length < 2 || to <= from) return geo;
@@ -314,9 +319,13 @@ export function buildRibbonGeometry(
     const half = (widthProfile ? widthProfile(Math.max(0, Math.min(1, rangeU))) : width) / 2;
     const cx = p.x + perp.px * lateralOffset;
     const cz = p.z + perp.pz * lateralOffset;
-    positions.push(cx + perp.px * half, p.y + yLift, cz + perp.pz * half);
+    const xa = cx + perp.px * half, za = cz + perp.pz * half;
+    const xb = cx - perp.px * half, zb = cz - perp.pz * half;
+    const ya = (conformTo ? Math.max(p.y, conformTo(xa, za)) : p.y) + yLift;
+    const yb = (conformTo ? Math.max(p.y, conformTo(xb, zb)) : p.y) + yLift;
+    positions.push(xa, ya, za);
     normals.push(0, 1, 0);
-    positions.push(cx - perp.px * half, p.y + yLift, cz - perp.pz * half);
+    positions.push(xb, yb, zb);
     normals.push(0, 1, 0);
     return vi;
   };
@@ -1383,8 +1392,11 @@ export class RoadRenderer {
     const weatherKind: RoadSurfaceKind = stage === 'graded' ? 'earth' : 'gravel';
     const yLift = Math.max(0.015, STAGE_YLIFT[stage] - SHOULDER_Y_GAP);
     const shoulderBuffer = stage === 'graded' ? 0 : BRIDGE_APPROACH_LENGTH;
+    // Drape verge strips onto the terrain (never below road height): on a cross-slope the old
+    // flat-at-road-height strips floated above the grass downhill and vanished under it uphill.
+    const drape = (x: number, z: number) => this.hf.heightAt(x, z);
     for (const range of groundRanges(samples, from, to, shoulderBuffer)) {
-      const geo = buildRibbonGeometry(samples, SHOULDER_WIDTH, yLift, range.from, range.to);
+      const geo = buildRibbonGeometry(samples, SHOULDER_WIDTH, yLift, range.from, range.to, 0, false, false, undefined, drape);
       const mat = makeStandardMaterial(SHOULDER_COLOR[stage], 1, 'shoulder');
       mat.roughness = 1;
       const mesh = this.addMesh(v, geo, mat);
@@ -1395,8 +1407,8 @@ export class RoadRenderer {
     // The tapered bridge approach owns the full verge-to-deck transition. End drainage before
     // that zone so ditch ribbons cannot float beside the deck or cut diagonally through the taper.
     for (const range of groundRanges(samples, from, to, BRIDGE_APPROACH_LENGTH)) {
-      const left = buildRibbonGeometry(samples, DITCH_WIDTH, Math.max(0.005, yLift - 0.04), range.from, range.to, DITCH_OFFSET);
-      const right = buildRibbonGeometry(samples, DITCH_WIDTH, Math.max(0.005, yLift - 0.04), range.from, range.to, -DITCH_OFFSET);
+      const left = buildRibbonGeometry(samples, DITCH_WIDTH, Math.max(0.005, yLift - 0.04), range.from, range.to, DITCH_OFFSET, false, false, undefined, drape);
+      const right = buildRibbonGeometry(samples, DITCH_WIDTH, Math.max(0.005, yLift - 0.04), range.from, range.to, -DITCH_OFFSET, false, false, undefined, drape);
       const ditchGeo = mergeGeometries([left, right]);
       left.dispose();
       right.dispose();

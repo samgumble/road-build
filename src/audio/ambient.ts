@@ -8,24 +8,14 @@ const SFX_GAIN = 0.6;
 const MUTE_RAMP = 0.3; // seconds
 const MUSIC_TOGGLE_RAMP = 0.3; // seconds, ramped like MUTE_RAMP so flipping MUSIC never clicks
 
-// Pad
-const PAD_ROOTS_HZ = [110.0, 130.81, 146.83, 164.81, 98.0]; // A2, C3, D3, E3, G2
-const PAD_CHORD_PERIOD = 24; // seconds per root
-const PAD_CROSSFADE = 4; // seconds, equal-power crossfade into the next voice pair
-const PAD_FILTER_NIGHT = 550; // raised from 400 so the pad never collapses into pure rumble
-const PAD_FILTER_DAY = 1400;
-const PAD_FILTER_EASE_TIME = 10; // seconds to fully ease across the night/day cutoff swing
-const PAD_TREMOLO_HZ = 0.08;
-const PAD_TREMOLO_DEPTH = 0.15; // +-15%
-const PAD_DETUNE_CENTS = 7; // detune between the two triangle voices
-// Task 39 ("de-drone"): the sub-oscillator voice (a sine reinforcing the root — a previous fix
-// already moved it up an octave to sit at the root rather than below it, but it was still
-// present/always-on) has been removed entirely per repeated user feedback ("the background drone
-// is distracting") — see the removed PadVoice.sub/subGain fields. The remaining two-triangle voice
-// gain is also cut by ~8dB on top of that, and the whole pad is now a FALLBACK that only plays when
-// zero real music tracks loaded successfully (see MusicPlayer below / AmbientAudio.buildPad's
-// gating) rather than always-on background music.
-const PAD_VOICE_GAIN = 0.5 * 0.4; // per voice-pair gain (two pairs alternate); *0.4 ~= -8dB cut
+// Chord progression. This used to drive a sustained synth pad (already demoted to an
+// offline-fallback by Task 39's de-drone pass) — after a THIRD drone report the pad was removed
+// outright, along with the day-shimmer sine: this codebase now has a standing rule of NO sustained
+// synthesized tones, ever (see HANDOFF invariants). The root cycle survives because the pluck
+// arpeggio wanders over it; only the sustained oscillators are gone. Offline/blocked-network
+// sessions simply get plucks + nature + construction sfx with no music bed.
+const CHORD_ROOTS_HZ = [110.0, 130.81, 146.83, 164.81, 98.0]; // A2, C3, D3, E3, G2
+const CHORD_PERIOD = 24; // seconds per root
 
 // Real ambient music tracks (Task 39): a small rotation of pre-recorded CC0 ambient tracks (see
 // public/music/LICENSE.txt for sourcing) played one at a time through HTMLAudioElement ->
@@ -83,11 +73,6 @@ const PLUCK_DELAY_TIME_L = 0.28;
 const PLUCK_DELAY_TIME_R = 0.42;
 const PLUCK_DELAY_FEEDBACK = 0.25;
 
-// Gentle high shimmer (day only)
-const SHIMMER_ENABLED = true;
-const SHIMMER_GAIN_DB = -28;
-const SHIMMER_ATTACK = 6; // seconds, slow attack easing in with day
-const SHIMMER_RATIO = 3; // octave + fifth above root (2x octave * 1.5 fifth)
 
 // Birds / crickets
 const BIRD_MIN_INTERVAL = 4;
@@ -156,34 +141,25 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
-/** One alternating voice-pair slot for the pad (two detuned triangles — no sub-oscillator, see
- * Task 39's de-drone removal above), so chord changes can crossfade between the outgoing and
- * incoming root without clicks. */
-interface PadVoice {
-  gain: GainNode;
-  oscA: OscillatorNode;
-  oscB: OscillatorNode;
-}
-
 /**
- * Generative ambient audio: a slowly shifting pentatonic pad bed, a sparse generative kalimba/bell
- * pluck arpeggio layer (through a ping-pong feedback delay) riding over the same chord roots, an
- * optional day-only high shimmer, day/night birds and crickets, construction sfx (stage-complete
- * blips, demolish reverse-beeper, radio chatter — deliberately NO continuous engine rumble; one
- * existed and was removed as a background drone), and (Task 39) a slow-rotating background of real
- * CC0 ambient music tracks. Built lazily via `start()` on first user gesture (autoplay policy);
- * until then no `AudioContext` or nodes exist. The real tracks themselves are lazy-loaded even
- * later — a few seconds after `start()` — so they never compete with anything at boot; the
- * synthesized pad is a silent fallback that only becomes audible if zero tracks ever load
- * successfully (offline/dev/blocked network).
+ * Generative ambient audio: a sparse generative kalimba/bell pluck arpeggio layer (through a
+ * ping-pong feedback delay) wandering over a slowly shifting pentatonic chord progression,
+ * day/night birds and crickets, construction sfx (stage-complete blips, demolish reverse-beeper,
+ * radio chatter, completion swells/chimes), and (Task 39) a slow-rotating background of real CC0
+ * ambient music tracks. There are deliberately NO sustained synthesized tones anywhere in this
+ * file — the engine rumble, the synth pad (even as an offline fallback), and the day-shimmer sine
+ * were each removed after being reported as "background drone" (three separate reports). Built
+ * lazily via `start()` on first user gesture (autoplay policy); until then no `AudioContext` or
+ * nodes exist. The real tracks lazy-load a few seconds after `start()`; sessions where no track
+ * loads simply have no music bed.
  *
  * All one-shot and looping scheduling is driven by `ctx.currentTime` lookahead scheduling inside
  * `update()`, which is called once per render frame — there is no `setInterval` anywhere in this
  * class except the music track rotation's load-delay/gap timers, which use `window.setTimeout`
  * because they span user-gesture/network-load boundaries rather than per-frame audio scheduling
- * (see `MusicPlayer`). Continuous sound sources (pad voices, pluck delay bus, shimmer osc,
- * cricket burst noise) are created once in `start()`/on first gate-open and reused; only
- * true one-shots (bird chirps, blips, beeper pulses, pluck/bell notes) allocate and discard nodes.
+ * (see `MusicPlayer`). Continuous sound sources (pluck delay bus, cricket burst noise) are
+ * created once in `start()`/on first gate-open and reused; only true one-shots (bird chirps,
+ * blips, beeper pulses, pluck/bell notes) allocate and discard nodes.
  */
 export class AmbientAudio {
   private ctx: AudioContext | null = null;
@@ -191,23 +167,16 @@ export class AmbientAudio {
   private sfxBus: GainNode | null = null;
   /** Task 39: gain node sitting between `master` and `musicBus`, ramped by the MUSIC HUD toggle
    * (independent of MUTE, which zeroes `master` and kills everything). Holds real tracks +
-   * pad-fallback ONLY — the pluck/shimmer layers stay on `musicBus` directly (unaffected by this
-   * toggle), matching the spec's "pluck stays SFX-adjacent on its current bus" instruction. */
+   * real tracks ONLY — the pluck layer stays on `musicBus` directly (unaffected by this toggle),
+   * matching the spec's "pluck stays SFX-adjacent on its current bus" instruction. */
   private musicToggleGain: GainNode | null = null;
   private _musicOn = true;
 
   private _muted = false;
 
-  // Pad (Task 39: now a fallback, only unmuted when MusicPlayer has zero tracks loaded — see
-  // `updatePadFallbackGate`)
-  private padVoices: [PadVoice, PadVoice] | null = null;
-  private padActiveIdx = 0; // which of padVoices[] is the "current" (most recently entering) pair
-  private padChordTimer = 0;
-  private padChordIdx = 0;
-  private padFilter: BiquadFilterNode | null = null;
-  private padFilterCutoff = PAD_FILTER_DAY;
-  private padFallbackGain: GainNode | null = null; // gates the whole pad on/off based on track load state
-  private padFallbackCurrent = 0; // eased 0..1 toward updatePadFallbackGate's target
+  // Chord progression clock (shared root cycle the pluck layer arpeggiates over)
+  private chordTimer = 0;
+  private chordIdx = 0;
 
   // Real ambient music track rotation (Task 39)
   private musicPlayer: MusicPlayer | null = null;
@@ -216,11 +185,6 @@ export class AmbientAudio {
   private pluckBus: GainNode | null = null;
   private pluckTimer = 0;
   private pluckNextInterval = PLUCK_MIN_INTERVAL_DAY;
-
-  // Gentle high shimmer (day only)
-  private shimmerOsc: OscillatorNode | null = null;
-  private shimmerGain: GainNode | null = null;
-  private shimmerLevel = 0; // eased 0..1, drives gain toward SHIMMER_GAIN_DB during day
 
   // Birds / crickets
   private birdTimer = 0;
@@ -336,15 +300,15 @@ export class AmbientAudio {
     master.connect(ctx.destination);
     this.master = master;
 
-    // musicBus: pluck/shimmer's existing, un-toggled home (Task 39 spec: these stay exactly as-is,
-    // "SFX-adjacent", unaffected by the MUSIC toggle — only MUTE reaches them, via `master`).
+    // musicBus: the pluck layer's existing, un-toggled home (Task 39 spec: it stays exactly as-is,
+    // "SFX-adjacent", unaffected by the MUSIC toggle — only MUTE reaches it, via `master`).
     const musicBus = ctx.createGain();
     musicBus.gain.value = MUSIC_GAIN;
     musicBus.connect(master);
 
-    // trackBus: real tracks + pad-fallback's home, gated by `musicToggleGain` (the MUSIC toggle) on
-    // its way to `master`. Kept at the same nominal level as musicBus so toggling MUSIC off/on
-    // doesn't change the overall balance of what's left playing.
+    // trackBus: the real tracks' home, gated by `musicToggleGain` (the MUSIC toggle) on its way to
+    // `master`. Kept at the same nominal level as musicBus so toggling MUSIC off/on doesn't change
+    // the overall balance of what's left playing.
     const musicToggleGain = ctx.createGain();
     musicToggleGain.gain.value = this._musicOn ? 1 : 0;
     musicToggleGain.connect(master);
@@ -361,9 +325,7 @@ export class AmbientAudio {
 
     this.noiseBuffer = this.buildNoiseBuffer(ctx);
 
-    this.buildPad(ctx, trackBus);
     this.buildPluckBus(ctx, musicBus);
-    if (SHIMMER_ENABLED) this.buildShimmer(ctx, musicBus);
     this.buildConstructionBed(ctx, sfxBus);
 
     this.musicPlayer = new MusicPlayer(ctx, trackBus);
@@ -383,74 +345,6 @@ export class AmbientAudio {
     const data = buffer.getChannelData(0);
     for (let i = 0; i < length; i++) data[i] = Math.random() * 2 - 1;
     return buffer;
-  }
-
-  private makePadVoice(ctx: AudioContext, destination: AudioNode): PadVoice {
-    const gain = ctx.createGain();
-    gain.gain.value = 0;
-    gain.connect(destination);
-
-    const oscA = ctx.createOscillator();
-    oscA.type = 'triangle';
-    oscA.detune.value = -PAD_DETUNE_CENTS;
-    oscA.connect(gain);
-
-    const oscB = ctx.createOscillator();
-    oscB.type = 'triangle';
-    oscB.detune.value = PAD_DETUNE_CENTS;
-    oscB.connect(gain);
-
-    const root = PAD_ROOTS_HZ[0];
-    oscA.frequency.value = root;
-    oscB.frequency.value = root;
-
-    oscA.start();
-    oscB.start();
-
-    return { gain, oscA, oscB };
-  }
-
-  private buildPad(ctx: AudioContext, trackBus: AudioNode): void {
-    // Lowpass filter shared by both voice pairs, tremolo, then a fallback gate, then the track bus
-    // (Task 39: the pad now lives on the same bus as real tracks — it's a fallback for when none
-    // loaded, not a permanent background layer — see `padFallbackGain` / `updatePadFallbackGate`).
-    const filter = ctx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.frequency.value = PAD_FILTER_DAY;
-    filter.Q.value = 0.7;
-    this.padFilter = filter;
-    this.padFilterCutoff = PAD_FILTER_DAY;
-
-    const tremoloGain = ctx.createGain();
-    tremoloGain.gain.value = 1;
-    filter.connect(tremoloGain);
-
-    // Starts silent — `updatePadFallbackGate` (called every frame from `update()`) eases this open
-    // only while MusicPlayer reports zero successfully-loaded tracks, and eases it shut again the
-    // instant a real track becomes available.
-    const padFallbackGain = ctx.createGain();
-    padFallbackGain.gain.value = 0;
-    tremoloGain.connect(padFallbackGain);
-    padFallbackGain.connect(trackBus);
-    this.padFallbackGain = padFallbackGain;
-
-    const lfo = ctx.createOscillator();
-    lfo.type = 'sine';
-    lfo.frequency.value = PAD_TREMOLO_HZ;
-    const lfoDepth = ctx.createGain();
-    lfoDepth.gain.value = PAD_TREMOLO_DEPTH; // scales -1..1 LFO to +-depth
-    lfo.connect(lfoDepth);
-    lfoDepth.connect(tremoloGain.gain); // AudioParam automation offsets around the base value (1)
-    lfo.start();
-
-    const voiceA = this.makePadVoice(ctx, filter);
-    const voiceB = this.makePadVoice(ctx, filter);
-    voiceA.gain.gain.value = PAD_VOICE_GAIN; // pair A starts fully in
-    voiceB.gain.gain.value = 0;
-    this.padVoices = [voiceA, voiceB];
-    this.padActiveIdx = 0;
-    this.padChordIdx = 0;
-    this.padChordTimer = 0;
   }
 
   /** Continuous send bus for the pluck/arpeggio layer: a ping-pong feedback delay (two DelayNodes,
@@ -496,25 +390,6 @@ export class AmbientAudio {
     panR.connect(feedbackL);
     feedbackL.connect(delayL);
     wetGain.connect(musicBus);
-  }
-
-  /** Very quiet slow-attack sine, day-only, an octave + fifth above the current chord root, eased
-   * in/out alongside the pad's own day/night filter easing. Skipped entirely if SHIMMER_ENABLED is
-   * false. */
-  private buildShimmer(ctx: AudioContext, musicBus: AudioNode): void {
-    const gain = ctx.createGain();
-    gain.gain.value = 0;
-    gain.connect(musicBus);
-
-    const osc = ctx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.value = PAD_ROOTS_HZ[0] * SHIMMER_RATIO;
-    osc.connect(gain);
-    osc.start();
-
-    this.shimmerOsc = osc;
-    this.shimmerGain = gain;
-    this.shimmerLevel = 0;
   }
 
   private buildConstructionBed(ctx: AudioContext, sfxBus: AudioNode): void {
@@ -635,38 +510,17 @@ export class AmbientAudio {
     this.clockTime += dt;
     if (!this.ctx) return; // not started yet (no user gesture) — nothing to do
 
-    // A simple day/night split (sun elevation sign) is sufficient for birds/crickets/pad —
+    // A simple day/night split (sun elevation sign) is sufficient for birds/crickets/plucks —
     // matches Atmosphere's own sunElevation(t) formula without needing a direct dependency on it.
     const night = this.isNightFromTimeOfDay(timeOfDay);
 
-    this.updatePadFilter(dt, night);
-    this.updatePadChords(dt);
-    this.updatePadFallbackGate(dt);
+    this.updateChordProgression(dt);
     this.updatePluck(dt, night);
-    this.updateShimmer(dt, night);
     this.updateBirdsAndCrickets(dt, night);
     this.updateConstruction(dt, cameraX);
     this.updateRadioChatter(dt, cameraX);
     this.drainGraderScrapes(cameraX);
     this.musicPlayer?.update();
-  }
-
-  /** Task 39: eases `padFallbackGain` toward 1 only while `musicPlayer` reports zero successfully
-   * loaded tracks (offline, dev with no network, or every track failed to load) — otherwise eases
-   * it toward 0, so the synthesized pad only ever fills in as a fallback rather than layering under
-   * real music. A short ease (not an instant snap) either way, matching this file's other gates. */
-  private updatePadFallbackGate(dt: number): void {
-    if (!this.padFallbackGain || !this.ctx) return;
-    const target = this.musicPlayer?.hasLoadedTrack() ? 0 : 1;
-    const rate = dt / 2; // ~2s ease
-    if (this.padFallbackCurrent < target) {
-      this.padFallbackCurrent = Math.min(target, this.padFallbackCurrent + rate);
-    } else if (this.padFallbackCurrent > target) {
-      this.padFallbackCurrent = Math.max(target, this.padFallbackCurrent - rate);
-    }
-    const now = this.ctx.currentTime;
-    this.padFallbackGain.gain.cancelScheduledValues(now);
-    this.padFallbackGain.gain.setValueAtTime(this.padFallbackCurrent, now);
   }
 
   private isNightFromTimeOfDay(timeOfDay: number): boolean {
@@ -676,72 +530,21 @@ export class AmbientAudio {
     return elevation < 0;
   }
 
-  private updatePadFilter(dt: number, night: boolean): void {
-    if (!this.padFilter || !this.ctx) return;
-    const target = night ? PAD_FILTER_NIGHT : PAD_FILTER_DAY;
-    const rate = dt / PAD_FILTER_EASE_TIME;
-    const range = PAD_FILTER_DAY - PAD_FILTER_NIGHT;
-    if (this.padFilterCutoff < target) {
-      this.padFilterCutoff = Math.min(target, this.padFilterCutoff + range * rate);
-    } else if (this.padFilterCutoff > target) {
-      this.padFilterCutoff = Math.max(target, this.padFilterCutoff - range * rate);
-    }
-    const now = this.ctx.currentTime;
-    this.padFilter.frequency.cancelScheduledValues(now);
-    this.padFilter.frequency.setValueAtTime(this.padFilterCutoff, now);
-  }
-
-  private updatePadChords(dt: number): void {
-    if (!this.padVoices || !this.ctx) return;
-    this.padChordTimer += dt;
-
-    if (this.padChordTimer >= PAD_CHORD_PERIOD) {
-      this.padChordTimer -= PAD_CHORD_PERIOD;
-      this.padChordIdx = (this.padChordIdx + 1) % PAD_ROOTS_HZ.length;
-      this.crossfadeToNextChord();
+  /** Advances the shared chord-root cycle. Formerly this also crossfaded a sustained pad bed
+   * between roots; the pad is gone (see CHORD_ROOTS_HZ's comment) but the clock stays so the
+   * pluck layer keeps wandering through the progression. */
+  private updateChordProgression(dt: number): void {
+    this.chordTimer += dt;
+    if (this.chordTimer >= CHORD_PERIOD) {
+      this.chordTimer -= CHORD_PERIOD;
+      this.chordIdx = (this.chordIdx + 1) % CHORD_ROOTS_HZ.length;
     }
   }
 
-  /** Sets the *incoming* voice pair to the next root and equal-power crossfades gain between the
-   * outgoing (currently active) pair and the incoming one over PAD_CROSSFADE seconds. */
-  private crossfadeToNextChord(): void {
-    const ctx = this.ctx;
-    const voices = this.padVoices;
-    if (!ctx || !voices) return;
-
-    const outIdx = this.padActiveIdx;
-    const inIdx = outIdx === 0 ? 1 : 0;
-    const outgoing = voices[outIdx];
-    const incoming = voices[inIdx];
-
-    const nextRoot = PAD_ROOTS_HZ[this.padChordIdx];
-    const now = ctx.currentTime;
-
-    incoming.oscA.frequency.setValueAtTime(nextRoot, now);
-    incoming.oscB.frequency.setValueAtTime(nextRoot, now);
-
-    const steps = 24;
-    outgoing.gain.gain.cancelScheduledValues(now);
-    incoming.gain.gain.cancelScheduledValues(now);
-    outgoing.gain.gain.setValueAtTime(outgoing.gain.gain.value, now);
-    incoming.gain.gain.setValueAtTime(incoming.gain.gain.value, now);
-    for (let i = 1; i <= steps; i++) {
-      const t = i / steps;
-      const at = now + t * PAD_CROSSFADE;
-      // Equal-power crossfade curve.
-      const outGain = Math.cos(t * 0.5 * Math.PI) * PAD_VOICE_GAIN;
-      const inGain = Math.sin(t * 0.5 * Math.PI) * PAD_VOICE_GAIN;
-      outgoing.gain.gain.linearRampToValueAtTime(outGain, at);
-      incoming.gain.gain.linearRampToValueAtTime(inGain, at);
-    }
-
-    this.padActiveIdx = inIdx;
-  }
-
-  /** Current chord root in Hz, reading the same state the pad scheduler already tracks — the
-   * pluck layer always arpeggiates over whatever chord the pad is currently on/crossfading to. */
+  /** Current chord root in Hz — the pluck layer always arpeggiates over the current root of the
+   * shared progression. */
   private currentChordRootHz(): number {
-    return PAD_ROOTS_HZ[this.padChordIdx];
+    return CHORD_ROOTS_HZ[this.chordIdx];
   }
 
   /** Sparse generative arpeggio: every PLUCK_MIN..MAX_INTERVAL seconds (rng-jittered, roughly
@@ -898,25 +701,6 @@ export class AmbientAudio {
 
   /** Slow-attack/release easing of the day-only shimmer layer's gain and frequency (tracks the
    * current chord root), mirroring the pad filter's easing approach. */
-  private updateShimmer(dt: number, night: boolean): void {
-    if (!this.shimmerGain || !this.shimmerOsc || !this.ctx) return;
-    const target = night ? 0 : 1;
-    const rate = dt / SHIMMER_ATTACK;
-    if (this.shimmerLevel < target) {
-      this.shimmerLevel = Math.min(target, this.shimmerLevel + rate);
-    } else if (this.shimmerLevel > target) {
-      this.shimmerLevel = Math.max(target, this.shimmerLevel - rate);
-    }
-    const now = this.ctx.currentTime;
-    const gainLin = dbToGain(SHIMMER_GAIN_DB) * this.shimmerLevel;
-    this.shimmerGain.gain.cancelScheduledValues(now);
-    this.shimmerGain.gain.setValueAtTime(gainLin, now);
-
-    const targetFreq = this.currentChordRootHz() * SHIMMER_RATIO;
-    this.shimmerOsc.frequency.cancelScheduledValues(now);
-    this.shimmerOsc.frequency.setValueAtTime(targetFreq, now);
-  }
-
   private updateBirdsAndCrickets(dt: number, night: boolean): void {
     if (!this.ctx || !this.sfxBus) return;
 

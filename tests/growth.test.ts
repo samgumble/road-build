@@ -148,30 +148,17 @@ describe('GrowthSim', () => {
     }
   });
 
-  it('fields prefer cells near an existing house (deterministic seed)', () => {
-    const { bus, sim, g } = world();
+  it('never spawns new field patches (user-removed "grass"), while houses still develop', () => {
+    // Field/grass patches were removed from live development entirely (repeated player feedback:
+    // "remove grass spawning from the environment growth"). The threshold bit is still consumed so
+    // the cell isn't re-rolled, placeField survives for parks, and RECORDS FROM OLD SAVES still
+    // restore and render — only new spawns stop.
+    const { bus, sim } = world();
     const records: { kind: string; x: number; z: number }[] = [];
     bus.on('growth:spawn', (e) => records.push({ kind: e.kind, x: e.x, z: e.z }));
     for (let i = 0; i < 60 * 420; i++) sim.update(1 / 60);
-    const houses = records.filter((r) => r.kind === 'house');
-    const fields = records.filter((r) => r.kind === 'field');
-    expect(houses.length).toBeGreaterThan(0);
-    expect(fields.length).toBeGreaterThan(0);
-    const nearHouse = (f: { x: number; z: number }) =>
-      houses.some((h) => Math.hypot(h.x - f.x, h.z - f.z) <= 14);
-    const fieldsNearHouse = fields.filter(nearHouse).length;
-    // Not every field will have a house within range (houses appear later in the dev sequence,
-    // and fields spawn before some houses exist), but a clear majority should end up adjacent to
-    // one once houses exist, given the preference logic scans for them.
-    expect(fieldsNearHouse).toBeGreaterThan(0);
-
-    // A field is a 10x10 square, not a point. Its full circumradius must clear the 6u road plus a
-    // small verge; checking only the old 6.5u center clearance allowed its grass plane to cover
-    // the asphalt even though the record itself was technically outside the road.
-    const fieldFootprintClearance = ROAD_WIDTH / 2 + Math.hypot(5, 5) + 0.5;
-    for (const field of fields) {
-      expect(nearestRoadSample(g, field.x, field.z).dist).toBeGreaterThanOrEqual(fieldFootprintClearance - 0.02);
-    }
+    expect(records.filter((r) => r.kind === 'house').length).toBeGreaterThan(0);
+    expect(records.filter((r) => r.kind === 'field').length).toBe(0);
   });
 
   it('is deterministic: same seed + build sequence produces identical records', () => {
