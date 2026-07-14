@@ -95,6 +95,17 @@ const DITCH_JUNCTION_SETBACK = 4;
 // this arm and can't be reached at all.
 const VERGE_SETBACK_MAX = 22; // hairpin clamp — beyond this the strips simply stay clear entirely
 
+// Junction paint (polish pass): every PAINTED arm of a degree-3+ node gets a stop line just
+// outside the conflict-area patch and a zebra crosswalk behind it. Positions come from the arm's
+// real cross-section (edgeArmAtNode at the given reach), so they follow curved/climbing arms.
+const STOP_LINE_REACH = JUNCTION_REACH + 0.4;
+const STOP_LINE_THICKNESS = 0.35;
+const STOP_LINE_HALF_WIDTH = 2.4;
+const CROSSWALK_REACH = JUNCTION_REACH + 1.6;
+const CROSSWALK_BAR_LENGTH = 1.3;
+const CROSSWALK_BAR_WIDTH = 0.35;
+const CROSSWALK_OFFSETS = [-2.1, -1.26, -0.42, 0.42, 1.26, 2.1];
+
 /** Arclength a verge strip of half-width `stripHalf` must stay back from a node so it can never
  * lie on any other arm's road surface. `ownHeading`/`otherHeadings` all point AWAY from the node. */
 export function vergeJunctionSetback(
@@ -1060,6 +1071,58 @@ export class RoadRenderer {
         tagWeatherSurface(mesh, stage === 'graded' ? 'earth' : stage === 'gravel' ? 'gravel' : 'asphalt');
         this.junctionGroup.add(mesh);
         this.junctionMeshes.push(mesh);
+      }
+
+      // Stop lines + zebra crosswalks on painted arms (see STOP_LINE_*/CROSSWALK_* constants).
+      const paintedArms = arms.filter((arm) => arm.edge.stage === 'painted');
+      if (paintedArms.length) {
+        const positions: number[] = [];
+        const normals: number[] = [];
+        const indices: number[] = [];
+        const quad = (cx: number, cy: number, cz: number, ax: number, az: number, alongHalf: number, acrossHalf: number) => {
+          const px = -az, pz = ax;
+          const base = positions.length / 3;
+          const corners = [
+            [cx - ax * alongHalf - px * acrossHalf, cz - az * alongHalf - pz * acrossHalf],
+            [cx + ax * alongHalf - px * acrossHalf, cz + az * alongHalf - pz * acrossHalf],
+            [cx + ax * alongHalf + px * acrossHalf, cz + az * alongHalf + pz * acrossHalf],
+            [cx - ax * alongHalf + px * acrossHalf, cz - az * alongHalf + pz * acrossHalf],
+          ];
+          for (const [x, z] of corners) {
+            positions.push(x, cy, z);
+            normals.push(0, 1, 0);
+          }
+          indices.push(base, base + 2, base + 1, base, base + 3, base + 2);
+        };
+        for (const arm of paintedArms) {
+          const stop = this.edgeArmAtNode(arm.edge, node.id, STOP_LINE_REACH);
+          const walk = this.edgeArmAtNode(arm.edge, node.id, CROSSWALK_REACH);
+          if (!stop || !walk) continue;
+          const s = stop.far, w = walk.far;
+          const sdx = Math.cos(s.heading), sdz = Math.sin(s.heading);
+          quad(s.x, s.y + CENTERLINE_YLIFT, s.z, sdx, sdz, STOP_LINE_THICKNESS / 2, STOP_LINE_HALF_WIDTH);
+          const wdx = Math.cos(w.heading), wdz = Math.sin(w.heading);
+          const wpx = -wdz, wpz = wdx;
+          for (const offset of CROSSWALK_OFFSETS) {
+            quad(
+              w.x + wpx * offset, w.y + CENTERLINE_YLIFT, w.z + wpz * offset,
+              wdx, wdz, CROSSWALK_BAR_LENGTH / 2, CROSSWALK_BAR_WIDTH / 2,
+            );
+          }
+        }
+        if (positions.length) {
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+          geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+          geometry.setIndex(indices);
+          const material = makeStandardMaterial(CENTERLINE_COLOR, 1, 'stripe');
+          const mesh = new THREE.Mesh(geometry, material);
+          mesh.receiveShadow = true;
+          mesh.userData.roadDetail = 'junctionPaint';
+          tagWeatherSurface(mesh, 'paint');
+          this.junctionGroup.add(mesh);
+          this.junctionMeshes.push(mesh);
+        }
       }
     }
   }

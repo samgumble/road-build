@@ -250,8 +250,9 @@ describe('SceneryRenderer decay/upgrade (Task 35)', () => {
     expect(stats.fieldMeshCount).toBe(baseline.fieldMeshCount + expectedByKind.field);
     // 3 stripe quads per live field, no more no less (Task 35: field stripe compaction).
     expect(stats.fieldStripeMeshCount).toBe(baseline.fieldStripeMeshCount + expectedByKind.field * 3);
-    // Every house/building has exactly one window quad.
-    expect(stats.windowMeshCount).toBe(baseline.windowMeshCount + expectedByKind.house + expectedByKind.building);
+    // Every house/building has AT LEAST one window quad (night polish pass: houses 1-2,
+    // buildings a 3-6 row grid); the exact-baseline restore below is the strong compaction check.
+    expect(stats.windowMeshCount).toBeGreaterThanOrEqual(baseline.windowMeshCount + expectedByKind.house + expectedByKind.building);
 
     // Remove everything spawned by this test and confirm every mesh returns to exactly the
     // pre-test baseline — the strongest possible "no ghosts" check: nothing invisible left

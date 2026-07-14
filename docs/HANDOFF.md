@@ -329,6 +329,22 @@ production-build, artifact-upload, and deploy jobs:
   - Coverage: sloped-junction patch heights, curved-arm corner anchoring, ditch setback, apron
     presence/size, road-anchored approach-rail poses, and junction prop exclusion (6 new tests in
     `roadContinuity.test.ts` / `roadsideRenderer.test.ts`).
+- Visual polish pass (2026-07-14, player request "make it look prettier/more polished"):
+  - Junction paint: painted degree-3+ arms get a stop line (JUNCTION_REACH + 0.4) and a 6-bar
+    zebra crosswalk (reach + 1.6), positioned from each arm's real cross-section so they follow
+    curves/slopes; one merged mesh per junction, `roadDetail: 'junctionPaint'`.
+  - Window grids: houses plant 1-2 window quads, buildings a 3-6 row grid scaled by their
+    skyline-stretched height (front/side faces, jitter, occasional dark flat) — `Instance.windowSlots`
+    is now an ARRAY; compaction frees slots in descending order and retargets the moved owner's
+    entry (see freeSlot). WINDOW_CAPACITY covers the worst case in one draw call.
+  - Horizon skirt (`src/render/horizonSkirt.ts`, DOM-safe module): an inward-facing cylinder just
+    inside the fog's far distance with a vertical alpha fade — the island edge dissolves into haze
+    instead of ending like a table edge. Fog does the tinting; no per-frame sync.
+  - Soft clouds (graphics-plan Task 4 slice, claimed in that doc): merged soft cards with a radial
+    alpha falloff replace the hard icosahedron puffs; Lambert-lit so they dim at night; identical
+    rng consumption/positions/drift.
+  - Per-instance weathering tints on traffic cones and survey stakes via instanceColor.
+  - (Car headlights were already shipped upstream — checked before implementing.)
 - Construction theater one-shots (2026-07-14): a low settle THUNK when a bridge deck span lands
   (`construction:deckSettled` event, emitted by `constructionRenderer.settleBridgeSpan` with the
   span's world x for panning) and a soft crack-rustle per corridor tree felled by the grading
