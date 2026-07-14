@@ -127,6 +127,9 @@ const CLEAR_RADIUS = ROAD_ENGINEERED_HALF_WIDTH;
  */
 export class WildernessSim {
   private cleared: boolean[];
+  /** Per-edge arclength the grading front has already swept (progressive clearing) — samples at
+   * or before this station were checked once and never need rescanning. */
+  private sweptTo = new Map<number, number>();
 
   constructor(
     private trees: ReadonlyArray<WildernessTree>,
@@ -134,14 +137,25 @@ export class WildernessSim {
     private graph: RoadGraph,
   ) {
     this.cleared = new Array(trees.length).fill(false);
+    // Progressive clearing (player request "trees are removed during the step after surveying"):
+    // trees fall AS the excavator's grading front passes them, not all at once when the whole
+    // stage completes. Demolition progress never fells trees.
+    this.bus.on('construction:progress', (e) => {
+      if (e.demolish || e.stage !== 'graded') return;
+      this.clearCorridor(e.edgeId, e.t);
+    });
     this.bus.on('construction:stage', (e) => {
       // A LIVE build always fires a discrete 'graded' transition exactly once as the excavator
       // finishes that stage. But a RESTORED edge (save.ts's restoreWorld) force-sets `edge.stage`
       // directly to whatever stage it was saved at and re-emits `construction:stage` with THAT
       // stage — which may be 'gravel', 'paved', or 'painted' if the save happened well past
       // grading, never a literal 'graded' event. Any of those stages implies grading already
-      // happened, so the corridor must still clear; 'removed' and 'surveyed' do not.
-      if (e.stage === 'removed') return;
+      // happened, so the corridor must still clear; 'removed' and 'surveyed' do not. With the
+      // progressive listener above this is the tail sweep + the restore path.
+      if (e.stage === 'removed') {
+        this.sweptTo.delete(e.edgeId);
+        return;
+      }
       if (STAGES.indexOf(e.stage) < GRADED_INDEX) return;
       this.clearCorridor(e.edgeId);
     });
@@ -185,20 +199,35 @@ export class WildernessSim {
    * worldgen dressing rather than a resource meant to be farmed by build/demolish cycles, and
    * regrowing it would need tracking each tree's clearing edge and re-validating against whatever
    * else may have since built over that ground — real complexity for a look nobody asked for. */
-  private clearCorridor(edgeId: number): void {
+  /** Clears active trees near the edge's non-bridge samples up to arclength `upTo` (the grading
+   * front's position; Infinity = the whole corridor). Each (edge, sample) is swept at most once
+   * via `sweptTo`, so per-tick progress events only ever test the newly passed stretch. */
+  private clearCorridor(edgeId: number, upTo = Infinity): void {
     const edge = this.graph.edges.get(edgeId);
     if (!edge) return;
+    const from = this.sweptTo.get(edgeId) ?? -1;
+    if (upTo <= from) return;
+    this.sweptTo.set(edgeId, upTo);
 
     const clearedIndices: number[] = [];
-    for (let i = 0; i < this.trees.length; i++) {
-      if (this.cleared[i]) continue;
-      const t = this.trees[i];
-      for (const s of edge.samples) {
-        if (s.bridge) continue;
-        if (Math.hypot(s.x - t.x, s.z - t.z) <= CLEAR_RADIUS) {
-          this.cleared[i] = true;
-          clearedIndices.push(i);
-          break;
+    let d = 0;
+    for (let i = 0; i < edge.samples.length; i++) {
+      if (i > 0) {
+        d += Math.hypot(
+          edge.samples[i].x - edge.samples[i - 1].x,
+          edge.samples[i].z - edge.samples[i - 1].z,
+        );
+      }
+      if (d > upTo) break;
+      if (d <= from) continue; // already swept by an earlier progress event
+      const s = edge.samples[i];
+      if (s.bridge) continue;
+      for (let t = 0; t < this.trees.length; t++) {
+        if (this.cleared[t]) continue;
+        const tree = this.trees[t];
+        if (Math.hypot(s.x - tree.x, s.z - tree.z) <= CLEAR_RADIUS) {
+          this.cleared[t] = true;
+          clearedIndices.push(t);
         }
       }
     }

@@ -903,6 +903,44 @@ describe('GrowthSim', () => {
       return { bus, hf, g, edgeId, anchor };
     }
 
+    it('clears corridor records progressively as the grading front passes (the step after surveying)', () => {
+      const { bus, hf, g, edgeId } = buildGraph('clear-progressive');
+      const sim = new GrowthSim(g, hf, bus, createRng('clear-progressive'));
+      const edge = g.edges.get(edgeId)!;
+
+      // 2D arclength per sample so records can sit at known stations along the run
+      const d: number[] = [0];
+      for (let i = 1; i < edge.samples.length; i++) {
+        d.push(d[i - 1] + Math.hypot(
+          edge.samples[i].x - edge.samples[i - 1].x,
+          edge.samples[i].z - edge.samples[i - 1].z,
+        ));
+      }
+      const total = d[d.length - 1];
+      const early = edge.samples[d.findIndex((v) => v >= total * 0.25)];
+      const late = edge.samples[d.findIndex((v) => v >= total * 0.75)];
+      sim.restore(new Float32Array(GRID_SIZE * GRID_SIZE), [
+        { kind: 'tree', x: early.x, z: early.z, rot: 0, id: 1 },
+        { kind: 'tree', x: late.x, z: late.z, rot: 0, id: 2 },
+      ]);
+
+      const cleared: number[] = [];
+      bus.on('growth:cleared', ({ id }) => cleared.push(id));
+      const progress = (t: number, demolish = false) => bus.emit('construction:progress', {
+        edgeId, stage: 'graded', t, pos: { x: 0, y: 0, z: 0 }, heading: 0,
+        vehicle: 'excavator', demolish, crew: 0, onBreak: false,
+      });
+
+      progress(total, true); // demolition progress must never clear records
+      expect(cleared).toEqual([]);
+
+      progress(total * 0.5); // mid-stage: only the record the front has passed starts clearing
+      expect(cleared).toEqual([1]);
+
+      progress(total); // the front finishing the run clears the rest
+      expect(cleared).toEqual([1, 2]);
+    });
+
     it('a tree record within the corridor fades quickly and is removed once graded', () => {
       const { bus, hf, g, edgeId } = buildGraph('clear-tree');
       const sim = new GrowthSim(g, hf, bus, createRng('clear-tree'));
