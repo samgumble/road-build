@@ -17,7 +17,6 @@ export interface DetailPose {
 export interface RoadsidePlan {
   culverts: DetailPose[];
   retainingWalls: DetailPose[];
-  guardrails: DetailPose[];
   reflectors: DetailPose[];
   signs: DetailPose[];
   utilityPoles: DetailPose[];
@@ -66,7 +65,7 @@ export function planRoadsideDetails(
   settlements: ReadonlyArray<Settlement>,
 ): RoadsidePlan {
   const plan: RoadsidePlan = {
-    culverts: [], retainingWalls: [], guardrails: [], reflectors: [], signs: [], utilityPoles: [],
+    culverts: [], retainingWalls: [], reflectors: [], signs: [], utilityPoles: [],
     gravelScatter: [], streetlamps: [],
   };
 
@@ -95,17 +94,14 @@ export function planRoadsideDetails(
       const right = poseAt(sample, heading, -1, terrain);
       const leftLand = terrain.isLand(left.x, left.z);
       const rightLand = terrain.isLand(right.x, right.z);
-      const leftDrop = sample.y - left.y;
-      const rightDrop = sample.y - right.y;
 
-      if (!leftLand || leftDrop > 1.35) plan.guardrails.push(left);
-      if (!rightLand || rightDrop > 1.35) plan.guardrails.push(right);
-
+      // (Guardrails were removed entirely — repeated player feedback. Drop/waterside geometry now
+      // plants nothing; the terrain context below still drives walls and culverts.)
       const crossSlope = Math.abs(left.y - right.y);
       if (crossSlope > 1.6) plan.retainingWalls.push(left.y < right.y ? left : right);
 
-      // Safety furniture (rails, walls) stands wherever the terrain demands it; everything below
-      // is cosmetic and stays out of intersection aprons.
+      // Retaining walls stand wherever the terrain demands them; everything below is cosmetic
+      // and stays out of intersection aprons.
       const inApron = nearJunction(sample.x, sample.z);
 
       if (!inApron && (!leftLand || !rightLand) && stationIndex % 2 === 1) {
@@ -226,8 +222,6 @@ export class RoadsideRenderer {
     };
 
     const yaw = (pose: DetailPose) => new THREE.Quaternion().setFromEuler(new THREE.Euler(0, -pose.heading, 0));
-    add(new THREE.BoxGeometry(5.5, 0.16, 0.14), material(0x9a9b93), 700, (p) => p.guardrails, 0.72, new THREE.Vector3(1, 1, 1), yaw);
-    add(new THREE.BoxGeometry(0.12, 0.72, 0.12), material(0x666864), 700, (p) => p.guardrails, 0.36, new THREE.Vector3(1, 1, 1));
     add(new THREE.BoxGeometry(5.5, 1.2, 0.42), material(0x756b58), 500, (p) => p.retainingWalls, 0.58, new THREE.Vector3(1, 1, 1), yaw);
     add(new THREE.TorusGeometry(0.36, 0.1, 6, 10), material(0x575d59), 300, (p) => p.culverts, 0.18, new THREE.Vector3(1, 1, 1),
       (pose) => new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI / 2, -pose.heading, 0)));

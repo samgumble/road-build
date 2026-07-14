@@ -133,13 +133,15 @@ assuming a green build means the page is live.
   settlement pair); phases are hash-seeded, walking uses render dt (theater ambles at any sim
   speed), and the whole group hides at night via `atmosphere:phase`. Pure render theater — no sim
   contract, no save state.
-- Bridge approach rails: REMOVED (2026-07-14, player request "remove the guard rails between
-  roads and bridges") after two alignment iterations — the deck's own rails plus the tapered
-  approach slab now own the transition visually. `planRoadsideDetails` plans guardrails ONLY from
-  the station loop's terrain context (drops > 1.35u and waterside verges); a regression test pins
-  a flat-land road-to-bridge transition to ZERO planned guardrails. `BRIDGE_RAIL_OFFSET` /
-  `STAGE_YLIFT` stay exported from `roadRenderer.ts` (deck rails still use the former). Do not
-  reintroduce approach rails without a fresh player request.
+- Roadside guardrails: REMOVED ENTIRELY (2026-07-14, third player report). First the dedicated
+  bridge-approach rails went; the player then still saw rails because the station loop's
+  terrain-context rails (drops > 1.35u, waterside verges) plant on exactly the geometry every
+  bridge approach has — an embankment beside water. The `guardrails` plan field and both instanced
+  pools (bar + posts) are deleted; bridge decks keep their own rails, retaining walls and culverts
+  keep covering terrain context. Regression tests pin `'guardrails' in plan === false` and the
+  pool count at 11. Do not reintroduce ANY roadside guardrail without a fresh player request —
+  this is the third time rails have been asked off the roads. `BRIDGE_RAIL_OFFSET` / `STAGE_YLIFT`
+  stay exported from `roadRenderer.ts` (deck rails still use the former).
 - Instancing audit (2026-07-13): every population-scaled renderer is instanced (cars, scenery GLB
   variants, roadside pools, construction cone/floodlight/particle pools, villagers). The only
   per-object draws are the three bounded construction crew rigs (cheap primitives per the Task 25
