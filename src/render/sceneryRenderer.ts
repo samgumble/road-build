@@ -100,6 +100,34 @@ export const MODEL_STYLE_VARIANTS: Readonly<Record<'tree' | 'house' | 'building'
 
 const FIELD_STRIPE_COLORS = ['#7fae6b', '#6a9b58'];
 
+// --- Skyline variety (player feedback: dense settlements read as a uniform wall of towers) ------
+// Buildings inside SKYLINE_CORE_DISTANCE of a road keep full "downtown" height; past
+// SKYLINE_FRINGE_DISTANCE they damp to ~70%, so a big settlement peaks along its main street and
+// steps down toward the edges instead of forming one flat-topped block.
+export const SKYLINE_CORE_DISTANCE = 10;
+export const SKYLINE_FRINGE_DISTANCE = 34;
+
+/** Per-building vertical stretch: distance-from-road falloff x a deterministic per-tower jitter.
+ * `roadDistance` null (no probe wired, e.g. tests/tools) falls back to jitter-only variation. */
+export function skylineHeightScale(roadDistance: number | null, jitter01: number): number {
+  const jitter = 0.9 + jitter01 * 0.25; // ±~12% per-tower silhouette variation
+  if (roadDistance === null) return jitter;
+  const t = Math.min(1, Math.max(0, (roadDistance - SKYLINE_CORE_DISTANCE) / (SKYLINE_FRINGE_DISTANCE - SKYLINE_CORE_DISTANCE)));
+  const falloff = 1.15 - t * 0.45; // 1.15 at the core -> 0.70 at the fringe
+  return falloff * jitter;
+}
+
+// Subtle per-instance facade multipliers (via InstancedMesh.instanceColor — no extra draw calls,
+// composes with the per-variant material tints). Kept close to white so towers still read as one
+// authored town, just not carbon copies.
+const BUILDING_FACADE_TINTS = ['#ffffff', '#eae0d3', '#d6dfe5', '#e0d6cb', '#ced6d1'];
+
+/** Stable cosmetic hash in [0,1); render-only, never consumes simulation RNG state. */
+function sceneryHash01(x: number, z: number): number {
+  const h = Math.abs(Math.imul(Math.round(x * 4) * 2246822519 + Math.round(z * 4) * 3266489917, 668265263));
+  return (h % 4096) / 4096;
+}
+
 const FLATTEN_RADIUS = 5;
 
 const WINDOW_SIZE = 0.5;
@@ -111,6 +139,7 @@ const dummyMatrix = new THREE.Matrix4();
 const dummyPos = new THREE.Vector3();
 const dummyQuat = new THREE.Quaternion();
 const dummyScale = new THREE.Vector3();
+const dummyColor = new THREE.Color();
 const upAxis = new THREE.Vector3(0, 1, 0);
 
 interface VariantMesh {
@@ -135,6 +164,9 @@ interface Instance {
   z: number;
   rot: number;
   windowSlot: number | null; // index into the window InstancedMesh, if this instance has windows
+  /** Skyline variety: per-instance vertical stretch baked into every matrix write for this
+   * instance (place, pop-in, fade, recover). 1 for everything except buildings. */
+  hScale: number;
 }
 
 /** An instance currently animating pop-in scale 0 -> 1. */
@@ -328,7 +360,14 @@ export class SceneryRenderer {
   // restore-time mechanism instead of duplicating `applyPendingFadeIfAny`.
   private pendingFadeOffsets = new Map<number, { elapsed: number; duration: number; sink: number }>();
 
-  constructor(private scene: THREE.Scene, private hf: Heightfield, private bus: EventBus) {
+  constructor(
+    private scene: THREE.Scene,
+    private hf: Heightfield,
+    private bus: EventBus,
+    /** Optional probe for the distance from (x, z) to the nearest road sample — powers the
+     * skyline height falloff. Absent (tests/tools), buildings vary by jitter alone. */
+    private roadDistanceAt?: (x: number, z: number) => number,
+  ) {
     const fieldGeo = new THREE.PlaneGeometry(FIELD_SIZE, FIELD_SIZE);
     fieldGeo.rotateX(-Math.PI / 2);
     const fieldMat = new THREE.MeshStandardMaterial({ color: FIELD_STRIPE_COLORS[0], roughness: 0.95 });
@@ -488,6 +527,26 @@ export class SceneryRenderer {
     instance.variant.mesh.getMatrixAt(instance.slot, dummyMatrix);
     dummyMatrix.decompose(dummyPos, dummyQuat, dummyScale);
     return dummyScale.x;
+  }
+
+  /** Test/diagnostic-only (skyline variety): the vertical stretch (scale.y / scale.x) baked into
+   * `id`'s live matrix — the per-building height falloff/jitter, independent of any pop-in/fade
+   * animation's uniform scale. Returns `null` if `id` has no live instance. */
+  verticalStretchOf(id: number): number | null {
+    const instance = this.byId.get(id);
+    if (!instance) return null;
+    instance.variant.mesh.getMatrixAt(instance.slot, dummyMatrix);
+    dummyMatrix.decompose(dummyPos, dummyQuat, dummyScale);
+    return dummyScale.y / dummyScale.x;
+  }
+
+  /** Test/diagnostic-only (skyline variety): `id`'s per-instance facade tint as a `#rrggbb` hex
+   * string, or `null` when the instance doesn't exist or its mesh has no per-instance colors. */
+  facadeTintOf(id: number): string | null {
+    const instance = this.byId.get(id);
+    if (!instance || !instance.variant.mesh.instanceColor) return null;
+    instance.variant.mesh.getColorAt(instance.slot, dummyColor);
+    return `#${dummyColor.getHexString()}`;
   }
 
   /** Test/diagnostic-only: whether `id` is currently tracked in the `fading` list (Finding 2) —
@@ -716,7 +775,7 @@ export class SceneryRenderer {
       patchMesh.instanceMatrix.needsUpdate = true;
 
       if (rec.kind === 'park') {
-        const instance: Instance = { kind: rec.kind, id, variant: { mesh: this.park, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlot: null };
+        const instance: Instance = { kind: rec.kind, id, variant: { mesh: this.park, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlot: null, hScale: 1 };
         this.instances.push(instance);
         this.ownersFor(this.park)[slot] = instance;
         if (id !== null) this.byId.set(id, instance);
@@ -751,7 +810,7 @@ export class SceneryRenderer {
       this.fieldStripe.instanceMatrix.needsUpdate = true;
       this.fieldStripeOwners[slot] = stripeSlots;
 
-      const instance: Instance = { kind: rec.kind, id, variant: { mesh: this.field, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlot: null };
+      const instance: Instance = { kind: rec.kind, id, variant: { mesh: this.field, baseHeight: 0 }, slot, x: rec.x, y, z: rec.z, rot: rec.rot, windowSlot: null, hScale: 1 };
       this.instances.push(instance);
       this.ownersFor(this.field)[slot] = instance;
       if (id !== null) this.byId.set(id, instance);
@@ -774,20 +833,35 @@ export class SceneryRenderer {
       finalY = this.hf.heightAt(rec.x, rec.z);
     }
 
+    // Skyline variety: buildings stretch vertically by road proximity (downtown-tall along the
+    // street, damped toward the fringe) plus deterministic jitter, and pick a per-instance facade
+    // tint. Both are render-only and frozen at spawn time.
+    let hScale = 1;
+    if (rec.kind === 'building') {
+      const roadDistance = this.roadDistanceAt ? this.roadDistanceAt(rec.x, rec.z) : null;
+      hScale = skylineHeightScale(roadDistance, sceneryHash01(rec.x, rec.z));
+    }
+
     const s = animate ? 0.001 : 1;
     dummyPos.set(rec.x, finalY, rec.z);
     dummyQuat.setFromAxisAngle(upAxis, rec.rot);
-    dummyScale.set(s, s, s);
+    dummyScale.set(s, s * hScale, s);
     dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
     variant.mesh.setMatrixAt(slot, dummyMatrix);
     variant.mesh.count = slot + 1;
     variant.mesh.instanceMatrix.needsUpdate = true;
 
+    if (rec.kind === 'building') {
+      dummyColor.set(BUILDING_FACADE_TINTS[this.variantIndex(rec.z + 31, rec.x + 17, BUILDING_FACADE_TINTS.length)]);
+      variant.mesh.setColorAt(slot, dummyColor);
+      variant.mesh.instanceColor!.needsUpdate = true;
+    }
+
     let windowSlot: number | null = null;
     if (rec.kind === 'house' || rec.kind === 'building') {
       if (this.windowCount < this.windows.instanceMatrix.count) {
         windowSlot = this.windowCount++;
-        const wy = finalY + variant.baseHeight * 0.5;
+        const wy = finalY + variant.baseHeight * 0.5 * hScale;
         const fx = Math.cos(rec.rot), fz = Math.sin(rec.rot);
         const wx = rec.x + fx * (rec.kind === 'building' ? 2.51 : 2.01);
         const wz = rec.z + fz * (rec.kind === 'building' ? 2.51 : 2.01);
@@ -801,7 +875,7 @@ export class SceneryRenderer {
       }
     }
 
-    const instance: Instance = { kind: rec.kind, id, variant, slot, x: rec.x, y: finalY, z: rec.z, rot: rec.rot, windowSlot };
+    const instance: Instance = { kind: rec.kind, id, variant, slot, x: rec.x, y: finalY, z: rec.z, rot: rec.rot, windowSlot, hScale };
     this.instances.push(instance);
     this.ownersFor(variant.mesh)[slot] = instance;
     if (windowSlot !== null) this.ownersFor(this.windows)[windowSlot] = instance;
@@ -1154,6 +1228,12 @@ export class SceneryRenderer {
     if (slot < lastSlot) {
       mesh.getMatrixAt(lastSlot, dummyMatrix);
       mesh.setMatrixAt(slot, dummyMatrix);
+      if (mesh.instanceColor) {
+        // per-instance facade tints (skyline variety) must follow the swapped-in survivor
+        mesh.getColorAt(lastSlot, dummyColor);
+        mesh.setColorAt(slot, dummyColor);
+        mesh.instanceColor.needsUpdate = true;
+      }
       const moved = owners?.[lastSlot] ?? null;
       if (moved) {
         moved.slot = slot;
@@ -1257,7 +1337,7 @@ export class SceneryRenderer {
     const sink = f.fromSink + (f.sink - f.fromSink) * t;
     dummyPos.set(f.instance.x, f.instance.y - sink, f.instance.z);
     dummyQuat.setFromAxisAngle(upAxis, f.instance.rot);
-    dummyScale.set(s, s, s);
+    dummyScale.set(s, s * f.instance.hScale, s);
     dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
     f.instance.variant.mesh.setMatrixAt(f.instance.slot, dummyMatrix);
     f.instance.variant.mesh.instanceMatrix.needsUpdate = true;
@@ -1282,7 +1362,7 @@ export class SceneryRenderer {
     const sink = r.fromSink * (1 - t);
     dummyPos.set(r.instance.x, r.instance.y - sink, r.instance.z);
     dummyQuat.setFromAxisAngle(upAxis, r.instance.rot);
-    dummyScale.set(s, s, s);
+    dummyScale.set(s, s * r.instance.hScale, s);
     dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
     r.instance.variant.mesh.setMatrixAt(r.instance.slot, dummyMatrix);
     r.instance.variant.mesh.instanceMatrix.needsUpdate = true;
@@ -1304,7 +1384,7 @@ export class SceneryRenderer {
         const s = Math.max(0.001, easeOutBack(t));
         dummyPos.set(a.instance.x, a.instance.y, a.instance.z);
         dummyQuat.setFromAxisAngle(upAxis, a.instance.rot);
-        dummyScale.set(s, s, s);
+        dummyScale.set(s, s * a.instance.hScale, s);
         dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
         a.instance.variant.mesh.setMatrixAt(a.instance.slot, dummyMatrix);
         a.instance.variant.mesh.instanceMatrix.needsUpdate = true;

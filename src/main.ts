@@ -20,6 +20,7 @@ import { generateWilderness, WildernessSim } from './sim/growth/wilderness';
 import { QuarrySim } from './sim/quarry';
 import { SceneryRenderer } from './render/sceneryRenderer';
 import { Atmosphere } from './render/atmosphere';
+import { atmosphereTimeScale } from './render/solarTime';
 import { Hud, randomSeed } from './ui/hud';
 import { StartScreen } from './ui/startScreen';
 import { serialize, deserialize, restoreWorld } from './sim/save';
@@ -146,7 +147,24 @@ function main(): void {
 
   const morphologySeed = createRng('growth-morphology-' + hf.seed)();
   const growth = new GrowthSim(graph, hf, bus, createRng('growth-' + hf.seed), morphologySeed);
-  const sceneryRenderer = new SceneryRenderer(scene, hf, bus);
+  // Skyline variety probe: distance from a point to the nearest road sample. Called once per
+  // building spawn (not per frame); the early-out fires as soon as a sample is effectively on
+  // top of the query point, and buildings only ever spawn near roads.
+  const roadDistanceAt = (x: number, z: number): number => {
+    let best = Infinity;
+    for (const edge of graph.edges.values()) {
+      for (const sample of edge.samples) {
+        const dx = sample.x - x, dz = sample.z - z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < best) {
+          best = d2;
+          if (best < 4) return Math.sqrt(best);
+        }
+      }
+    }
+    return Math.sqrt(best);
+  };
+  const sceneryRenderer = new SceneryRenderer(scene, hf, bus, roadDistanceAt);
   const roadsideRenderer = new RoadsideRenderer(scene, graph, hf, bus);
   const villagerRenderer = new VillagerRenderer(scene, graph, hf, bus);
 
@@ -215,12 +233,11 @@ function main(): void {
       cameraRig.update(dt);
       roadRenderer.update(dt, atmosphere.rainAmount);
       drawTool.update(dt);
-      // Important 10: the day/night cycle is meant to accelerate with the HUD's speed control
-      // (1x/4x/16x, via `loop.timeScale`) the same way the fixed-step sim does — Atmosphere's own
-      // doc comment already (incorrectly) claimed timeScale was "baked in" to its dt, but this
-      // render callback computes `dt` straight from wall-clock time with no timeScale applied at
-      // all, so the day cycle previously ran at real-world speed regardless of the selected speed.
-      atmosphere.update(dt * loop.timeScale);
+      // Important 10: the day/night cycle accelerates with the HUD's speed control — but capped
+      // at ATMOSPHERE_MAX_TIMESCALE (4x): at a raw 16x the lighting sweeps noon->midnight every
+      // couple of minutes and reads as strobing while you fast-forward construction. Sim, crews,
+      // traffic, and growth all still honor the full selected speed; only lighting stays calm.
+      atmosphere.update(dt * atmosphereTimeScale(loop.timeScale));
       // Task 46 (Groundwork stutter fix): ConstructionRenderer's vehicle position/heading damping
       // needs to know how much SIM time this rendered frame actually covered (see
       // ConstructionRenderer.update's `timeScale` param doc) — but its many wall-clock-calibrated

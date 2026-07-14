@@ -1,5 +1,17 @@
 export const SUNRISE_TIME = 1 / 6;
 export const SUNSET_TIME = 5 / 6;
+
+// Calm lighting at fast-forward: at a raw 16x the full day/night cycle sweeps past every couple
+// of minutes and the lighting reads as strobing — noon to midnight and back while you watch one
+// road build. The ATMOSPHERE clock therefore caps at 4x no matter how fast the sim runs; crews,
+// traffic, and growth still honor the full HUD speed. Lives here (not atmosphere.ts) so tests can
+// import it without pulling in the DOM-touching sky/quality modules.
+export const ATMOSPHERE_MAX_TIMESCALE = 4;
+
+/** The time scale the atmosphere actually advances at for a given sim (HUD) time scale. */
+export function atmosphereTimeScale(simTimeScale: number): number {
+  return Math.min(simTimeScale, ATMOSPHERE_MAX_TIMESCALE);
+}
 const DAY_SPAN = SUNSET_TIME - SUNRISE_TIME; // two thirds of the cycle
 const NIGHT_SPAN = 1 - DAY_SPAN; // one third of the cycle
 
