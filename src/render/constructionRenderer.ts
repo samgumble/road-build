@@ -2275,7 +2275,7 @@ export class ConstructionRenderer {
 
   constructor(
     private scene: THREE.Scene,
-    bus: EventBus,
+    private bus: EventBus,
     private graph: RoadGraph,
     private hf: Heightfield,
     private roadRenderer: RoadRenderer,
@@ -2917,6 +2917,13 @@ export class ConstructionRenderer {
     this.roadRenderer.setBridgeMask(crossing.edgeId, crossing.settledUpTo);
     this.roadRenderer.markSpanSettled(crossing.edgeId, crossing.runFromDist, crossing.activeSpanIdx);
     crossing.activeSpanIdx = null;
+    // Audio hook: one settle thunk per landed span (ambient.ts pans it by world x).
+    const edge = this.graph.edges.get(crossing.edgeId);
+    if (edge) {
+      const mid = (crossing.segmentFrom + crossing.segmentTo) / 2;
+      const p = sampleAt(edge.samples, mid);
+      this.bus.emit('construction:deckSettled', { edgeId: crossing.edgeId, x: p.pos.x, z: p.pos.z });
+    }
   }
 
   private emitDust(x: number, y: number, z: number): void {

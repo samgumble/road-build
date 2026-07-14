@@ -96,6 +96,32 @@ describe('context-sensitive roadside detail planning', () => {
     expect(planRoadsideDetails(graph, terrain, [])).toEqual(plan); // deterministic
   });
 
+  it('never plants any roadside prop inside any road corridor, even at acute junction angles', () => {
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, sampler);
+    // ~27-degree fork: a station prop offset 5.1u from its OWN road lands squarely on the
+    // neighboring arm's asphalt when only a fixed node-radius exclusion applies.
+    graph.commitChain([{ x: 0, z: 0 }, { x: 24, z: 0 }, { x: 48, z: 0 }]);
+    graph.commitChain([{ x: 24, z: 0 }, { x: 56, z: 16 }]);
+    for (const edge of graph.edges.values()) edge.stage = 'painted';
+    const flat = { heightAt: () => 0, isLand: () => true };
+    const settlements = [{ id: 1, kind: 'building' as const, x: 36, z: 8 }];
+
+    const plan = planRoadsideDetails(graph, flat, settlements);
+    const props = [
+      ...plan.gravelScatter, ...plan.reflectors, ...plan.utilityPoles, ...plan.streetlamps,
+      ...plan.culverts, ...plan.signs, ...plan.guardrails, ...plan.retainingWalls,
+    ];
+    expect(props.length).toBeGreaterThan(0);
+    for (const prop of props) {
+      for (const edge of graph.edges.values()) {
+        for (const s of edge.samples) {
+          expect(Math.hypot(s.x - prop.x, s.z - prop.z)).toBeGreaterThan(3 - 1e-6);
+        }
+      }
+    }
+  });
+
   it('keeps cosmetic roadside props out of intersection aprons', () => {
     const bus = new EventBus();
     const graph = new RoadGraph(bus, sampler);

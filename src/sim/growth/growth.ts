@@ -1068,7 +1068,7 @@ export class GrowthSim {
           this.strandedSince.delete(r.id);
           this.fadingSince.delete(r.id);
           this.clearingSince.set(r.id, this.simTime);
-          this.bus.emit('growth:cleared', { id: r.id });
+          this.bus.emit('growth:cleared', { id: r.id, kind: r.kind });
         }
       }
     }

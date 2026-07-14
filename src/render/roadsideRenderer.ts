@@ -135,6 +135,22 @@ export function planRoadsideDetails(
     }
   }
 
+  // Corridor guard: NO planned pose may stand on any developed road surface. Poses offset from
+  // their own edge are safe by construction, but at acute junction angles (or dense networks) a
+  // pose 5.1u out from one road lands squarely on a NEIGHBORING road's asphalt — fixed
+  // node-radius exclusions can't catch that. Cheap enough: runs only on plan rebuilds.
+  const corridorClear = ROAD_WIDTH / 2 + 0.3;
+  const onAnyRoad = (pose: DetailPose): boolean => {
+    for (const edge of graph.edges.values()) {
+      if (!developed(edge.stage, 'graded')) continue;
+      for (const s of edge.samples) {
+        const dx = s.x - pose.x, dz = s.z - pose.z;
+        if (dx * dx + dz * dz <= corridorClear * corridorClear) return true;
+      }
+    }
+    return false;
+  };
+
   for (const node of graph.nodes.values()) {
     const edgeIds = graph.edgesAtNode(node.id);
     const painted = edgeIds.some((id) => {
@@ -146,7 +162,16 @@ export function planRoadsideDetails(
     const first = graph.edges.get(edgeIds[0]);
     const heading = first ? headingAt(first.samples, first.a === node.id ? 0 : first.samples.length - 1) : 0;
     const sample = { x: node.x, y, z: node.z, bridge: false };
-    plan.signs.push(poseAt(sample, heading, 1, terrain));
+    // the naive verge side may be occupied by another arm's asphalt at a junction — take the
+    // first side that stands clear (skip the sign entirely if the node is fully boxed in)
+    const signPose = [1, -1]
+      .map((side) => poseAt(sample, heading, side, terrain))
+      .find((pose) => !onAnyRoad(pose));
+    if (signPose) plan.signs.push(signPose);
+  }
+
+  for (const key of Object.keys(plan) as Array<keyof RoadsidePlan>) {
+    plan[key] = plan[key].filter((pose) => !onAnyRoad(pose));
   }
 
   return plan;

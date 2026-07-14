@@ -51,11 +51,13 @@ export interface GameEvents {
   // just trees. `growth:remove` (already existing, additive to no consumer) still fires once the
   // fade completes, same as stranded decay's own removal — NOT rescuable: `growth:rescued` is never
   // emitted for a record cleared this way, even if the road that cleared it is later demolished.
-  'growth:cleared': { id: number };
+  'growth:cleared': { id: number; kind?: 'tree' | 'field' | 'house' | 'building' | 'park' };
   'atmosphere:phase': { night: boolean };
   // Task 31: ambient wilderness clearing. `indices` are positions into the WildernessTree[] array
   // the renderer/sim were both constructed with (stable per tree for the life of the world).
   'wilderness:cleared': { indices: number[] };
+  /** One bridge deck span landed (crane settle) — audio plays a thunk panned by world x. */
+  'construction:deckSettled': { edgeId: number; x: number; z: number };
   // Task 34: quarry landmark placed (first road commit ever, or replayed on restore — see
   // src/sim/quarry.ts). Additive event; renderers build the pad+prop in response.
   'quarry:placed': { x: number; z: number; rot: number };
