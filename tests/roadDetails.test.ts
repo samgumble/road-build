@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as THREE from 'three';
-import { RoadRenderer } from '../src/render/roadRenderer';
+import { RoadRenderer, buildRibbonGeometry } from '../src/render/roadRenderer';
 import { RoadGraph } from '../src/sim/roads/graph';
 import { EventBus } from '../src/core/events';
 import { Heightfield } from '../src/sim/terrain/heightfield';
@@ -70,6 +70,29 @@ describe('road integration details', () => {
     const bounds = ditch.geometry.boundingBox!;
     expect(bounds.max.z - bounds.min.z).toBeGreaterThan(ROAD_WIDTH + 3);
     expect(ditch.userData.weatherSurface).toBe('earth');
+  });
+
+  it('drapes conforming ribbons onto the terrain: up-slope they sit on the grass, down-slope they never sink below road height', () => {
+    const samples: RoadSample[] = [];
+    for (let x = 0; x <= 48; x += 2) samples.push({ x, y: 1, z: 0, bridge: false });
+    const crossSlope = (_x: number, z: number) => z * 0.5; // terrain rises with +z, falls with -z
+
+    // uphill verge (offset +6, width 4 -> vertices at z in [4, 8]): terrain is ABOVE road height,
+    // so every vertex must follow the terrain surface rather than floating at road height.
+    const uphill = buildRibbonGeometry(samples, 4, 0.02, 0, 48, 6, false, false, undefined, crossSlope);
+    const up = uphill.getAttribute('position') as THREE.BufferAttribute;
+    expect(up.count).toBeGreaterThan(0);
+    for (let i = 0; i < up.count; i++) {
+      expect(up.getY(i)).toBeCloseTo(Math.max(1, up.getZ(i) * 0.5) + 0.02, 3);
+    }
+
+    // downhill verge (offset -6): terrain is BELOW road height — the strip must clamp to road
+    // height rather than dropping under the asphalt edge.
+    const downhill = buildRibbonGeometry(samples, 4, 0.02, 0, 48, -6, false, false, undefined, crossSlope);
+    const down = downhill.getAttribute('position') as THREE.BufferAttribute;
+    for (let i = 0; i < down.count; i++) {
+      expect(down.getY(i)).toBeCloseTo(1.02, 3);
+    }
   });
 
   it('does not float drainage ditches beside bridge decks', () => {

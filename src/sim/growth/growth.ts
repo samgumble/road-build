@@ -808,7 +808,12 @@ export class GrowthSim {
           if (level < th.value) break;
           if (mask & th.bit) continue;
           this.spawnMask[idx] |= th.bit;
-          if (th.kind === 'tree') {
+          if (th.kind === 'field') {
+            // Field/grass patches no longer spawn (removed per repeated player feedback — "remove
+            // grass spawning from the environment growth"). The bit is still consumed so the cell
+            // isn't re-rolled; `placeField` stays for parks, and saved field records still restore.
+            continue;
+          } else if (th.kind === 'tree') {
             // Thinned + scattered (see TREE_SPAWN_CHANCE) so corridors read as woodland, not a
             // hedge; the bit is still set above so a skipped cell isn't re-rolled every frame.
             if (this.rng() >= TREE_SPAWN_CHANCE) continue;

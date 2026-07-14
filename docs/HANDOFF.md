@@ -65,10 +65,14 @@ assuming a green build means the page is live.
 - The site-command toolbar can collapse to a single `Show Controls` button. Its state persists under
   `groundwork-toolbar-collapsed`; keep the restore action outside `.gw-toolbar-controls` so a
   collapsed toolbar can never strand the player without a way to reopen it.
-- Procedural fields are 10×10 squares (`FIELD_SIZE` is shared by GrowthSim and SceneryRenderer),
-  not point records. Spawn clearance uses the field circumradius plus the road half-width/verge,
-  and corridor clearing adds the same footprint radius. Preserve both halves of that invariant or
-  field grass can overlap an existing/new road even while its center passes a point-distance check.
+- Fields NO LONGER SPAWN (2026-07-13, per repeated player feedback: "remove grass spawning from
+  the environment growth") — the 'field' threshold bit is consumed with no record. Everything
+  field-shaped survives for other users of it: `placeField` places parks, field records from OLD
+  SAVES still restore/render/decay, and the footprint rule below still governs both. Fields are
+  10×10 squares (`FIELD_SIZE` is shared by GrowthSim and SceneryRenderer), not point records.
+  Spawn clearance uses the field circumradius plus the road half-width/verge, and corridor
+  clearing adds the same footprint radius. Preserve both halves of that invariant or park/field
+  grass can overlap an existing/new road even while its center passes a point-distance check.
 - Rain darkens and lowers the roughness of existing road materials by surface type. Dry weather
   is an exact authored-material reset, and fresh asphalt/paint curing composes with wetness rather
   than being overwritten by it.
@@ -76,6 +80,10 @@ assuming a green build means the page is live.
   ribbon under the authoritative road surface; bridge runs are subtracted so verges never float
   beside decks. Painted roads add two tire-wear strips merged into one geometry/draw call. Both
   detail types are tagged into the existing weather lifecycle and disposed through `EdgeVisual.meshes`.
+  Shoulder and ditch ribbons DRAPE onto the terrain via `buildRibbonGeometry`'s `conformTo`
+  parameter — per-vertex `max(road height, terrain height)` — so on a cross-slope they sit on the
+  grass uphill and clamp to road height downhill instead of floating/burying. The road ribbon and
+  deck never use `conformTo` (grading is the authority for the surface itself).
 - Roadside-realism pass: ground roads add shallow drainage ditches; a fixed 11-pool instanced
   `RoadsideRenderer` derives culverts, retaining walls, guardrails, curve reflectors, junction
   signs/aprons, settlement utility poles, and gravel scatter from graph/terrain/growth context.
@@ -148,6 +156,11 @@ assuming a green build means the page is live.
 - **Render lifetime:** Instanced scenery slot compaction must purge all animations referencing a
   freed instance. Construction dressing is pooled and must dispose cleanly.
 - **Mobile UI:** Retain ≥44px touch targets, safe-area padding, and no browser-page pinch zoom.
+- **No sustained synthesized tones, ever:** three separate "background drone" reports were traced
+  to (1) the engine-rumble noise loop, (2) the synth pad — even after being demoted to an
+  offline-only fallback — and (3) the day-shimmer sine. All are gone. Music is real tracks only;
+  synthesis is reserved for one-shots and short gated pulses (plucks, blips, beeper, chatter,
+  chimes). Do not add a new continuous oscillator or looping noise bed for any reason.
 - **Launch flow:** Start-screen art is decorative; title/actions must stay real HTML. Keep the HUD
   inert and the sim paused until dismissal, let secondary buttons receive their own Enter/Space,
   and preserve a reduced-motion path.
