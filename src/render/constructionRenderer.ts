@@ -24,6 +24,8 @@ const ROAD_WIDTH_HALF = ROAD_WIDTH / 2;
 const CAB_COLOR = '#e8641b';
 const BODY_COLOR = '#3c3f41';
 const WHEEL_COLOR = '#1c1d1e';
+const GLASS_COLOR = '#16262d';
+const STEEL_COLOR = '#666d70';
 const BEACON_COLOR = '#ffb020';
 
 const BEACON_HZ = 2;
@@ -256,7 +258,8 @@ function flatMat(color: string, emissive?: string): THREE.MeshStandardMaterial {
 
 function wheelCylinder(radius: number, width: number): THREE.CylinderGeometry {
   const geo = new THREE.CylinderGeometry(radius, radius, width, 10);
-  geo.rotateZ(Math.PI / 2);
+  // Vehicle-local +X is forward, so the axle runs across the machine on local Z.
+  geo.rotateX(Math.PI / 2);
   return geo;
 }
 
@@ -373,7 +376,8 @@ interface VehicleRig {
 
 function addBeacon(parent: THREE.Object3D, y: number): THREE.MeshStandardMaterial {
   const mat = flatMat(BEACON_COLOR, BEACON_COLOR);
-  const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.35, 8, 6), mat);
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.16, 8, 6), mat);
+  mesh.name = 'construction-warning-beacon';
   mesh.position.set(0, y, 0);
   parent.add(mesh);
   return mat;
@@ -381,19 +385,37 @@ function addBeacon(parent: THREE.Object3D, y: number): THREE.MeshStandardMateria
 
 function buildExcavator(): VehicleRig {
   const group = new THREE.Group();
+  group.name = 'construction-model-excavator';
   const body = new THREE.Group(); // slope pitch/roll + accel dip applied here, wheels/tracks are children so they tilt with the chassis but spin independently
+  body.name = 'excavator-chassis';
   group.add(body);
   const materials: THREE.MeshStandardMaterial[] = [];
   const bodyMat = flatMat(BODY_COLOR);
   const cabMat = flatMat(CAB_COLOR);
   const wheelMat = flatMat(WHEEL_COLOR);
   const treadMat = flatMat('#151515');
-  materials.push(bodyMat, cabMat, wheelMat, treadMat);
+  const glassMat = flatMat(GLASS_COLOR);
+  glassMat.roughness = 0.32;
+  const steelMat = flatMat(STEEL_COLOR);
+  steelMat.metalness = 0.35;
+  materials.push(bodyMat, cabMat, wheelMat, treadMat, glassMat, steelMat);
 
-  // tracked base
-  const base = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.6, 1.8), wheelMat);
-  base.position.y = 0.3;
+  // Narrow central undercarriage plus two separately readable crawler tracks.
+  const base = new THREE.Mesh(new THREE.BoxGeometry(2.35, 0.32, 1.15), bodyMat);
+  base.position.y = 0.46;
   body.add(base);
+  const trackGeo = new THREE.BoxGeometry(2.75, 0.55, 0.4);
+  for (const [side, z] of [['left', 0.72], ['right', -0.72]] as const) {
+    const track = new THREE.Mesh(trackGeo, treadMat);
+    track.name = `excavator-${side}-track`;
+    track.position.set(0, 0.3, z);
+    body.add(track);
+    for (const x of [-0.82, 0, 0.82]) {
+      const bogie = new THREE.Mesh(wheelCylinder(0.2, 0.08), steelMat);
+      bogie.position.set(x, 0.3, z + (side === 'left' ? 0.215 : -0.215));
+      body.add(bogie);
+    }
+  }
 
   // Subtle "rolling track" illusion: two alternating tread boxes along each side of the base that
   // step forward/reset in a sawtooth, giving the impression of a moving tread without UV scroll
@@ -401,48 +423,83 @@ function buildExcavator(): VehicleRig {
   // stepping reads as continuous motion rather than a pop.
   const treadGeo = new THREE.BoxGeometry(0.5, 0.12, 1.9);
   const trackTreadA = new THREE.Mesh(treadGeo, treadMat);
+  trackTreadA.name = 'excavator-moving-tread-a';
   trackTreadA.position.set(0.6, 0.62, 0);
   body.add(trackTreadA);
   const trackTreadB = new THREE.Mesh(treadGeo, treadMat);
+  trackTreadB.name = 'excavator-moving-tread-b';
   trackTreadB.position.set(-0.6, 0.62, 0);
   body.add(trackTreadB);
 
   // rotating cab (turret) — yaws toward the dump side during the dig cycle
   const cab = new THREE.Group();
+  cab.name = 'excavator-cab-pivot';
   cab.position.y = 0.6;
   body.add(cab);
 
-  const cabBody = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.9, 1.5), cabMat);
-  cabBody.position.set(-0.2, 0.45, 0);
+  const turntable = new THREE.Mesh(new THREE.CylinderGeometry(0.78, 0.9, 0.24, 12), bodyMat);
+  turntable.position.y = 0.08;
+  cab.add(turntable);
+  const cabBody = new THREE.Mesh(new THREE.BoxGeometry(1.45, 0.82, 1.32), cabMat);
+  cabBody.position.set(-0.28, 0.56, 0);
   cab.add(cabBody);
+  const counterweight = new THREE.Mesh(new THREE.CylinderGeometry(0.68, 0.78, 0.78, 10), cabMat);
+  counterweight.name = 'excavator-counterweight';
+  counterweight.rotation.z = Math.PI / 2;
+  counterweight.position.set(-0.92, 0.48, 0);
+  cab.add(counterweight);
+  const window = new THREE.Mesh(new THREE.BoxGeometry(0.54, 0.48, 1.35), glassMat);
+  window.name = 'excavator-window';
+  window.position.set(0.18, 0.7, 0);
+  cab.add(window);
+  const roof = new THREE.Mesh(new THREE.BoxGeometry(0.78, 0.12, 1.42), cabMat);
+  roof.position.set(-0.05, 1.02, 0);
+  cab.add(roof);
 
   // Boom pivot (shoulder): sits at the front of the cab; boomArm mesh is offset so it extends
   // away from the pivot rather than rotating about its own center.
   const boom = new THREE.Group();
+  boom.name = 'excavator-boom-pivot';
   boom.position.set(0.6, 0.7, 0);
   cab.add(boom);
 
-  const boomArm = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.35, 0.35), bodyMat);
+  const boomArm = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.38, 0.42), cabMat);
   boomArm.position.set(1.0, 0, 0);
   boom.add(boomArm);
+  const boomRam = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 1.45, 8), steelMat);
+  boomRam.rotation.z = Math.PI / 2;
+  boomRam.position.set(0.75, -0.26, 0);
+  boom.add(boomRam);
 
   // Stick pivot (elbow): positioned at the boom's far end, rotates independently of the boom.
   const stick = new THREE.Group();
+  stick.name = 'excavator-stick-pivot';
   stick.position.set(2.0, 0, 0);
   boom.add(stick);
 
-  const stickArm = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.28, 0.28), bodyMat);
+  const stickArm = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.28, 0.32), cabMat);
   stickArm.position.set(0.7, 0, 0);
   stick.add(stickArm);
 
   // Bucket pivot (wrist): at the stick's far end.
   const bucket = new THREE.Group();
+  bucket.name = 'excavator-bucket-pivot';
   bucket.position.set(1.4, 0, 0);
   stick.add(bucket);
 
-  const bucketMesh = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 0.6), bodyMat);
+  const bucketMesh = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 0.72), steelMat);
   bucketMesh.position.set(0.25, -0.25, 0);
+  bucketMesh.rotation.z = -0.18;
   bucket.add(bucketMesh);
+  const teeth = new THREE.Group();
+  teeth.name = 'excavator-bucket-teeth';
+  teeth.position.set(0.63, -0.5, 0);
+  for (const z of [-0.24, 0, 0.24]) {
+    const tooth = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.09, 0.09), steelMat);
+    tooth.position.z = z;
+    teeth.add(tooth);
+  }
+  bucket.add(teeth);
 
   const beaconMat = addBeacon(cab, 1.05);
 
@@ -464,6 +521,7 @@ function buildExcavator(): VehicleRig {
 
 function buildTruck(): VehicleRig {
   const group = new THREE.Group();
+  group.name = 'construction-model-truck';
   const body = new THREE.Group();
   group.add(body);
   const materials: THREE.MeshStandardMaterial[] = [];
@@ -471,22 +529,47 @@ function buildTruck(): VehicleRig {
   const cabMat = flatMat(CAB_COLOR);
   const wheelMat = flatMat(WHEEL_COLOR);
   const gravelMat = flatMat(GRAVEL_COLOR);
-  materials.push(bodyMat, cabMat, wheelMat, gravelMat);
+  const glassMat = flatMat(GLASS_COLOR);
+  glassMat.roughness = 0.32;
+  materials.push(bodyMat, cabMat, wheelMat, gravelMat, glassMat);
 
-  const cab = new THREE.Mesh(new THREE.BoxGeometry(1.2, 1.1, 1.5), cabMat);
-  cab.position.set(1.4, 0.85, 0);
+  const chassis = new THREE.Mesh(new THREE.BoxGeometry(3.7, 0.24, 0.78), wheelMat);
+  chassis.position.set(-0.1, 0.56, 0);
+  body.add(chassis);
+  const cab = new THREE.Mesh(new THREE.BoxGeometry(1.25, 1.15, 1.48), cabMat);
+  cab.name = 'dump-truck-cab';
+  cab.position.set(1.45, 1.03, 0);
   body.add(cab);
+  const hood = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.52, 1.34), cabMat);
+  hood.position.set(2.34, 0.83, 0);
+  body.add(hood);
+  const windshield = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.58, 1.18), glassMat);
+  windshield.name = 'dump-truck-windshield';
+  windshield.position.set(2.08, 1.2, 0);
+  body.add(windshield);
 
   // tipping bed pivot: hinge sits at the bed's rear-bottom edge so the bed rotates up and back,
   // dumping "out the tailgate" (-x, rear of the vehicle in local space).
   const bedPivot = new THREE.Group();
+  bedPivot.name = 'dump-truck-bed-pivot';
   bedPivot.position.set(-1.9, 0.45, 0);
   body.add(bedPivot);
 
-  const bed = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.9, 1.7), bodyMat);
+  const bed = new THREE.Mesh(new THREE.BoxGeometry(2.65, 0.82, 1.72), bodyMat);
   bed.position.set(1.3, 0.45, 0);
   bed.rotation.z = 0.05;
   bedPivot.add(bed);
+  const bedRibs = new THREE.Group();
+  bedRibs.name = 'dump-truck-bed-ribs';
+  bedRibs.position.set(1.3, 0.45, 0);
+  for (const x of [-0.95, -0.32, 0.32, 0.95]) {
+    for (const z of [-0.88, 0.88]) {
+      const rib = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.86, 0.08), cabMat);
+      rib.position.set(x, 0, z);
+      bedRibs.add(rib);
+    }
+  }
+  bedPivot.add(bedRibs);
 
   // Spoil mound: scales 0->1 in the bed as the excavator's dig cycle deposits loads (deliverable
   // 3). Parented to bedPivot so it tips out with the bed during the gravel-deposit animation.
@@ -495,28 +578,33 @@ function buildTruck(): VehicleRig {
   spoilMesh.scale.setScalar(0.001);
   bedPivot.add(spoilMesh);
 
-  const wheelGeo = wheelCylinder(0.45, 1.9);
+  const wheelGeo = wheelCylinder(0.45, 0.3);
   const wheels: WheelRef[] = [];
-  for (const x of [-1.3, 0, 1.4]) {
-    const wheel = new THREE.Mesh(wheelGeo, wheelMat);
-    wheel.position.set(x, 0.45, 0);
-    body.add(wheel);
-    wheels.push({ mesh: wheel, radius: 0.45 });
+  for (const [axle, x] of [['rear', -1.35], ['middle', -0.55], ['front', 1.55]] as const) {
+    for (const [side, z] of [['left', 0.78], ['right', -0.78]] as const) {
+      const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+      wheel.name = `dump-truck-${axle}-${side}-wheel`;
+      wheel.position.set(x, 0.45, z);
+      body.add(wheel);
+      wheels.push({ mesh: wheel, radius: 0.45 });
+    }
   }
 
-  const beaconMat = addBeacon(cab, 0.9);
+  const beaconMat = addBeacon(cab, 0.68);
 
   return { kind: 'truck', group, body, beaconMat, wheels, materials, bedPivot, spoilMesh };
 }
 
 function buildPaver(): VehicleRig {
   const group = new THREE.Group();
+  group.name = 'construction-model-paver';
   const body = new THREE.Group();
   group.add(body);
   const materials: THREE.MeshStandardMaterial[] = [];
   const bodyMat = flatMat(BODY_COLOR);
   const cabMat = flatMat(CAB_COLOR);
   const wheelMat = flatMat(WHEEL_COLOR);
+  const glassMat = flatMat(GLASS_COLOR);
   const matMat = new THREE.MeshStandardMaterial({
     color: MAT_COLOR,
     roughness: 0.25,
@@ -524,30 +612,62 @@ function buildPaver(): VehicleRig {
     transparent: true,
     opacity: 0,
   });
-  materials.push(bodyMat, cabMat, wheelMat, matMat);
+  materials.push(bodyMat, cabMat, wheelMat, glassMat, matMat);
 
   // low slab chassis
   const slab = new THREE.Mesh(new THREE.BoxGeometry(2.8, 0.4, 1.9), bodyMat);
   slab.position.y = 0.3;
   body.add(slab);
 
-  // hopper at the front (direction of travel is +x in local space)
-  const hopper = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.7, 1.8), bodyMat);
-  hopper.position.set(1.2, 0.65, 0);
+  // Split hopper wings make the receiving mouth readable from the overview camera.
+  const hopper = new THREE.Group();
+  hopper.name = 'paver-hopper';
+  hopper.position.set(1.25, 0.66, 0);
   body.add(hopper);
-
-  const cab = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.7, 1.1), cabMat);
-  cab.position.set(-0.6, 0.75, 0);
-  body.add(cab);
-
-  const trackGeo = wheelCylinder(0.35, 1.7);
-  const wheels: WheelRef[] = [];
-  for (const x of [-1.1, 0.9]) {
-    const track = new THREE.Mesh(trackGeo, wheelMat);
-    track.position.set(x, 0.2, 0);
-    body.add(track);
-    wheels.push({ mesh: track, radius: 0.35 });
+  for (const z of [-0.58, 0.58]) {
+    const wing = new THREE.Mesh(new THREE.BoxGeometry(1.05, 0.7, 0.72), bodyMat);
+    wing.position.z = z;
+    wing.rotation.x = z > 0 ? -0.22 : 0.22;
+    hopper.add(wing);
   }
+
+  const platform = new THREE.Group();
+  platform.name = 'paver-operator-platform';
+  platform.position.set(-0.55, 0.78, 0);
+  body.add(platform);
+  const console = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.62, 1.05), cabMat);
+  platform.add(console);
+  const consoleGlass = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.32, 0.86), glassMat);
+  consoleGlass.position.set(0.39, 0.12, 0);
+  platform.add(consoleGlass);
+  const canopy = new THREE.Group();
+  canopy.name = 'paver-canopy';
+  canopy.position.set(-0.55, 1.62, 0);
+  body.add(canopy);
+  const roof = new THREE.Mesh(new THREE.BoxGeometry(1.25, 0.12, 1.55), cabMat);
+  canopy.add(roof);
+  for (const z of [-0.62, 0.62]) {
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.82, 0.08), cabMat);
+    post.position.set(-0.35, -0.42, z);
+    canopy.add(post);
+  }
+
+  const trackShellGeo = new THREE.BoxGeometry(2.35, 0.52, 0.34);
+  const wheels: WheelRef[] = [];
+  for (const [side, z] of [['left', 0.72], ['right', -0.72]] as const) {
+    const track = new THREE.Mesh(trackShellGeo, wheelMat);
+    track.name = `paver-${side}-track`;
+    track.position.set(-0.05, 0.28, z);
+    body.add(track);
+    const drive = new THREE.Mesh(wheelCylinder(0.28, 0.1), wheelMat);
+    drive.position.set(0.72, 0.28, z + (side === 'left' ? 0.2 : -0.2));
+    body.add(drive);
+    wheels.push({ mesh: drive, radius: 0.28 });
+  }
+  const screed = new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.22, 2.25), wheelMat);
+  screed.name = 'paver-screed';
+  screed.position.set(-1.72, 0.22, 0);
+  body.add(screed);
 
   // Fresh-asphalt mat: a short glossy quad trailing the paver's rear, parented to `group` (not
   // `body`) so it stays screen-flat regardless of chassis pitch/roll — it represents freshly laid
@@ -558,13 +678,14 @@ function buildPaver(): VehicleRig {
   matMesh.position.set(-1.8, 0.06, 0);
   group.add(matMesh);
 
-  const beaconMat = addBeacon(cab, 0.5);
+  const beaconMat = addBeacon(canopy, 0.18);
 
   return { kind: 'paver', group, body, beaconMat, wheels, materials, matMesh, matMat };
 }
 
 function buildRoller(): VehicleRig {
   const group = new THREE.Group();
+  group.name = 'construction-model-roller';
   const body = new THREE.Group();
   group.add(body);
   const materials: THREE.MeshStandardMaterial[] = [];
@@ -575,6 +696,7 @@ function buildRoller(): VehicleRig {
 
   // big front drum
   const drum = new THREE.Mesh(wheelCylinder(0.65, 1.8), drumMat);
+  drum.name = 'roller-front-drum';
   drum.position.set(1.1, 0.65, 0);
   body.add(drum);
 
@@ -582,16 +704,29 @@ function buildRoller(): VehicleRig {
   chassis.position.set(-0.5, 0.75, 0);
   body.add(chassis);
 
-  const cab = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.7, 1.0), cabMat);
-  cab.position.set(-0.8, 1.25, 0);
-  body.add(cab);
+  const seat = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.58, 0.62), cabMat);
+  seat.name = 'roller-operator-seat';
+  seat.position.set(-0.55, 1.28, 0);
+  body.add(seat);
 
-  const rearWheelGeo = wheelCylinder(0.5, 1.6);
+  const rearWheelGeo = wheelCylinder(0.52, 1.58);
   const rearWheel = new THREE.Mesh(rearWheelGeo, drumMat);
+  rearWheel.name = 'roller-rear-drum';
   rearWheel.position.set(-1.3, 0.5, 0);
   body.add(rearWheel);
+  const canopy = new THREE.Group();
+  canopy.name = 'roller-rollover-canopy';
+  canopy.position.set(-0.55, 1.9, 0);
+  body.add(canopy);
+  const canopyRoof = new THREE.Mesh(new THREE.BoxGeometry(1.35, 0.12, 1.42), cabMat);
+  canopy.add(canopyRoof);
+  for (const x of [-0.45, 0.45]) for (const z of [-0.54, 0.54]) {
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.07, 1.05, 0.07), cabMat);
+    post.position.set(x, -0.53, z);
+    canopy.add(post);
+  }
 
-  const beaconMat = addBeacon(cab, 0.5);
+  const beaconMat = addBeacon(canopy, 0.18);
 
   const wheels: WheelRef[] = [
     { mesh: drum, radius: 0.65 },
@@ -1565,6 +1700,7 @@ function buildWorkerFigure(): WorkerRig {
  * leveling the ribbon the sim already renders (no geometry change needed). */
 function buildGrader(): VehicleRig {
   const group = new THREE.Group();
+  group.name = 'construction-model-grader';
   const body = new THREE.Group();
   group.add(body);
   const materials: THREE.MeshStandardMaterial[] = [];
@@ -1572,47 +1708,75 @@ function buildGrader(): VehicleRig {
   const cabMat = flatMat(CAB_COLOR);
   const wheelMat = flatMat(WHEEL_COLOR);
   const bladeMat = flatMat('#4a4a4a');
-  materials.push(bodyMat, cabMat, wheelMat, bladeMat);
+  const glassMat = flatMat(GLASS_COLOR);
+  glassMat.roughness = 0.32;
+  materials.push(bodyMat, cabMat, wheelMat, bladeMat, glassMat);
 
-  const frame = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.35, 0.9), bodyMat);
-  frame.position.set(0, 0.55, 0);
+  const frame = new THREE.Mesh(new THREE.BoxGeometry(3.7, 0.24, 0.48), bodyMat);
+  frame.position.set(0.05, 0.68, 0);
   body.add(frame);
 
-  const hood = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.5, 0.7), bodyMat);
-  hood.position.set(1.5, 0.65, 0);
+  const hood = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.58, 0.8), bodyMat);
+  hood.position.set(-1.18, 0.85, 0);
   body.add(hood);
 
-  const cab = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.8, 0.9), cabMat);
-  cab.position.set(0.1, 1.05, 0);
+  const cab = new THREE.Group();
+  cab.name = 'grader-cab';
+  cab.position.set(-0.35, 1.26, 0);
   body.add(cab);
+  const cabCore = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.78, 0.92), cabMat);
+  cab.add(cabCore);
+  const cabWindow = new THREE.Mesh(new THREE.BoxGeometry(0.94, 0.44, 0.7), glassMat);
+  cabWindow.name = 'grader-window';
+  cabWindow.position.y = 0.1;
+  cab.add(cabWindow);
+  const cabRoof = new THREE.Mesh(new THREE.BoxGeometry(1.02, 0.1, 1.04), bodyMat);
+  cabRoof.position.y = 0.44;
+  cab.add(cabRoof);
 
-  // angled center blade, lowered near the ground just ahead of the front axle
-  const blade = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.5, 1.8), bladeMat);
-  blade.position.set(0.55, 0.28, 0);
-  blade.rotation.y = THREE.MathUtils.degToRad(20); // angled to cast material to one side
-  body.add(blade);
+  // Named drawbar/circle/blade assembly gives the grader its characteristic waist.
+  const bladeAssembly = new THREE.Group();
+  bladeAssembly.name = 'grader-circle-blade';
+  bladeAssembly.position.set(0.42, 0.3, 0);
+  bladeAssembly.rotation.y = THREE.MathUtils.degToRad(20);
+  body.add(bladeAssembly);
+  const circle = new THREE.Mesh(new THREE.TorusGeometry(0.42, 0.07, 6, 16), bladeMat);
+  circle.rotation.x = Math.PI / 2;
+  circle.position.y = 0.25;
+  bladeAssembly.add(circle);
+  const blade = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.48, 2.0), bladeMat);
+  bladeAssembly.add(blade);
 
   const strutGeo = new THREE.BoxGeometry(0.6, 0.08, 0.08);
   for (const side of [-1, 1]) {
     const strut = new THREE.Mesh(strutGeo, bodyMat);
-    strut.position.set(0.25, 0.4, side * 0.3);
+    strut.position.set(0.1, 0.5, side * 0.3);
     strut.rotation.y = THREE.MathUtils.degToRad(20);
     body.add(strut);
   }
 
   const wheelGeo = wheelCylinder(0.4, 0.3);
   const wheels: WheelRef[] = [];
+  const frontAxle = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.18, 1.22), bladeMat);
+  frontAxle.name = 'grader-front-axle';
+  frontAxle.position.set(1.72, 0.48, 0);
+  body.add(frontAxle);
+  const tandemFrame = new THREE.Mesh(new THREE.BoxGeometry(1.25, 0.2, 1.16), bladeMat);
+  tandemFrame.name = 'grader-tandem-frame';
+  tandemFrame.position.set(-1.15, 0.48, 0);
+  body.add(tandemFrame);
   // 6 wheels: 2 front (steerable in reality, decorative here), 4 rear in a tandem bogie
-  for (const [x, zs] of [[1.4, [0.5, -0.5]], [-1.1, [0.5, -0.5]], [-1.6, [0.5, -0.5]]] as [number, number[]][]) {
-    for (const z of zs) {
+  for (const [axle, x] of [['front', 1.72], ['middle', -0.82], ['rear', -1.55]] as const) {
+    for (const [side, z] of [['left', 0.64], ['right', -0.64]] as const) {
       const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+      wheel.name = `grader-${axle}-${side}-wheel`;
       wheel.position.set(x, 0.4, z);
       body.add(wheel);
       wheels.push({ mesh: wheel, radius: 0.4 });
     }
   }
 
-  const beaconMat = addBeacon(cab, 1.5);
+  const beaconMat = addBeacon(cab, 0.62);
 
   // The grader is pure render-side theater (like the roller) with no corresponding `VehicleKind` in
   // the sim's `construction:progress` contract — `kind` is never actually read anywhere in this
@@ -3146,7 +3310,7 @@ export class ConstructionRenderer {
     // rolling speed always matches actual displacement rather than a fixed animation rate. ---
     if (dist > 0.00001 && rig.wheels.length > 0) {
       for (const w of rig.wheels) {
-        w.mesh.rotation.x += dist / w.radius;
+        w.mesh.rotation.z += dist / w.radius;
       }
     }
 
@@ -3684,7 +3848,7 @@ export class ConstructionRenderer {
     rig.group.rotation.y = -(roller.rollerOscDir > 0 ? roller.curHeading : roller.curHeading + Math.PI);
 
     for (const w of rig.wheels) {
-      w.mesh.rotation.x += Math.abs(offsetDelta) / w.radius;
+      w.mesh.rotation.z += Math.abs(offsetDelta) / w.radius;
     }
 
     slot.steamTimer += dt;

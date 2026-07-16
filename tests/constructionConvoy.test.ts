@@ -48,6 +48,76 @@ function activeVehicleKinds(renderer: ConstructionRenderer, crew: number, thresh
 }
 
 describe('ConstructionRenderer convoy (Task 36)', () => {
+  it('builds readable machine-specific silhouettes with semantic animated parts', () => {
+    const { renderer, scene } = buildRig('construction-model-contract', 40);
+
+    const expectedParts: Record<string, string[]> = {
+      excavator: [
+        'excavator-left-track',
+        'excavator-right-track',
+        'excavator-counterweight',
+        'excavator-window',
+        'excavator-boom-pivot',
+        'excavator-stick-pivot',
+        'excavator-bucket-pivot',
+        'excavator-bucket-teeth',
+      ],
+      truck: [
+        'dump-truck-cab',
+        'dump-truck-windshield',
+        'dump-truck-bed-pivot',
+        'dump-truck-bed-ribs',
+        'dump-truck-front-left-wheel',
+        'dump-truck-front-right-wheel',
+        'dump-truck-rear-left-wheel',
+        'dump-truck-rear-right-wheel',
+      ],
+      paver: [
+        'paver-left-track',
+        'paver-right-track',
+        'paver-hopper',
+        'paver-operator-platform',
+        'paver-canopy',
+        'paver-screed',
+      ],
+      roller: [
+        'roller-front-drum',
+        'roller-rear-drum',
+        'roller-operator-seat',
+        'roller-rollover-canopy',
+      ],
+      grader: [
+        'grader-front-axle',
+        'grader-tandem-frame',
+        'grader-cab',
+        'grader-window',
+        'grader-circle-blade',
+      ],
+    };
+
+    for (const [kind, partNames] of Object.entries(expectedParts)) {
+      const root = scene.getObjectByName(`construction-model-${kind}`);
+      expect(root, `${kind} root`).toBeDefined();
+      for (const partName of partNames) {
+        expect(root!.getObjectByName(partName), `${kind}: ${partName}`).toBeDefined();
+      }
+    }
+
+    const truckRoot = scene.getObjectByName('construction-model-truck')!;
+    let truckWheelCount = 0;
+    truckRoot.traverse((part) => {
+      if (part.name.startsWith('dump-truck-') && part.name.endsWith('-wheel')) truckWheelCount++;
+    });
+    expect(truckWheelCount).toBe(6);
+
+    const frontDrum = scene.getObjectByName('roller-front-drum') as THREE.Mesh;
+    frontDrum.geometry.computeBoundingBox();
+    const drumSize = frontDrum.geometry.boundingBox!.getSize(new THREE.Vector3());
+    expect(drumSize.z).toBeGreaterThan(drumSize.x);
+
+    renderer.dispose();
+  });
+
   it('grounds the visible fleet with one pooled contact-shadow mesh and clears idle slots', () => {
     const { bus, renderer, scene } = buildRig('fleet-shadow-test', 40);
     const shadows = scene.getObjectByName('construction-contact-shadows') as THREE.InstancedMesh | undefined;
