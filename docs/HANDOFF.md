@@ -161,6 +161,12 @@ assuming a green build means the page is live.
   uses distance to the same painted degree-3 junction centers that boost growth morphology rather
   than distance to a road (all real parcels already share an 8–10u road setback, which made the
   previous falloff nearly inert). Simple-road settlements stay low-rise; connected centers peak.
+- Construction-fleet grounding (2026-07-15, `codex/construction-fleet-upgrade`): every visible
+  construction rig now contributes a footprint-tuned contact decal to one fixed-capacity
+  `InstancedMesh`. The pool follows the renderer's eased presentation positions/headings/scales,
+  clears idle slots every frame, and covers synthesized rollers, graders, and the shared crane
+  without adding shadow-casting lights or per-machine draw calls. The scene contract and idle
+  cleanup are pinned in `tests/constructionConvoy.test.ts`.
 
 ## Invariants worth protecting
 
