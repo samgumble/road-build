@@ -11,6 +11,7 @@ import {
   solarTimeOfDay,
   sunElevation,
 } from './solarTime';
+import { rainVisibility } from './weatherTuning';
 
 /** A single keyframe stop, at a given point in the 0..1 day cycle. */
 interface Stop {
@@ -360,18 +361,18 @@ export class Atmosphere {
 
     const skyColor = sampleStops(SKY_STOPS, this.timeOfDay);
 
-    // Densify fog 1.5x during rain, eased.
-    const fogNear = THREE.MathUtils.lerp(this.baseFogNear, this.baseFogNear / 1.5, this.rainIntensity);
-    const fogFar = THREE.MathUtils.lerp(this.baseFogFar, this.baseFogFar / 1.5, this.rainIntensity);
+    // Rain pulls fog inward and softens the sun, but a shared readability curve floors both so
+    // the strategic road network and active build fronts remain visible through a full storm.
+    const visibility = rainVisibility(this.rainIntensity, this.baseFogNear, this.baseFogFar);
 
     this.scene.background = skyColor;
     const fog = this.scene.fog as THREE.Fog;
     fog.color.copy(skyColor);
-    fog.near = fogNear;
-    fog.far = fogFar;
+    fog.near = visibility.fogNear;
+    fog.far = visibility.fogFar;
 
     // Sun intensity 0 (night) -> 1.6 (noon warm), scaled by elevation, halved during rain.
-    const sunIntensity = Math.max(0, elevationRaw) * 1.6 * (1 - 0.5 * this.rainIntensity);
+    const sunIntensity = Math.max(0, elevationRaw) * 1.6 * visibility.sunScale;
     this.sun.intensity = sunIntensity;
     this.sun.color.copy(SUN_WARM);
 

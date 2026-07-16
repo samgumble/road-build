@@ -179,6 +179,14 @@ assuming a green build means the page is live.
   cap reflection strength separately. The foam band is narrower, dimmer, and less opacity-heavy,
   while the existing depth tint, night daylight multiplier, fog, and depth-based outer fade remain
   authoritative. Shader wiring and response bounds are pinned in `tests/waterMaterial.test.ts`.
+- Weather/settlement legibility (2026-07-15, `codex/weather-settlement-legibility`): full rain now
+  floors fog at 480–720u and retains 65% of the solar key, keeping the island road network and work
+  fronts readable while roads/rain streaks still sell wet weather. High tier adds a restrained
+  0.96-saturation/1.02-contrast warm grade before the existing output pass; low tier remains direct.
+  GrowthSim reserves a 9u future-tower footprint before accepting a house, so later in-place
+  upgrades cannot create overlaps. `SceneryRenderer.rebuild` deterministically separates legacy
+  saved structures for rendering only; saved/simulation coordinates stay authoritative. Contracts
+  live in `tests/weatherLegibility.test.ts` and the settlement-placement block of `tests/growth.test.ts`.
 
 ## Invariants worth protecting
 

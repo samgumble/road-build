@@ -63,7 +63,9 @@
 - [x] Improve water depth color, shoreline foam restraint, night response, and reflection roughness.
   Depth/night/fade groundwork was retained; this pass adds rough Fresnel sky response and a more
   restrained foam band without texture samples or a reflection render pass.
-- [ ] Clamp rain/fog to a gameplay-legibility floor and add a restrained LUT/grade on high tier.
+- [x] Clamp rain/fog to a gameplay-legibility floor and add a restrained LUT/grade on high tier.
+  Storm fog/sun floors are pure tested curves; the high-tier composer adds a subtle analytic grade
+  before OutputPass while low tier keeps its direct render path.
 - [ ] Gate SSAO/contact AO behind measured ≥55fps headroom only.
 
 ## Task 6: Add camera storytelling

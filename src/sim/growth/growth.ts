@@ -297,6 +297,62 @@ export interface SpawnRecord {
   id: number;
 }
 
+// Reserve the largest possible rendered structure footprint, not only today's house mesh: every
+// house can upgrade in place to a width-scaled 5x5 tower. A 9u center gap safely contains two
+// 4.1u circumradii plus a narrow visual alley at any pair of rotations.
+export const STRUCTURE_MIN_CENTER_DISTANCE = 9;
+
+function isStructure(kind: GrowthKind): boolean {
+  return kind === 'house' || kind === 'building';
+}
+
+export function structurePlacementClear(
+  records: ReadonlyArray<Pick<SpawnRecord, 'kind' | 'x' | 'z'>>,
+  x: number,
+  z: number,
+): boolean {
+  const minDistanceSq = STRUCTURE_MIN_CENTER_DISTANCE * STRUCTURE_MIN_CENTER_DISTANCE;
+  return records.every((record) => !isStructure(record.kind) || (
+    (record.x - x) * (record.x - x) + (record.z - z) * (record.z - z) >= minDistanceSq
+  ));
+}
+
+/** Render-only migration for legacy saves authored before structure clearance existed. The first
+ * structure keeps its authoritative position; later collisions move outward from their road-facing
+ * front in deterministic rings. Simulation/save coordinates remain untouched, while reloads stop
+ * drawing two full footprints in the same space. */
+export function resolveStructureRenderLayout(records: ReadonlyArray<SpawnRecord>): SpawnRecord[] {
+  const resolved: SpawnRecord[] = [];
+  const step = STRUCTURE_MIN_CENTER_DISTANCE + 1;
+  const angleOffsets = [0, Math.PI / 6, -Math.PI / 6, Math.PI / 3, -Math.PI / 3, Math.PI / 2, -Math.PI / 2, Math.PI];
+
+  for (const record of records) {
+    if (!isStructure(record.kind) || structurePlacementClear(resolved, record.x, record.z)) {
+      resolved.push({ ...record });
+      continue;
+    }
+
+    let placed: SpawnRecord | null = null;
+    const outward = record.rot + Math.PI;
+    for (let ring = 1; ring <= 6 && !placed; ring++) {
+      for (const offset of angleOffsets) {
+        const angle = outward + offset;
+        const candidate = {
+          ...record,
+          x: record.x + Math.cos(angle) * step * ring,
+          z: record.z + Math.sin(angle) * step * ring,
+        };
+        if (structurePlacementClear(resolved, candidate.x, candidate.z)) {
+          placed = candidate;
+          break;
+        }
+      }
+    }
+    resolved.push(placed ?? { ...record });
+  }
+  return resolved;
+}
+
 function cellIndex(i: number, j: number): number {
   return j * GRID_SIZE + i;
 }
@@ -775,6 +831,11 @@ export class GrowthSim {
       ({ x, z } = this.clearOfRoads(cx + jx, cz + jz));
       rot = this.rng() * Math.PI * 2;
     }
+
+    // Consume the parcel threshold but decline the structure when its future tower footprint would
+    // collide with an existing house/building. This avoids unbounded retries or pushing a parcel
+    // into a different cell/road corridor while guaranteeing later in-place upgrades remain clear.
+    if (isStructure(kind) && !structurePlacementClear(this.records, x, z)) return;
 
     const id = this.nextRecordId++;
     this.records.push({ kind, x, z, rot, id });

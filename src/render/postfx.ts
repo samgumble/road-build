@@ -6,6 +6,7 @@ import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { VignetteShader } from 'three/examples/jsm/shaders/VignetteShader.js';
 import { PIXEL_RATIO_CAP } from './quality';
+import { RESTRAINED_GRADE } from './colorGrade';
 
 // Threshold tuned high (0.85) so daylight terrain/water/vertex-color surfaces — which sit well
 // under 1.0 in linear-before-tonemap terms even under strong sun — do NOT bloom; only genuinely
@@ -23,6 +24,37 @@ const BLOOM_RADIUS = 0.4;
 // smaller offset keeps dot(uv,uv) from reaching the target strength except right at the corners.
 const VIGNETTE_OFFSET = 0.9;
 const VIGNETTE_DARKNESS = 0.92;
+
+const RESTRAINED_GRADE_SHADER = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uSaturation: { value: RESTRAINED_GRADE.saturation },
+    uContrast: { value: RESTRAINED_GRADE.contrast },
+    uWarmth: { value: RESTRAINED_GRADE.warmth },
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    uniform float uSaturation;
+    uniform float uContrast;
+    uniform float uWarmth;
+    varying vec2 vUv;
+    void main() {
+      vec4 sampleColor = texture2D(tDiffuse, vUv);
+      float luma = dot(sampleColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+      vec3 graded = mix(vec3(luma), sampleColor.rgb, uSaturation);
+      graded = (graded - 0.5) * uContrast + 0.5;
+      graded += vec3(uWarmth, uWarmth * 0.15, -uWarmth * 0.65);
+      gl_FragColor = vec4(clamp(graded, 0.0, 1.0), sampleColor.a);
+    }
+  `,
+};
 
 export interface PostFx {
   composer: EffectComposer;
@@ -95,6 +127,10 @@ export function createPostFx(
   vignettePass.uniforms.offset.value = VIGNETTE_OFFSET;
   vignettePass.uniforms.darkness.value = VIGNETTE_DARKNESS;
   composer.addPass(vignettePass);
+
+  // A nearly neutral high-tier grade unifies terrain, water, and sky after bloom/vignette while
+  // retaining gameplay hue separation. Low tier skips the composer and therefore this pass.
+  composer.addPass(new ShaderPass(RESTRAINED_GRADE_SHADER));
 
   const outputPass = new OutputPass();
   composer.addPass(outputPass);

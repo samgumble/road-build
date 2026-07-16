@@ -3,7 +3,13 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Heightfield } from '../sim/terrain/heightfield';
 import { EventBus } from '../core/events';
-import { FIELD_SIZE, type GrowthKind, type SpawnRecord, type DecayEntry } from '../sim/growth/growth';
+import {
+  FIELD_SIZE,
+  resolveStructureRenderLayout,
+  type GrowthKind,
+  type SpawnRecord,
+  type DecayEntry,
+} from '../sim/growth/growth';
 import type { WildernessTree } from '../sim/growth/wilderness';
 
 /** Minimal shape `place()` actually needs — a `SpawnRecord` satisfies this, but so does a
@@ -1340,7 +1346,10 @@ export class SceneryRenderer {
       this.pendingFadeOffsets.set(id, { elapsed: 0, duration: CLEAR_FADE_DURATION, sink: 0 });
     }
 
-    for (const rec of spawned) {
+    // Legacy saves can contain structures authored before GrowthSim reserved footprint clearance.
+    // Resolve those render positions deterministically while leaving authoritative saved records
+    // unchanged; new live spawns already satisfy the same clearance at simulation level.
+    for (const rec of resolveStructureRenderLayout(spawned)) {
       if (this.categoryReady(rec.kind)) this.place(rec, false, rec.id);
       else this.pendingSpawns.push({ rec, animate: false, id: rec.id }); // restored — no pop-in once ready
     }
