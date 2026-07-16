@@ -23,6 +23,10 @@
 
 **Files:** `src/render/constructionRenderer.ts`, `src/render/modelManifest.ts`, `public/models/construction/*`, `tests/constructionConvoy.test.ts`
 
+- [x] Remodel the original procedural fallback excavator, grader, paver, roller, and dump truck
+      with readable machine-specific silhouettes, correctly oriented wheels/drums, and semantic
+      part names. Delivered 2026-07-15 in `codex/construction-model-upgrade`; these remain the
+      dependency-free fallback and do not complete the GLB replacement items below.
 - [ ] Replace excavator, grader, paver, roller, and dump truck in that order.
 - [ ] Preserve existing per-kind groups, target transforms, fades, shuttle ownership, lights, and disposal.
 - [ ] Map procedural states to named pivots/clips: tracks/wheels, boom, bucket, blade, hopper, roller drum.

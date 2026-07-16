@@ -167,6 +167,19 @@ assuming a green build means the page is live.
   clears idle slots every frame, and covers synthesized rollers, graders, and the shared crane
   without adding shadow-casting lights or per-machine draw calls. The scene contract and idle
   cleanup are pinned in `tests/constructionConvoy.test.ts`.
+- Construction-model remodel (2026-07-15, `codex/construction-model-upgrade`): the original
+  procedural excavator, dump truck, paver, roller, and grader fallbacks now have machine-specific
+  silhouettes and semantic parts instead of slab placeholders. The excavator gains separate
+  crawler tracks/bogies, glazing, counterweight, hydraulic ram, and bucket teeth; the truck gains a
+  framed cab, windshield, ribbed tipping bed, and six independent wheels; the paver gains split
+  hopper wings, crawler shells, operator canopy, and rear screed; the roller gains correctly
+  transverse front/rear drums plus a rollover canopy; and the grader gains a cab/window shell,
+  front axle, tandem frame, and circle/blade assembly. The shared wheel helper now aligns every
+  axle on local Z and wheel animation rotates about that same axis. Existing dig, dump, shuttle,
+  paving, rolling, grading, slope, fade, beacon, and contact-shadow behavior is unchanged. Roots
+  and animated components are named for a later GLB pivot binding; the manifest/async GLB layer in
+  the graphics roadmap is still future work. `tests/constructionConvoy.test.ts` pins the semantic
+  part inventory, six-wheel truck layout, and transverse drum geometry.
 - Terrain-material depth (2026-07-15, `codex/terrain-material-upgrade`): the terrain vertex palette
   now crossfades sand, grass, highland grass, and rock instead of snapping at fixed bands. A
   deterministic world-space value field gently varies the cliff threshold and albedo, while the
