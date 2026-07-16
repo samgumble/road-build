@@ -74,6 +74,85 @@ describe('RoadGraph', () => {
     expect(g.edges.size).toBe(0);
   });
 
+  describe('connection topology transactions', () => {
+    it('emits one sorted connection transaction for a simple commit', () => {
+      const bus = new EventBus();
+      const graph = new RoadGraph(bus, stubSampler);
+      const changes: number[][] = [];
+      bus.on('roads:connectionsChanged', ({ nodeIds }) => changes.push(nodeIds));
+
+      graph.commitChain([{ x: 0, z: 0 }, { x: 32, z: 0 }]);
+
+      expect(changes).toEqual([[1, 2]]);
+    });
+
+    it('emits one connection transaction with every affected surviving node for an interior tie-in', () => {
+      const bus = new EventBus();
+      const graph = new RoadGraph(bus, denseSampler);
+      const changes: number[][] = [];
+      let roadChanges = 0;
+      bus.on('roads:connectionsChanged', ({ nodeIds }) => changes.push(nodeIds));
+      bus.on('roads:changed', () => roadChanges++);
+
+      graph.commitChain([{ x: 0, z: 0 }, { x: 32, z: 0 }]);
+      changes.length = 0;
+      roadChanges = 0;
+      graph.commitChain([{ x: 16, z: 0 }, { x: 16, z: 24 }]);
+
+      expect(changes).toHaveLength(1);
+      expect(roadChanges).toBe(1);
+      const junction = [...graph.nodes.values()].find((n) => n.x === 16 && n.z === 0)!;
+      expect(changes[0]).toContain(junction.id);
+      expect(new Set(changes[0]).size).toBe(changes[0].length);
+      expect(changes[0]).toEqual([...changes[0]].sort((a, b) => a - b));
+    });
+
+    it('batches a direct splitEdge replacement into one sorted transaction', () => {
+      const bus = new EventBus();
+      const graph = new RoadGraph(bus, stubSampler);
+      const changes: number[][] = [];
+      let roadChanges = 0;
+      bus.on('roads:connectionsChanged', ({ nodeIds }) => changes.push(nodeIds));
+      bus.on('roads:changed', () => roadChanges++);
+      const [edgeId] = graph.commitChain([
+        { x: 0, z: 0 }, { x: 16, z: 0 }, { x: 32, z: 0 },
+      ]);
+      changes.length = 0;
+      roadChanges = 0;
+
+      const split = graph.splitEdge(edgeId, 1);
+
+      expect(changes).toHaveLength(1);
+      expect(roadChanges).toBe(1);
+      expect(changes[0]).toEqual([...changes[0]].sort((a, b) => a - b));
+      expect(changes[0]).toEqual([
+        graph.edges.get(split.left)!.a,
+        split.nodeId,
+        graph.edges.get(split.right)!.b,
+      ].sort((a, b) => a - b));
+    });
+
+    it('emits one transaction for a closed loop and one for removal', () => {
+      const bus = new EventBus();
+      const graph = new RoadGraph(bus, stubSampler);
+      const changes: number[][] = [];
+      bus.on('roads:connectionsChanged', ({ nodeIds }) => changes.push(nodeIds));
+      const ids = graph.commitChain([
+        { x: 0, z: 0 }, { x: 16, z: 0 }, { x: 16, z: 16 },
+        { x: 0, z: 16 }, { x: 0, z: 0 },
+      ]);
+
+      expect(changes).toHaveLength(1);
+      expect(changes[0]).toHaveLength(2);
+      changes.length = 0;
+
+      graph.removeEdge(ids[0]);
+
+      expect(changes).toHaveLength(1);
+      expect(changes[0]).toEqual([...changes[0]].sort((a, b) => a - b));
+    });
+  });
+
   describe('closed loops (Task 41)', () => {
     it('commits a closed chain (stroke returns to its start) as two half-loop edges sharing a midpoint node', () => {
       const g = mk();

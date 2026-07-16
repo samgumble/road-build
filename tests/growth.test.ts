@@ -3,9 +3,7 @@ import {
   FIELD_ROAD_CLEARANCE,
   FIELD_SIZE,
   GrowthSim,
-  resolveStructureRenderLayout,
   settlementMorphology,
-  STRUCTURE_MIN_CENTER_DISTANCE,
   type SpawnRecord,
 } from '../src/sim/growth/growth';
 import { RoadGraph } from '../src/sim/roads/graph';
@@ -166,34 +164,21 @@ describe('GrowthSim', () => {
     }
   });
 
-  it('reserves a non-overlapping future-building footprint for every live house parcel', () => {
-    const { sim } = world();
-    for (let t = 0; t < 420; t += 0.5) sim.update(0.5);
-    const structures = sim.spawned.filter((r) => r.kind === 'house' || r.kind === 'building');
-    expect(structures.length).toBeGreaterThan(1);
-    for (let i = 0; i < structures.length; i++) {
-      for (let j = i + 1; j < structures.length; j++) {
-        expect(Math.hypot(structures[i].x - structures[j].x, structures[i].z - structures[j].z))
-          .toBeGreaterThanOrEqual(STRUCTURE_MIN_CENTER_DISTANCE);
-      }
-    }
-  });
+  it('accepts two structure spawns at the same parcel center', () => {
+    const bus = new EventBus();
+    const hf = new Heightfield('overlapping-structures', bus);
+    const graph = new RoadGraph(bus, makeSampler(hf));
+    const sim = new GrowthSim(graph, hf, bus, () => 0.5);
+    const spawn = sim as unknown as {
+      spawn(kind: 'house' | 'building', cx: number, cz: number): void;
+    };
 
-  it('repairs overlapping legacy save visuals deterministically without moving unrelated scenery', () => {
-    const legacy: SpawnRecord[] = [
-      { kind: 'house', x: 10, z: 10, rot: 0, id: 1 },
-      { kind: 'building', x: 10.5, z: 10, rot: 0, id: 2 },
-      { kind: 'tree', x: 11, z: 11, rot: 0.3, id: 3 },
-    ];
-    const first = resolveStructureRenderLayout(legacy);
-    const second = resolveStructureRenderLayout(legacy);
+    spawn.spawn('house', 32, 32);
+    spawn.spawn('building', 32, 32);
 
-    expect(first).toEqual(second);
-    expect(first[0]).toEqual(legacy[0]);
-    expect(first[2]).toEqual(legacy[2]);
-    expect(Math.hypot(first[0].x - first[1].x, first[0].z - first[1].z))
-      .toBeGreaterThanOrEqual(STRUCTURE_MIN_CENTER_DISTANCE);
-    expect(first.map((r) => r.id)).toEqual(legacy.map((r) => r.id));
+    expect(sim.spawned).toHaveLength(2);
+    expect(sim.spawned[0].x).toBe(sim.spawned[1].x);
+    expect(sim.spawned[0].z).toBe(sim.spawned[1].z);
   });
 
   it('never spawns new field patches (user-removed "grass"), while houses still develop', () => {

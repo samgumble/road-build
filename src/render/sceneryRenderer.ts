@@ -5,7 +5,6 @@ import type { Heightfield } from '../sim/terrain/heightfield';
 import { EventBus } from '../core/events';
 import {
   FIELD_SIZE,
-  resolveStructureRenderLayout,
   type GrowthKind,
   type SpawnRecord,
   type DecayEntry,
@@ -1346,10 +1345,7 @@ export class SceneryRenderer {
       this.pendingFadeOffsets.set(id, { elapsed: 0, duration: CLEAR_FADE_DURATION, sink: 0 });
     }
 
-    // Legacy saves can contain structures authored before GrowthSim reserved footprint clearance.
-    // Resolve those render positions deterministically while leaving authoritative saved records
-    // unchanged; new live spawns already satisfy the same clearance at simulation level.
-    for (const rec of resolveStructureRenderLayout(spawned)) {
+    for (const rec of spawned) {
       if (this.categoryReady(rec.kind)) this.place(rec, false, rec.id);
       else this.pendingSpawns.push({ rec, animate: false, id: rec.id }); // restored — no pop-in once ready
     }

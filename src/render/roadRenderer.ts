@@ -9,6 +9,7 @@ import {
 } from '../core/constants';
 import { EventBus } from '../core/events';
 import { RoadGraph, RoadEdge } from '../sim/roads/graph';
+import { planJunction, type JunctionPlan } from '../sim/roads/junctionPlan';
 import type { Heightfield } from '../sim/terrain/heightfield';
 import { easeOutCubic, clamp01 } from './easing';
 
@@ -890,8 +891,11 @@ interface EdgeVisual {
 export class RoadRenderer {
   private visuals = new Map<number, EdgeVisual>();
   private clockSeconds = 0;
-  private readonly junctionGroup = new THREE.Group();
-  private junctionMeshes: THREE.Mesh[] = [];
+  private readonly connectionGroup = new THREE.Group();
+  private connectionMeshes: THREE.Mesh[] = [];
+  private connectionTopologySignatures = new Map<number, string>();
+  private connectionSurfaceSignatures = new Map<number, string>();
+  private connectionGroups = new Map<number, THREE.Group>();
 
   // Bridge construction theater (Task 22): persisted per-station/per-span animation state that
   // survives the throttled `rebuild()` cycle (see PylonRiseState/RailSettleState doc comments).
@@ -905,19 +909,17 @@ export class RoadRenderer {
     bus: EventBus,
     private hf: Heightfield,
   ) {
-    this.junctionGroup.name = 'road-junction-surfaces';
-    this.scene.add(this.junctionGroup);
-    bus.on('roads:edgeAdded', ({ edgeId }) => {
-      this.onEdgeAdded(edgeId);
-      this.rebuildJunctions();
-    });
+    this.connectionGroup.name = 'road-connection-surfaces';
+    this.scene.add(this.connectionGroup);
     bus.on('roads:edgeRemoved', ({ edgeId }) => {
       this.disposeEdge(edgeId);
-      this.rebuildJunctions();
     });
+    bus.on('roads:connectionsChanged', ({ nodeIds }) => this.rebuildConnections(nodeIds));
     bus.on('construction:stage', ({ edgeId, stage, crew }) => {
+      const edge = this.graph.edges.get(edgeId);
+      const endpointIds = edge ? [edge.a, edge.b] : [];
       this.onStage(edgeId, stage, crew);
-      this.rebuildJunctions();
+      for (const nodeId of endpointIds) this.refreshConnectionStage(nodeId);
     });
     bus.on('construction:progress', ({ edgeId, stage, t, demolish }) => this.onProgress(edgeId, stage, t, demolish));
     bus.on('traffic:edgeEntered', ({ edgeId, firstUse }) => {
@@ -991,23 +993,100 @@ export class RoadRenderer {
     return vergeJunctionSetback(own.heading, others, stripHalf);
   }
 
-  /** Rebuilds all completed degree-3+ conflict areas as topology-owned meshes. Mixed-stage
-   * junctions layer cumulatively: a newly graded branch expands the dirt foundation while the
-   * already-paved through road gets its own narrower asphalt patch on top. No edge-end strip owns
-   * the center, and no presentation-only terrain-height cylinder is involved. */
-  private rebuildJunctions(): void {
-    for (const mesh of this.junctionMeshes) {
-      this.junctionGroup.remove(mesh);
-      mesh.geometry.dispose();
-      (mesh.material as THREE.Material).dispose();
+  /** Topology work is transaction-scoped: unchanged signatures are exact no-ops, while a changed
+   * node first gives every surviving incident edge a chance to surrender/claim its endpoint and
+   * then replaces only that node's shared group. */
+  private rebuildConnections(nodeIds: readonly number[]): void {
+    const changed: JunctionPlan[] = [];
+    const edgeIds = new Set<number>();
+    for (const nodeId of new Set(nodeIds)) {
+      const plan = planJunction(this.graph, nodeId);
+      if (!plan) {
+        this.disposeConnectionGroup(nodeId);
+        this.connectionTopologySignatures.delete(nodeId);
+        this.connectionSurfaceSignatures.delete(nodeId);
+        continue;
+      }
+      if (this.connectionTopologySignatures.get(nodeId) === plan.topologySignature) continue;
+      changed.push(plan);
+      for (const edgeId of this.graph.edgesAtNode(nodeId)) edgeIds.add(edgeId);
     }
-    this.junctionMeshes = [];
 
-    for (const node of this.graph.nodes.values()) {
-      const edgeIds = this.graph.edgesAtNode(node.id);
-      if (edgeIds.length < 3) continue;
-      const arms = edgeIds.flatMap((edgeId) => {
-        const edge = this.graph.edges.get(edgeId);
+    // One transaction can dirty both ends of the same edge (splits/closed loops). Rebuild the edge
+    // group once, then replace each changed node group once, preserving exact event cardinality.
+    for (const edgeId of edgeIds) {
+      const edge = this.graph.edges.get(edgeId);
+      if (edge) this.rebuild(edge);
+    }
+    for (const plan of changed) {
+      this.replaceConnectionGroup(plan);
+      if (plan.kind === 'end') {
+        this.connectionTopologySignatures.delete(plan.nodeId);
+        this.connectionSurfaceSignatures.delete(plan.nodeId);
+      } else {
+        this.connectionTopologySignatures.set(plan.nodeId, plan.topologySignature);
+        this.connectionSurfaceSignatures.set(plan.nodeId, plan.surfaceSignature);
+      }
+    }
+  }
+
+  /** Stage events never recalculate topology or touch sibling edge geometry. They compare the
+   * stage-only signature at each endpoint and replace only the shared presentation group whose
+   * material/layers/paint actually changed. */
+  private refreshConnectionStage(nodeId: number): void {
+    const plan = planJunction(this.graph, nodeId);
+    if (!plan) {
+      this.disposeConnectionGroup(nodeId);
+      this.connectionTopologySignatures.delete(nodeId);
+      this.connectionSurfaceSignatures.delete(nodeId);
+      return;
+    }
+    if (plan.kind === 'end') {
+      this.disposeConnectionGroup(nodeId);
+      this.connectionTopologySignatures.delete(nodeId);
+      this.connectionSurfaceSignatures.delete(nodeId);
+      return;
+    }
+    if (this.connectionSurfaceSignatures.get(nodeId) === plan.surfaceSignature) return;
+    this.replaceConnectionGroup(plan);
+    this.connectionTopologySignatures.set(nodeId, plan.topologySignature);
+    this.connectionSurfaceSignatures.set(nodeId, plan.surfaceSignature);
+  }
+
+  private replaceConnectionGroup(plan: JunctionPlan): void {
+    this.disposeConnectionGroup(plan.nodeId);
+    if (plan.kind === 'end') return;
+    const group = this.buildConnectionGroup(plan);
+    this.connectionGroups.set(plan.nodeId, group);
+    this.connectionGroup.add(group);
+  }
+
+  private disposeConnectionGroup(nodeId: number): void {
+    const group = this.connectionGroups.get(nodeId);
+    if (!group) return;
+    const removed = new Set<THREE.Mesh>();
+    group.traverse((child) => {
+      if (!(child instanceof THREE.Mesh)) return;
+      removed.add(child);
+      child.geometry.dispose();
+      const materials = Array.isArray(child.material) ? child.material : [child.material];
+      for (const material of materials) material.dispose();
+    });
+    this.connectionMeshes = this.connectionMeshes.filter((mesh) => !removed.has(mesh));
+    this.connectionGroup.remove(group);
+    this.connectionGroups.delete(nodeId);
+  }
+
+  /** Builds one completed degree-2 seam or degree-3+ conflict area. Mixed-stage connections layer
+   * cumulatively: a newly graded branch expands the dirt foundation while the already-paved road
+   * gets its own narrower asphalt patch on top. */
+  private buildConnectionGroup(plan: JunctionPlan): THREE.Group {
+      const node = this.graph.nodes.get(plan.nodeId)!;
+      const nodeGroup = new THREE.Group();
+      nodeGroup.name = `road-connection-${node.id}`;
+      nodeGroup.userData.connectionKind = plan.kind;
+      const arms = plan.arms.flatMap((plannedArm) => {
+        const edge = this.graph.edges.get(plannedArm.edgeId);
         if (!edge) return [];
         const stage = junctionSurfaceStage(edge.stage);
         const arm = this.edgeArmAtNode(edge, node.id);
@@ -1047,10 +1126,10 @@ export class RoadRenderer {
           apronMaterial.roughness = 1;
           const apron = new THREE.Mesh(apronGeometry, apronMaterial);
           apron.receiveShadow = true;
-          apron.userData.roadDetail = 'junctionVerge';
+          apron.userData.roadDetail = plan.kind === 'seam' ? 'connectionVerge' : 'junctionVerge';
           tagWeatherSurface(apron, apronStage === 'graded' ? 'earth' : 'gravel');
-          this.junctionGroup.add(apron);
-          this.junctionMeshes.push(apron);
+          nodeGroup.add(apron);
+          this.connectionMeshes.push(apron);
         }
       }
 
@@ -1066,15 +1145,44 @@ export class RoadRenderer {
         const material = makeStandardMaterial(STAGE_COLOR[stage], 1, 'ribbon');
         const mesh = new THREE.Mesh(geometry, material);
         mesh.receiveShadow = true;
-        mesh.userData.roadDetail = 'junctionSurface';
+        mesh.userData.roadDetail = plan.kind === 'seam' ? 'connectionSurface' : 'junctionSurface';
         mesh.userData.junctionStage = stage;
         tagWeatherSurface(mesh, stage === 'graded' ? 'earth' : stage === 'gravel' ? 'gravel' : 'asphalt');
-        this.junctionGroup.add(mesh);
-        this.junctionMeshes.push(mesh);
+        nodeGroup.add(mesh);
+        this.connectionMeshes.push(mesh);
+      }
+
+      // A seam owns the center paint too: once both incident edges are painted, bridge the two
+      // trimmed edge-owned dash ranges with one continuous ribbon through the node. The actual
+      // sampled arm endpoints keep the connector flush with curved and sloped approaches.
+      if (plan.kind === 'seam' && arms.length === 2 && arms.every((arm) => arm.edge.stage === 'painted')) {
+        const [a, b] = arms;
+        const stripeSamples: RoadSample[] = [
+          { x: a.far.x, y: a.far.y, z: a.far.z, bridge: false },
+          { x: plan.x, y: Math.max(a.y, b.y), z: plan.z, bridge: false },
+          { x: b.far.x, y: b.far.y, z: b.far.z, bridge: false },
+        ];
+        const stripeGeometry = buildRibbonGeometry(
+          stripeSamples, CENTERLINE_WIDTH, CENTERLINE_YLIFT, 0, Infinity,
+        );
+        if (stripeGeometry.getAttribute('position')) {
+          const stripeMaterial = makeStandardMaterial(CENTERLINE_COLOR, 1, 'stripe');
+          stripeMaterial.roughness = WET_SHEEN_END;
+          const stripe = new THREE.Mesh(stripeGeometry, stripeMaterial);
+          stripe.receiveShadow = true;
+          stripe.userData.roadDetail = 'connectionCenterline';
+          tagWeatherSurface(stripe, 'paint');
+          nodeGroup.add(stripe);
+          this.connectionMeshes.push(stripe);
+        }
       }
 
       // Stop lines + zebra crosswalks on painted arms (see STOP_LINE_*/CROSSWALK_* constants).
-      const paintedArms = arms.filter((arm) => arm.edge.stage === 'painted');
+      // Stop bars and crosswalks currently share one mesh, so the whole cluster is deliberately
+      // limited to policy-stopped approaches. Splitting all-arm crosswalks is a separate model.
+      const paintedArms = plan.kind === 'junction'
+        ? arms.filter((arm) => arm.edge.stage === 'painted' && plan.stoppedEdgeIds.includes(arm.edge.id))
+        : [];
       if (paintedArms.length) {
         const positions: number[] = [];
         const normals: number[] = [];
@@ -1120,15 +1228,16 @@ export class RoadRenderer {
           mesh.receiveShadow = true;
           mesh.userData.roadDetail = 'junctionPaint';
           tagWeatherSurface(mesh, 'paint');
-          this.junctionGroup.add(mesh);
-          this.junctionMeshes.push(mesh);
+          nodeGroup.add(mesh);
+          this.connectionMeshes.push(mesh);
         }
       }
-    }
+      return nodeGroup;
   }
 
-  private junctionOwnsEdgeEnd(edge: RoadEdge, nodeId: number, stage: Exclude<Stage, 'surveyed'>): boolean {
-    if (this.graph.edgesAtNode(nodeId).length < 3) return false;
+  private connectionOwnsEdgeEnd(edge: RoadEdge, nodeId: number, stage: Exclude<Stage, 'surveyed'>): boolean {
+    const plan = planJunction(this.graph, nodeId);
+    if (!plan || plan.kind === 'end') return false;
     const completed = junctionSurfaceStage(edge.stage);
     const requested = junctionSurfaceStage(stage);
     return completed !== null && requested !== null
@@ -1147,16 +1256,10 @@ export class RoadRenderer {
       from,
       to,
       total,
-      this.junctionOwnsEdgeEnd(edge, edge.a, stage) ? 3 : 0,
-      this.junctionOwnsEdgeEnd(edge, edge.b, stage) ? 3 : 0,
+      this.connectionOwnsEdgeEnd(edge, edge.a, stage) ? 3 : 0,
+      this.connectionOwnsEdgeEnd(edge, edge.b, stage) ? 3 : 0,
       reach,
     );
-  }
-
-  private onEdgeAdded(edgeId: number): void {
-    const edge = this.graph.edges.get(edgeId);
-    if (!edge) return;
-    this.rebuild(edge);
   }
 
   private onStage(edgeId: number, stage: Stage | 'removed', crew = -1): void {
@@ -2001,10 +2104,10 @@ export class RoadRenderer {
       }
     }
 
-    // Junction surfaces are not children of an edge visual, but they represent the same authored
+    // Connection surfaces are not children of an edge visual, but they represent the same authored
     // materials and must react to rain identically. Apply from stored dry values each frame so
     // rebuilds and weather transitions remain non-compounding.
-    for (const mesh of this.junctionMeshes) {
+    for (const mesh of this.connectionMeshes) {
       const kind = mesh.userData.weatherSurface as RoadSurfaceKind | undefined;
       if (!kind) continue;
       const material = mesh.material as THREE.MeshStandardMaterial;

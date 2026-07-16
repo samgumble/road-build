@@ -273,6 +273,23 @@ describe('SceneryRenderer decay/upgrade (Task 35)', () => {
   // were mid-fade at save time — no animation, correct scale/sink for the saved offset — rather
   // than popping them back in at full scale with a freshly-restarted fade.
   describe('rebuild() partial-fade restoration (Finding 2)', () => {
+    it('renders overlapping saved structures at their authoritative shared coordinates', () => {
+      const houseId = freshId();
+      const buildingId = freshId();
+      sr.rebuild([
+        { kind: 'house', x: 8070, z: 8070, rot: 0, id: houseId },
+        { kind: 'building', x: 8070, z: 8070, rot: 0, id: buildingId },
+      ]);
+      const instances = (sr as unknown as {
+        byId: Map<number, { x: number; z: number }>;
+      }).byId;
+
+      expect(instances.get(houseId)).toMatchObject({ x: 8070, z: 8070 });
+      expect(instances.get(buildingId)).toMatchObject({ x: 8070, z: 8070 });
+      bus.emit('growth:remove', { id: houseId });
+      bus.emit('growth:remove', { id: buildingId });
+    });
+
     it('a record with no decay entry rebuilds at full scale, not fading', () => {
       const id = freshId();
       sr.rebuild([{ kind: 'tree', x: 8000, z: 8000, rot: 0, id }]);
