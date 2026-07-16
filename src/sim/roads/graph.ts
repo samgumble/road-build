@@ -15,6 +15,8 @@ export class RoadGraph {
   private points = new Map<string, { kind: 'node' | 'edge'; id: number; ctrlIndex?: number }>();
   private nextNode = 1;
   private nextEdge = 1;
+  private connectionTxnDepth = 0;
+  private affectedConnectionNodes = new Set<number>();
 
   constructor(private bus: EventBus, private sampler: (ctrl: P2[]) => RoadSample[]) {}
 
@@ -97,6 +99,7 @@ export class RoadGraph {
     for (let i = 1; i < ctrl.length - 1; i++) {
       if (!this.points.has(key(ctrl[i]))) this.points.set(key(ctrl[i]), { kind: 'edge', id, ctrlIndex: i });
     }
+    this.touchConnection(a, b);
     return id;
   }
 
@@ -108,15 +111,16 @@ export class RoadGraph {
   }
 
   splitEdge(edgeId: number, ctrlIndex: number): { nodeId: number; left: number; right: number } {
-    // DOCUMENTED-SKIP: unlike `commitChain`/`removeEdge`, this doesn't also emit `roads:changed` —
-    // only the per-edge `roads:edgeRemoved`/`roads:edgeAdded` pair below. Callers that split as part
-    // of a larger chain commit (the normal path, via `commitChain`) get a `roads:changed` from that
-    // outer call anyway; a bare/direct `splitEdge` call would miss the lane/growth rebuild it
-    // implies. This is a rare corner (direct callers outside `commitChain` are test-only today) and
-    // the fix — emitting `roads:changed` here too — would mean a double rebuild on the far more
-    // common commitChain path, which isn't worth the extra recompute cost for this edge case.
-    const e = this.edges.get(edgeId)!;
-    return this.replaceEdgeWithSplit(e, e.ctrl, ctrlIndex);
+    const directSplit = this.connectionTxnDepth === 0;
+    this.beginConnectionTransaction();
+    try {
+      const e = this.edges.get(edgeId)!;
+      const split = this.replaceEdgeWithSplit(e, e.ctrl, ctrlIndex);
+      if (directSplit) this.bus.emit('roads:changed', {});
+      return split;
+    } finally {
+      this.endConnectionTransaction();
+    }
   }
 
   /** Inserts a snapped connection point into the nearest control-polyline leg, then performs the
@@ -155,6 +159,7 @@ export class RoadGraph {
     this.points.set(key(p), { kind: 'node', id });
     const left = this.makeEdge(e.a, id, ctrl.slice(0, ctrlIndex + 1), e.stage);
     const right = this.makeEdge(id, e.b, ctrl.slice(ctrlIndex), e.stage);
+    this.touchConnection(e.a, id, e.b);
     this.bus.emit('roads:edgeRemoved', { edgeId: e.id });
     this.bus.emit('roads:edgeAdded', { edgeId: left });
     this.bus.emit('roads:edgeAdded', { edgeId: right });
@@ -162,6 +167,15 @@ export class RoadGraph {
   }
 
   commitChain(rawCtrl: P2[]): number[] {
+    this.beginConnectionTransaction();
+    try {
+      return this.commitChainBody(rawCtrl);
+    } finally {
+      this.endConnectionTransaction();
+    }
+  }
+
+  private commitChainBody(rawCtrl: P2[]): number[] {
     const ctrl: P2[] = [];
     for (const r of rawCtrl) {
       const p = RoadGraph.snap(r.x, r.z);
@@ -259,15 +273,41 @@ export class RoadGraph {
   }
 
   removeEdge(edgeId: number): void {
-    const e = this.edges.get(edgeId);
-    if (!e) return;
-    this.unindexEdge(e);
-    this.edges.delete(edgeId);
-    for (const nid of [e.a, e.b]) {
-      if (this.edgesAtNode(nid).length === 0) this.pruneOrphanNode(nid);
+    this.beginConnectionTransaction();
+    try {
+      const e = this.edges.get(edgeId);
+      if (!e) return;
+      this.unindexEdge(e);
+      this.edges.delete(edgeId);
+      for (const nid of [e.a, e.b]) {
+        if (this.edgesAtNode(nid).length === 0) this.pruneOrphanNode(nid);
+      }
+      this.touchConnection(e.a, e.b);
+      this.bus.emit('roads:edgeRemoved', { edgeId });
+      this.bus.emit('roads:changed', {});
+    } finally {
+      this.endConnectionTransaction();
     }
-    this.bus.emit('roads:edgeRemoved', { edgeId });
-    this.bus.emit('roads:changed', {});
+  }
+
+  private beginConnectionTransaction(): void {
+    this.connectionTxnDepth++;
+  }
+
+  private touchConnection(...nodeIds: number[]): void {
+    for (const id of nodeIds) {
+      if (this.nodes.has(id)) this.affectedConnectionNodes.add(id);
+    }
+  }
+
+  private endConnectionTransaction(): void {
+    this.connectionTxnDepth--;
+    if (this.connectionTxnDepth !== 0) return;
+    const nodeIds = [...this.affectedConnectionNodes]
+      .filter((id) => this.nodes.has(id))
+      .sort((a, b) => a - b);
+    this.affectedConnectionNodes.clear();
+    if (nodeIds.length) this.bus.emit('roads:connectionsChanged', { nodeIds });
   }
 
   /** Removes a node with no attached edges from both `nodes` and the `points` index. Caller must

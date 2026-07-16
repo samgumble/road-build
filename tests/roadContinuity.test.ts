@@ -45,6 +45,50 @@ function junctionSampler(ctrl: P2[]): RoadSample[] {
   return out;
 }
 
+function renderedConnections() {
+  const bus = new EventBus();
+  const graph = new RoadGraph(bus, junctionSampler);
+  const scene = new THREE.Scene();
+  const renderer = new RoadRenderer(scene, graph, bus, new Heightfield('connection-fixture', bus));
+  return { bus, graph, scene, renderer };
+}
+
+function paintAll(bus: EventBus, graph: RoadGraph): void {
+  for (const edge of graph.edges.values()) {
+    edge.stage = 'painted';
+    bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
+  }
+}
+
+function renderedCorner() {
+  const fixture = renderedConnections();
+  fixture.graph.commitChain([{ x: 0, z: 0 }, { x: 24, z: 0 }]);
+  fixture.graph.commitChain([{ x: 24, z: 0 }, { x: 40, z: 16 }]);
+  paintAll(fixture.bus, fixture.graph);
+  return fixture;
+}
+
+function renderedPaintedLoop() {
+  const fixture = renderedConnections();
+  fixture.graph.commitChain([
+    { x: 0, z: 0 }, { x: 24, z: 0 }, { x: 24, z: 24 },
+    { x: 0, z: 24 }, { x: 0, z: 0 },
+  ]);
+  paintAll(fixture.bus, fixture.graph);
+  return fixture;
+}
+
+function connectionMeshes(scene: THREE.Scene): THREE.Mesh[] {
+  const root = scene.getObjectByName('road-connection-surfaces') as THREE.Group;
+  const meshes: THREE.Mesh[] = [];
+  root?.traverse((child) => {
+    if (child instanceof THREE.Mesh) meshes.push(child);
+  });
+  return meshes;
+}
+
+const makeRenderedGraph = renderedConnections;
+
 function progress(bus: EventBus, edgeId: number, t: number): void {
   bus.emit('construction:progress', {
     edgeId,
@@ -72,9 +116,9 @@ describe('road and bridge continuity', () => {
       bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
     }
 
-    const junctionGroup = scene.getObjectByName('road-junction-surfaces') as THREE.Group;
+    const junctionGroup = scene.getObjectByName('road-connection-surfaces') as THREE.Group;
     expect(junctionGroup).toBeTruthy();
-    expect(junctionGroup.children.some((child) => child.userData.roadDetail === 'junctionSurface')).toBe(true);
+    expect(connectionMeshes(scene).some((child) => child.userData.roadDetail === 'junctionSurface')).toBe(true);
 
     const junction = [...graph.nodes.values()].find((node) => graph.edgesAtNode(node.id).length === 3)!;
     for (const edgeId of graph.edgesAtNode(junction.id)) {
@@ -132,8 +176,7 @@ describe('road and bridge continuity', () => {
       bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
     }
 
-    const junctionGroup = scene.getObjectByName('road-junction-surfaces') as THREE.Group;
-    const patch = junctionGroup.children.find(
+    const patch = connectionMeshes(scene).find(
       (child) => child.userData.roadDetail === 'junctionSurface' && child.userData.junctionStage === 'paved',
     ) as THREE.Mesh;
     expect(patch).toBeTruthy();
@@ -256,8 +299,7 @@ describe('road and bridge continuity', () => {
       bus.emit('construction:stage', { edgeId: edge.id, stage: 'graded', crew: 0 });
     }
 
-    const junctionGroup = scene.getObjectByName('road-junction-surfaces') as THREE.Group;
-    const apron = junctionGroup.children.find((child) => child.userData.roadDetail === 'junctionVerge') as THREE.Mesh;
+    const apron = connectionMeshes(scene).find((child) => child.userData.roadDetail === 'junctionVerge') as THREE.Mesh;
     expect(apron).toBeTruthy();
     const positions = apron.geometry.getAttribute('position') as THREE.BufferAttribute;
     let maxDist = 0;
@@ -305,7 +347,7 @@ describe('road and bridge continuity', () => {
     }
   });
 
-  it('paints stop lines and crosswalk bars on every PAINTED arm of a junction, and none before paint', () => {
+  it('paints stop lines and crosswalk bars only on stopped PAINTED arms, and none before paint', () => {
     const bus = new EventBus();
     const graph = new RoadGraph(bus, junctionSampler);
     const scene = new THREE.Scene();
@@ -316,18 +358,20 @@ describe('road and bridge continuity', () => {
       edge.stage = 'graded';
       bus.emit('construction:stage', { edgeId: edge.id, stage: 'graded', crew: 0 });
     }
-    const junctionGroup = scene.getObjectByName('road-junction-surfaces') as THREE.Group;
+    const meshes = connectionMeshes(scene);
     // graded junction: no paint yet
-    expect(junctionGroup.children.some((child) => child.userData.roadDetail === 'junctionPaint')).toBe(false);
+    expect(meshes.some((child) => child.userData.roadDetail === 'junctionPaint')).toBe(false);
 
     for (const edge of graph.edges.values()) {
       edge.stage = 'painted';
       bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
     }
-    const paint = junctionGroup.children.find((child) => child.userData.roadDetail === 'junctionPaint') as THREE.Mesh;
+    const paint = connectionMeshes(scene).find((child) => child.userData.roadDetail === 'junctionPaint') as THREE.Mesh;
     expect(paint).toBeTruthy();
     expect(paint.userData.weatherSurface).toBe('paint');
-    // one stop line + crosswalk cluster per arm: geometry near each of the three arm mouths,
+    // This T has a clear east-west major pair, so only the north minor approach is stopped. The
+    // current combined paint mesh intentionally keeps its crosswalk with that stopped approach.
+    // Geometry remains near the arm mouth, inside the road width, above the asphalt.
     // 5-8u from the node, inside the road width, floating just above the asphalt
     const positions = paint.geometry.getAttribute('position') as THREE.BufferAttribute;
     const armHits = { west: false, east: false, north: false };
@@ -342,7 +386,7 @@ describe('road and bridge continuity', () => {
       if (dx > 4.9) armHits.east = true;
       if (dz > 4.9) armHits.north = true;
     }
-    expect(armHits).toEqual({ west: true, east: true, north: true });
+    expect(armHits).toEqual({ west: false, east: false, north: true });
   });
 
   it('lays a shoulder-width verge apron under every junction patch', () => {
@@ -357,8 +401,8 @@ describe('road and bridge continuity', () => {
       bus.emit('construction:stage', { edgeId: edge.id, stage: 'painted', crew: 0 });
     }
 
-    const junctionGroup = scene.getObjectByName('road-junction-surfaces') as THREE.Group;
-    const apron = junctionGroup.children.find((child) => child.userData.roadDetail === 'junctionVerge') as THREE.Mesh;
+    const meshes = connectionMeshes(scene);
+    const apron = meshes.find((child) => child.userData.roadDetail === 'junctionVerge') as THREE.Mesh;
     expect(apron).toBeTruthy();
     expect(apron.userData.weatherSurface).toBe('gravel'); // painted arms -> gravel verge, like buildShoulders
     apron.geometry.computeBoundingBox();
@@ -368,7 +412,7 @@ describe('road and bridge continuity', () => {
     expect(bounds.max.z - bounds.min.z).toBeGreaterThanOrEqual(shoulderWidth - 1e-6);
     expect(bounds.max.x - bounds.min.x).toBeGreaterThanOrEqual(shoulderWidth - 1e-6);
     // and it sits under the surface patch, not over it
-    const patch = junctionGroup.children.find((child) => child.userData.roadDetail === 'junctionSurface') as THREE.Mesh;
+    const patch = meshes.find((child) => child.userData.roadDetail === 'junctionSurface') as THREE.Mesh;
     patch.geometry.computeBoundingBox();
     expect(bounds.max.y).toBeLessThan(patch.geometry.boundingBox!.max.y);
   });
@@ -484,27 +528,123 @@ describe('road and bridge continuity', () => {
     expect(visual.bridgeMaskTo).toBeNull();
   });
 
-  it('adds full-width endpoint coverage so two painted road ribbons meet at a degree-2 corner', () => {
-    const bus = new EventBus();
-    const hf = new Heightfield('road-endpoint-caps', bus);
-    const graph = new RoadGraph(bus, bridgeSampler);
-    const scene = new THREE.Scene();
-    new RoadRenderer(scene, graph, bus, hf);
+  it('uses one shared degree-2 seam with continuous paint and no overlapping caps', () => {
+    const { graph, scene } = renderedCorner();
+    const node = [...graph.nodes.values()].find((candidate) => graph.edgesAtNode(candidate.id).length === 2)!;
+    const connectionGroup = scene.getObjectByName(`road-connection-${node.id}`) as THREE.Group;
+    expect(connectionGroup).toBeTruthy();
+    expect(connectionGroup.children.filter((child) => child.userData.roadDetail === 'connectionSurface')).toHaveLength(1);
+    expect(connectionGroup.children.filter((child) => child.userData.roadDetail === 'connectionCenterline')).toHaveLength(1);
 
-    const [east] = graph.commitChain([{ x: 0, z: 0 }, { x: 40, z: 0 }]);
-    const [north] = graph.commitChain([{ x: 40, z: 0 }, { x: 40, z: 40 }]);
-    for (const edgeId of [east, north]) {
-      graph.edges.get(edgeId)!.stage = 'painted';
-      bus.emit('construction:stage', { edgeId, stage: 'painted', crew: 0 });
-    }
-
-    for (const edgeId of [east, north]) {
+    for (const edgeId of graph.edgesAtNode(node.id)) {
       const group = scene.children.find((child) => child.userData.edgeId === edgeId) as THREE.Group;
       const capCount = group.children.reduce((sum, child) => {
         if (!(child instanceof THREE.Mesh)) return sum;
         return sum + Number(child.geometry.userData.roadEndpointCaps ?? 0);
       }, 0);
-      expect(capCount).toBe(2);
+      expect(capCount).toBe(1); // remote degree-1 end only
     }
+  });
+
+  it('gives both closed-loop nodes seam geometry without controls', () => {
+    const { graph, scene } = renderedPaintedLoop();
+    for (const node of graph.nodes.values()) {
+      const group = scene.getObjectByName(`road-connection-${node.id}`)!;
+      expect(group.children.some((child) => child.userData.roadDetail === 'connectionSurface')).toBe(true);
+      expect(group.children.some((child) => child.userData.roadDetail === 'junctionSurface')).toBe(false);
+    }
+  });
+
+  it('rebuilds affected connections once and ignores traffic, growth, weather, and frames', () => {
+    const { bus, graph, renderer, scene } = makeRenderedGraph();
+    graph.commitChain([{ x: 0, z: 0 }, { x: 32, z: 0 }]);
+    graph.commitChain([{ x: 32, z: 0 }, { x: 40, z: 8 }]);
+    paintAll(bus, graph);
+    const node = [...graph.nodes.values()].find((candidate) => candidate.x === 32 && candidate.z === 0)!;
+    const before = (scene.getObjectByName(`road-connection-${node.id}`)!.children[0] as THREE.Mesh).geometry;
+
+    bus.emit('traffic:edgeEntered', { edgeId: 1, carId: 1, pos: { x: 0, y: 0, z: 0 }, firstUse: false });
+    bus.emit('growth:spawn', { id: 1, kind: 'house', x: 8, z: 8, rot: 0 });
+    renderer.update(1 / 60, 1);
+    bus.emit('roads:connectionsChanged', { nodeIds: [node.id] }); // unchanged topology signature
+
+    const after = (scene.getObjectByName(`road-connection-${node.id}`)!.children[0] as THREE.Mesh).geometry;
+    expect(after).toBe(before);
+  });
+
+  it('rebuilds every existing incident edge after a new tie-in', () => {
+    const { bus, graph, scene } = makeRenderedGraph();
+    const [west] = graph.commitChain([{ x: 0, z: 0 }, { x: 16, z: 0 }]);
+    const [east] = graph.commitChain([{ x: 16, z: 0 }, { x: 32, z: 0 }]);
+    for (const edgeId of [west, east]) {
+      graph.edges.get(edgeId)!.stage = 'painted';
+      bus.emit('construction:stage', { edgeId, stage: 'painted', crew: 0 });
+    }
+    const oldByEdge = new Map([west, east].map((edgeId) => {
+      const group = scene.children.find((child) => child.userData.edgeId === edgeId) as THREE.Group;
+      return [edgeId, new Set(group.children.map((child) => (child as THREE.Mesh).geometry))] as const;
+    }));
+
+    graph.commitChain([{ x: 16, z: 0 }, { x: 16, z: 24 }]);
+
+    const junction = [...graph.nodes.values()].find((candidate) => candidate.x === 16 && candidate.z === 0)!;
+    expect(graph.edgesAtNode(junction.id)).toHaveLength(3);
+    for (const edgeId of [west, east]) {
+      const group = scene.children.find((child) => child.userData.edgeId === edgeId) as THREE.Group;
+      expect(group.children.every((child) => !oldByEdge.get(edgeId)!.has((child as THREE.Mesh).geometry))).toBe(true);
+    }
+  });
+
+  it('refreshes exactly the changed edge endpoints and disposes replaced connection geometry', () => {
+    const { bus, graph, scene } = makeRenderedGraph();
+    graph.commitChain([{ x: 0, z: 0 }, { x: 16, z: 0 }]);
+    const [center] = graph.commitChain([{ x: 16, z: 0 }, { x: 32, z: 0 }]);
+    graph.commitChain([{ x: 32, z: 0 }, { x: 48, z: 0 }]);
+    graph.commitChain([{ x: 64, z: 0 }, { x: 80, z: 0 }]);
+    graph.commitChain([{ x: 80, z: 0 }, { x: 88, z: 8 }]);
+    paintAll(bus, graph);
+
+    const nodeAt = (x: number) => [...graph.nodes.values()].find((node) => node.x === x && node.z === 0)!;
+    const ids = [nodeAt(16).id, nodeAt(32).id, nodeAt(80).id];
+    const before = new Map(ids.map((id) => [id, scene.getObjectByName(`road-connection-${id}`)!]));
+    const replacedGeometry = before.get(ids[0])!.children[0] as THREE.Mesh;
+    let disposed = false;
+    replacedGeometry.geometry.addEventListener('dispose', () => { disposed = true; });
+
+    graph.edges.get(center)!.stage = 'paved';
+    bus.emit('construction:stage', { edgeId: center, stage: 'paved', crew: 0 });
+
+    expect(scene.getObjectByName(`road-connection-${ids[0]}`)).not.toBe(before.get(ids[0]));
+    expect(scene.getObjectByName(`road-connection-${ids[1]}`)).not.toBe(before.get(ids[1]));
+    expect(scene.getObjectByName(`road-connection-${ids[2]}`)).toBe(before.get(ids[2]));
+    expect(disposed).toBe(true);
+  });
+
+  it('defers new-edge geometry until the topology transaction is complete', () => {
+    const { bus, graph, scene } = makeRenderedGraph();
+    let renderedDuringEdgeAdded = false;
+    bus.on('roads:edgeAdded', ({ edgeId }) => {
+      renderedDuringEdgeAdded = scene.children.some((child) => child.userData.edgeId === edgeId);
+    });
+
+    const [edgeId] = graph.commitChain([{ x: 0, z: 0 }, { x: 32, z: 0 }]);
+
+    expect(renderedDuringEdgeAdded).toBe(false);
+    expect(scene.children.some((child) => child.userData.edgeId === edgeId)).toBe(true);
+  });
+
+  it('does not retain cache entries for pruned degree-1 endpoint nodes', () => {
+    const { graph, renderer } = makeRenderedGraph();
+    const [edgeId] = graph.commitChain([{ x: 0, z: 0 }, { x: 32, z: 0 }]);
+    const caches = renderer as unknown as {
+      connectionTopologySignatures: Map<number, string>;
+      connectionSurfaceSignatures: Map<number, string>;
+    };
+
+    expect(caches.connectionTopologySignatures.size).toBe(0);
+    expect(caches.connectionSurfaceSignatures.size).toBe(0);
+    graph.removeEdge(edgeId);
+    expect(caches.connectionTopologySignatures.size).toBe(0);
+    expect(caches.connectionSurfaceSignatures.size).toBe(0);
   });
 });

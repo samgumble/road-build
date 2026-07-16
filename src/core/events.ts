@@ -2,6 +2,7 @@ import type { Stage, V3, VehicleKind } from './types';
 
 export interface GameEvents {
   'roads:changed': Record<string, never>;                     // any topology/stage change relevant to lanes+growth
+  'roads:connectionsChanged': { nodeIds: number[] };         // surviving nodes affected by one topology transaction
   'roads:edgeAdded': { edgeId: number };
   'roads:edgeRemoved': { edgeId: number };
   'construction:stage': { edgeId: number; stage: Stage | 'removed'; crew: number };
