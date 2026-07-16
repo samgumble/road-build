@@ -54,7 +54,9 @@
 **Files:** `src/render/scene.ts`, `src/render/postfx.ts`, `src/render/terrainRenderer.ts`, `src/render/atmosphere.ts`, `src/render/quality.ts`
 
 - [x] Add a small environment map or procedural sky contribution for coherent reflections.
-- [ ] Add contact-shadow decals or a low-cost blob-shadow pool beneath vehicles/large props.
+- [x] Add contact-shadow decals or a low-cost blob-shadow pool beneath vehicles/large props.
+  Construction fleet delivered as one fixed-capacity instanced pool; extend the same pattern to
+  any future large moving props instead of enabling extra shadow-casting lights.
 - [ ] Introduce terrain macro color/roughness variation and slope-aware rock seasoning.
 - [ ] Improve water depth color, shoreline foam restraint, night response, and reflection roughness.
 - [ ] Clamp rain/fog to a gameplay-legibility floor and add a restrained LUT/grade on high tier.

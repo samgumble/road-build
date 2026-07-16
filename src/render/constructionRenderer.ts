@@ -926,6 +926,75 @@ interface VehicleState {
   dumpCountThisLoad: number; // dig-cycle dumps received since the bed was last emptied
 }
 
+type ConstructionShadowKind = VehicleKind | 'grader';
+
+const CONSTRUCTION_SHADOW_FOOTPRINTS: Readonly<Record<ConstructionShadowKind, { length: number; width: number }>> = {
+  excavator: { length: 3.4, width: 2.3 },
+  truck: { length: 4.2, width: 2.2 },
+  paver: { length: 3.7, width: 2.5 },
+  roller: { length: 2.5, width: 2.2 },
+  liner: { length: 2.8, width: 1.8 },
+  surveyor: { length: 1.4, width: 1.2 },
+  crane: { length: 4.4, width: 3.8 },
+  grader: { length: 4.6, width: 2.1 },
+};
+
+/** One-draw-call contact shadows for every construction vehicle. The pool follows the rigs'
+ * already-damped presentation state, so it never becomes authoritative and naturally shares their
+ * fade/handoff behavior. Soft decals keep the fleet grounded at overview distance and at night
+ * without adding shadow-casting lights or one draw call per machine. */
+class ConstructionContactShadowPool {
+  readonly mesh: THREE.InstancedMesh;
+  private dummy = new THREE.Object3D();
+
+  constructor(capacity: number) {
+    const geometry = new THREE.CircleGeometry(1, 24);
+    geometry.rotateX(-Math.PI / 2);
+    const material = new THREE.MeshBasicMaterial({
+      color: '#17201c',
+      transparent: true,
+      opacity: 0.26,
+      depthWrite: false,
+      toneMapped: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+    });
+    this.mesh = new THREE.InstancedMesh(geometry, material, capacity);
+    this.mesh.name = 'construction-contact-shadows';
+    this.mesh.count = 0;
+    this.mesh.frustumCulled = false;
+    this.mesh.renderOrder = 1;
+  }
+
+  beginFrame(): void {
+    this.mesh.count = 0;
+  }
+
+  add(state: VehicleState, kind: ConstructionShadowKind): void {
+    if (!state.hasTarget || state.scale <= 0.001 || this.mesh.count >= this.mesh.instanceMatrix.count) return;
+    const footprint = CONSTRUCTION_SHADOW_FOOTPRINTS[kind];
+    this.dummy.position.set(state.curPos.x, state.curPos.y + 0.035, state.curPos.z);
+    this.dummy.rotation.set(0, -state.curHeading, 0);
+    this.dummy.scale.set(
+      footprint.length * 0.5 * state.scale,
+      1,
+      footprint.width * 0.5 * state.scale,
+    );
+    this.dummy.updateMatrix();
+    this.mesh.setMatrixAt(this.mesh.count++, this.dummy.matrix);
+  }
+
+  endFrame(): void {
+    this.mesh.visible = this.mesh.count > 0;
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  dispose(): void {
+    this.mesh.geometry.dispose();
+    (this.mesh.material as THREE.Material).dispose();
+  }
+}
+
 /**
  * Fixed-capacity, pre-allocated THREE.Points pool. `spawn()` overwrites the oldest available
  * slot (ring-buffer style) with a fresh particle; `update()` advances ages and writes only the
@@ -2254,6 +2323,7 @@ export class ConstructionRenderer {
   private exhaustPool: ParticlePool; // Task 26 deliverable 3: shared across crews (positions carry crew implicitly)
   private tireMarks: TireMarkPool;
   private stakes: StakePool;
+  private vehicleShadows: ConstructionContactShadowPool;
 
   private clock = 0;
   private readonly IDLE_TIMEOUT = 0.2; // seconds without a progress event => job considered done
@@ -2319,12 +2389,18 @@ export class ConstructionRenderer {
     this.exhaustPool = new ParticlePool(EXHAUST_POOL_SIZE, EXHAUST_SIZE, EXHAUST_COLOR, EXHAUST_LIFETIME);
     this.tireMarks = new TireMarkPool(TIRE_MARK_POOL_SIZE);
     this.stakes = new StakePool(STAKE_POOL_SIZE);
+    // Maximum live states: every per-crew rig, plus the synthesized trailing roller and grader,
+    // plus the single shared crane. The fixed pool remains one draw call at full three-crew load.
+    this.vehicleShadows = new ConstructionContactShadowPool(
+      MAX_CREWS * (PER_CREW_KINDS.length + 2) + 1,
+    );
     this.scene.add(this.dustPool.points);
     this.scene.add(this.steamPool.points);
     this.scene.add(this.gravelPool.points);
     this.scene.add(this.exhaustPool.points);
     this.scene.add(this.tireMarks.mesh);
     this.scene.add(this.stakes.mesh);
+    this.scene.add(this.vehicleShadows.mesh);
 
     const craneSegmentParts = buildCraneSegment();
     this.craneSegment = craneSegmentParts.mesh;
@@ -3139,6 +3215,17 @@ export class ConstructionRenderer {
     for (let crew = 0; crew < this.crews.length; crew++) {
       this.updateCrew(crew, dt, night, stepDt);
     }
+
+    this.vehicleShadows.beginFrame();
+    this.vehicleShadows.add(this.craneState, 'crane');
+    for (const slot of this.crews) {
+      for (const [kind, state] of slot.states) this.vehicleShadows.add(state, kind);
+      // Roller is normally synthesized outside `states`; guard against a future real roller event
+      // placing the same rig in the map so the shadow can never be written twice.
+      if (!slot.states.has('roller')) this.vehicleShadows.add(slot.roller, 'roller');
+      this.vehicleShadows.add(slot.grader, 'grader');
+    }
+    this.vehicleShadows.endFrame();
 
     // Task 45: visible cast light per tower (ground pool + downward cone) — one shared pool across
     // all crews, rebuilt every frame from each crew's live tower positions. `floodlightVisibility`
@@ -4241,12 +4328,14 @@ export class ConstructionRenderer {
     this.scene.remove(this.exhaustPool.points);
     this.scene.remove(this.tireMarks.mesh);
     this.scene.remove(this.stakes.mesh);
+    this.scene.remove(this.vehicleShadows.mesh);
     this.dustPool.dispose();
     this.steamPool.dispose();
     this.gravelPool.dispose();
     this.exhaustPool.dispose();
     this.tireMarks.dispose();
     this.stakes.dispose();
+    this.vehicleShadows.dispose();
 
     this.scene.remove(this.craneSegment);
     this.craneSegment.geometry.dispose();

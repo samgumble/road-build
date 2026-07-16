@@ -31,7 +31,7 @@ function buildRig(seed: string, span: number) {
   const renderer = new ConstructionRenderer(scene, bus, graph, hf, roadRenderer);
   const anchor = findAnchor(hf, span);
   const [edgeId] = graph.commitChain([anchor, { x: anchor.x + span, z: anchor.z }]);
-  return { bus, hf, graph, queue, renderer, edgeId };
+  return { bus, hf, graph, queue, renderer, scene, edgeId };
 }
 
 /** Reads crew 0's currently "shown" (scale > threshold) per-kind vehicle states via the renderer's
@@ -48,6 +48,27 @@ function activeVehicleKinds(renderer: ConstructionRenderer, crew: number, thresh
 }
 
 describe('ConstructionRenderer convoy (Task 36)', () => {
+  it('grounds the visible fleet with one pooled contact-shadow mesh and clears idle slots', () => {
+    const { bus, renderer, scene } = buildRig('fleet-shadow-test', 40);
+    const shadows = scene.getObjectByName('construction-contact-shadows') as THREE.InstancedMesh | undefined;
+    expect(shadows).toBeInstanceOf(THREE.InstancedMesh);
+    expect(shadows!.count).toBe(0);
+
+    bus.emit('construction:progress', {
+      edgeId: 0, stage: 'graded', t: 0, pos: { x: 0, y: 0, z: 0 }, heading: 0,
+      vehicle: 'excavator', demolish: false, crew: 0, onBreak: false,
+    });
+    renderer.update(0.1, false);
+
+    expect(shadows!.count).toBe(1);
+    const material = shadows!.material as THREE.MeshBasicMaterial;
+    expect(material.transparent).toBe(true);
+    expect(material.depthWrite).toBe(false);
+
+    renderer.update(1, false);
+    expect(shadows!.count).toBe(0);
+  });
+
   it('shows the excavator (graded front) and paver/liner (a later front) simultaneously visible once the train is underway', () => {
     const { queue, renderer, edgeId, graph } = buildRig('convoy-test', 220);
 
