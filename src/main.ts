@@ -15,7 +15,7 @@ import { BuildQueue } from './sim/construction/queue';
 import { ConstructionRenderer } from './render/constructionRenderer';
 import { TrafficSim } from './sim/traffic/traffic';
 import { CarRenderer } from './render/carRenderer';
-import { GrowthSim } from './sim/growth/growth';
+import { GrowthSim, paintedJunctionDistance } from './sim/growth/growth';
 import { generateWilderness, WildernessSim } from './sim/growth/wilderness';
 import { QuarrySim } from './sim/quarry';
 import { SceneryRenderer } from './render/sceneryRenderer';
@@ -147,24 +147,11 @@ function main(): void {
 
   const morphologySeed = createRng('growth-morphology-' + hf.seed)();
   const growth = new GrowthSim(graph, hf, bus, createRng('growth-' + hf.seed), morphologySeed);
-  // Skyline variety probe: distance from a point to the nearest road sample. Called once per
-  // building spawn (not per frame); the early-out fires as soon as a sample is effectively on
-  // top of the query point, and buildings only ever spawn near roads.
-  const roadDistanceAt = (x: number, z: number): number => {
-    let best = Infinity;
-    for (const edge of graph.edges.values()) {
-      for (const sample of edge.samples) {
-        const dx = sample.x - x, dz = sample.z - z;
-        const d2 = dx * dx + dz * dz;
-        if (d2 < best) {
-          best = d2;
-          if (best < 4) return Math.sqrt(best);
-        }
-      }
-    }
-    return Math.sqrt(best);
-  };
-  const sceneryRenderer = new SceneryRenderer(scene, hf, bus, roadDistanceAt);
+  // Skyline variety probe: buildings already share an 8-10u road setback, so nearest-ROAD
+  // distance cannot distinguish a center from a fringe. Degree-3 painted junctions are the same
+  // deterministic centers used by GrowthSim morphology and create a meaningful radial gradient.
+  const settlementCenterDistanceAt = (x: number, z: number): number => paintedJunctionDistance(graph, x, z);
+  const sceneryRenderer = new SceneryRenderer(scene, hf, bus, settlementCenterDistanceAt);
   const roadsideRenderer = new RoadsideRenderer(scene, graph, hf, bus);
   const villagerRenderer = new VillagerRenderer(scene, graph, hf, bus);
 

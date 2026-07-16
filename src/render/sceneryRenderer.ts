@@ -103,18 +103,18 @@ export const MODEL_STYLE_VARIANTS: Readonly<Record<'tree' | 'house' | 'building'
 const FIELD_STRIPE_COLORS = ['#7fae6b', '#6a9b58'];
 
 // --- Skyline variety (player feedback: dense settlements read as a uniform wall of towers) ------
-// Buildings inside SKYLINE_CORE_DISTANCE of a road keep full "downtown" height; past
+// Buildings inside SKYLINE_CORE_DISTANCE of a connected road junction keep full "downtown" height; past
 // SKYLINE_FRINGE_DISTANCE they damp to ~70%, so a big settlement peaks along its main street and
 // steps down toward the edges instead of forming one flat-topped block.
-export const SKYLINE_CORE_DISTANCE = 10;
-export const SKYLINE_FRINGE_DISTANCE = 34;
+export const SKYLINE_CORE_DISTANCE = 18;
+export const SKYLINE_FRINGE_DISTANCE = 70;
 
-/** Per-building vertical stretch: distance-from-road falloff x a deterministic per-tower jitter.
- * `roadDistance` null (no probe wired, e.g. tests/tools) falls back to jitter-only variation. */
-export function skylineHeightScale(roadDistance: number | null, jitter01: number): number {
+/** Per-building vertical stretch: settlement-center falloff x deterministic per-tower jitter.
+ * `centerDistance` null (no probe wired, e.g. tests/tools) falls back to jitter-only variation. */
+export function skylineHeightScale(centerDistance: number | null, jitter01: number): number {
   const jitter = 0.9 + jitter01 * 0.25; // ±~12% per-tower silhouette variation
-  if (roadDistance === null) return jitter;
-  const t = Math.min(1, Math.max(0, (roadDistance - SKYLINE_CORE_DISTANCE) / (SKYLINE_FRINGE_DISTANCE - SKYLINE_CORE_DISTANCE)));
+  if (centerDistance === null) return jitter;
+  const t = Math.min(1, Math.max(0, (centerDistance - SKYLINE_CORE_DISTANCE) / (SKYLINE_FRINGE_DISTANCE - SKYLINE_CORE_DISTANCE)));
   const falloff = 1.15 - t * 0.45; // 1.15 at the core -> 0.70 at the fringe
   return falloff * jitter;
 }
@@ -368,9 +368,9 @@ export class SceneryRenderer {
     private scene: THREE.Scene,
     private hf: Heightfield,
     private bus: EventBus,
-    /** Optional probe for the distance from (x, z) to the nearest road sample — powers the
+    /** Optional probe for the distance from (x, z) to the nearest connected junction center — powers the
      * skyline height falloff. Absent (tests/tools), buildings vary by jitter alone. */
-    private roadDistanceAt?: (x: number, z: number) => number,
+    private settlementCenterDistanceAt?: (x: number, z: number) => number,
   ) {
     const fieldGeo = new THREE.PlaneGeometry(FIELD_SIZE, FIELD_SIZE);
     fieldGeo.rotateX(-Math.PI / 2);
@@ -842,8 +842,8 @@ export class SceneryRenderer {
     // tint. Both are render-only and frozen at spawn time.
     let hScale = 1;
     if (rec.kind === 'building') {
-      const roadDistance = this.roadDistanceAt ? this.roadDistanceAt(rec.x, rec.z) : null;
-      hScale = skylineHeightScale(roadDistance, sceneryHash01(rec.x, rec.z));
+      const centerDistance = this.settlementCenterDistanceAt ? this.settlementCenterDistanceAt(rec.x, rec.z) : null;
+      hScale = skylineHeightScale(centerDistance, sceneryHash01(rec.x, rec.z));
     }
 
     const s = animate ? 0.001 : 1;

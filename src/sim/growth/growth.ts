@@ -14,9 +14,9 @@ const RECOMPUTE_INTERVAL = 2; // sim-seconds, throttle for distance-field recomp
 const MAX_ROAD_DIST_CELLS = 6; // ~24u; cells beyond this never accumulate development
 // Tuned (Task 23) against user feedback that development felt "too eager": at a fresh road's
 // closest ring (d=0) with the per-cell RATE_VARIANCE multiplier below, this rate lands first
-// trees ~65-115s, first fields ~135-230s, first houses no sooner than ~230s (~3.8 sim-min), first
-// buildings no sooner than ~320s (~5.4 sim-min) — measured by direct simulation, see the numbers
-// documented alongside THRESHOLDS below. Previously 0.008, which put houses under 1.5 sim-min.
+// trees ~65-115s, first fields ~135-230s, and first houses no sooner than ~230s (~3.8 sim-min).
+// Visible buildings arrive later through the developed-neighbor upgrade gate. Previously 0.008,
+// which put houses under 1.5 sim-min.
 const DEV_RATE_BASE = 0.0026;
 const DEV_RATE_DIST_DIVISOR = 7;
 const MAX_SLOPE = 0.5;
@@ -178,6 +178,21 @@ export function settlementMorphology(
   return Math.max(pocket, junction);
 }
 
+/** Distance to the nearest node where at least three PAINTED roads meet. Shared by simulation
+ * morphology and render-side skyline shaping so both systems agree on where a town center is. */
+export function paintedJunctionDistance(graph: RoadGraph, x: number, z: number): number {
+  let best = Infinity;
+  for (const node of graph.nodes.values()) {
+    let paintedDegree = 0;
+    for (const edgeId of graph.edgesAtNode(node.id)) {
+      if (graph.edges.get(edgeId)?.stage === 'painted') paintedDegree++;
+    }
+    if (paintedDegree < 3) continue;
+    best = Math.min(best, Math.hypot(node.x - x, node.z - z));
+  }
+  return best;
+}
+
 export type GrowthKind = 'tree' | 'field' | 'house' | 'building' | 'park';
 
 // Living Towns parcel variety: a coordinate-seeded fraction of house-threshold parcels become
@@ -215,9 +230,9 @@ interface Threshold {
 //   tree:      first ~68s,  median ~86s   (target 45-90s)
 //   field:     first ~139s, median ~176s  (target ~2 sim-min)
 //   house:     first ~231s, median ~293s  (target >= 3 sim-min / 180s)
-//   building:  first ~323s, median ~357s  (target >= 5 sim-min / 300s; only ~half of cells
-//              reach 'building' within the 400s simulation window, matching buildings being the
-//              rarest/last stage)
+//   building progression bit: first ~323s, median ~357s. This bit no longer directly spawns a
+//              second structure; visible towers arrive later through HOUSE_UPGRADE_DEV plus its
+//              developed-neighbor and low-rise-density gates.
 // Previously 0.25/0.5/0.75/0.95 with a fixed (no-variance) 0.008 rate, which put houses under 1.5
 // sim-minutes and buildings under 2.
 const THRESHOLDS: Threshold[] = [
@@ -628,16 +643,7 @@ export class GrowthSim {
   }
 
   private nearestPaintedJunctionDistance(x: number, z: number): number {
-    let best = Infinity;
-    for (const node of this.graph.nodes.values()) {
-      let paintedDegree = 0;
-      for (const edgeId of this.graph.edgesAtNode(node.id)) {
-        if (this.graph.edges.get(edgeId)?.stage === 'painted') paintedDegree++;
-      }
-      if (paintedDegree < 3) continue;
-      best = Math.min(best, Math.hypot(node.x - x, node.z - z));
-    }
-    return best;
+    return paintedJunctionDistance(this.graph, x, z);
   }
 
   private settlementMultFor(idx: number, x: number, z: number): number {
@@ -824,6 +830,12 @@ export class GrowthSim {
             // Field/grass patches no longer spawn (removed per repeated player feedback — "remove
             // grass spawning from the environment growth"). The bit is still consumed so the cell
             // isn't re-rolled; `placeField` stays for parks, and saved field records still restore.
+            continue;
+          } else if (th.kind === 'building') {
+            // The building threshold is retained as a consumed/save-compatible progression bit,
+            // but it must not place a SECOND structure on the parcel. Towers arise only through
+            // `tryUpgrade`, which mutates the existing house record in place once its developed-
+            // neighbor and low-rise-density gates pass.
             continue;
           } else if (th.kind === 'tree') {
             // Thinned + scattered (see TREE_SPAWN_CHANCE) so corridors read as woodland, not a
