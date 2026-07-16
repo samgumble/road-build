@@ -4,7 +4,13 @@ import { EventBus } from '../core/events';
 import { DAY_LENGTH, WORLD_SIZE } from '../core/constants';
 import { clamp01 } from './easing';
 import { Sky } from './sky';
-import { solarTimeOfDay, sunElevation } from './solarTime';
+import {
+  ambientFillForElevation,
+  environmentFillForElevation,
+  exposureForElevation,
+  solarTimeOfDay,
+  sunElevation,
+} from './solarTime';
 
 /** A single keyframe stop, at a given point in the 0..1 day cycle. */
 interface Stop {
@@ -29,6 +35,10 @@ const SKY_STOPS: Stop[] = [
 ];
 
 const SUN_WARM = new THREE.Color('#fff3d6');
+const HEMI_SKY_DAY = new THREE.Color('#cfe8ff');
+const HEMI_SKY_NIGHT = new THREE.Color('#6f83ad');
+const HEMI_GROUND_DAY = new THREE.Color('#3d3a30');
+const HEMI_GROUND_NIGHT = new THREE.Color('#1d2940');
 
 function sampleStops(stops: Stop[], t: number): THREE.Color {
   const wrapped = ((t % 1) + 1) % 1;
@@ -79,10 +89,6 @@ const NIGHT_HYSTERESIS = 0.02;
 // rather than going fully black.
 const DAYLIGHT_NIGHT_FLOOR = 0.25;
 
-const EXPOSURE_DAY = 1.0;
-// Task 23: raised from 0.65 so ACES tone mapping doesn't crush night scenes to near-black;
-// 0.75 keeps a clear day/night exposure difference while making terrain silhouettes readable.
-const EXPOSURE_NIGHT = 0.75;
 const EXPOSURE_LAMBDA = 1.5; // ease rate, 1/s
 
 /**
@@ -379,10 +385,13 @@ export class Atmosphere {
     );
     this.sun.target.position.set(0, 0, 0);
 
-    // Hemisphere light 0.24 (night) -> 0.55 (day). Task 23: floor raised from 0.15 so the darkest
-    // part of the night still has enough ambient skyglow to read terrain silhouettes, without
-    // raising the daytime end (keeps day/night contrast, i.e. the "mood", intact).
-    this.hemi.intensity = THREE.MathUtils.lerp(0.24, 0.55, elevation01);
+    // Keep diffuse form readable through twilight, and give PBR materials a restrained neutral
+    // reflection source at every hour. Both curves are continuous across the horizon.
+    this.hemi.intensity = ambientFillForElevation(elevationRaw);
+    this.scene.environmentIntensity = environmentFillForElevation(elevationRaw);
+    const hemiDaylight = clamp01((elevationRaw + 0.25) / 0.85);
+    this.hemi.color.lerpColors(HEMI_SKY_NIGHT, HEMI_SKY_DAY, hemiDaylight);
+    this.hemi.groundColor.lerpColors(HEMI_GROUND_NIGHT, HEMI_GROUND_DAY, hemiDaylight);
 
     // Task 38: eased daylight signal for the water shader, same elevation01 curve as hemi above.
     // At elevation01=1 (midday) this is exactly 1.0, a no-op vs. pre-Task-38 water rendering.
@@ -400,7 +409,7 @@ export class Atmosphere {
   }
 
   private applyExposure(dt: number): void {
-    const target = this.night ? EXPOSURE_NIGHT : EXPOSURE_DAY;
+    const target = exposureForElevation(sunElevation(this.timeOfDay));
     const cur = this.renderer.toneMappingExposure;
     this.renderer.toneMappingExposure = cur + (target - cur) * clamp01(EXPOSURE_LAMBDA * dt);
   }
