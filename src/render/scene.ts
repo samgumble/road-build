@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { PIXEL_RATIO_CAP, SHADOW_MAP_SIZE } from './quality';
 import { buildHorizonSkirt } from './horizonSkirt';
 
@@ -23,10 +24,22 @@ export function createScene(canvas: HTMLCanvasElement): SceneRig {
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color('#bcd9e8');
-  scene.fog = new THREE.Fog('#bcd9e8', 400, 900);
+  // Keep the horizon soft without veiling the initial overview camera, which begins roughly 540
+  // units from the island centre. Weather can still pull this inward for a deliberately hazy read.
+  scene.fog = new THREE.Fog('#bcd9e8', 620, 900);
   scene.add(buildHorizonSkirt());
 
-  const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 2, 2000);
+  // A small procedural PMREM gives all standard/physical materials coherent ambient reflections.
+  // It avoids an external HDR payload and stays subtle enough for the sun to remain the key light.
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const roomEnvironment = new RoomEnvironment();
+  const environmentTarget = pmrem.fromScene(roomEnvironment, 0.04);
+  scene.environment = environmentTarget.texture;
+  scene.environmentIntensity = 0.24;
+  roomEnvironment.dispose();
+  pmrem.dispose();
+
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 2, 3500);
   camera.position.set(340, 260, 340);
   camera.lookAt(0, 0, 0);
 

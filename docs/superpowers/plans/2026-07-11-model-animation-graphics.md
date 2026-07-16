@@ -53,7 +53,7 @@
 
 **Files:** `src/render/scene.ts`, `src/render/postfx.ts`, `src/render/terrainRenderer.ts`, `src/render/atmosphere.ts`, `src/render/quality.ts`
 
-- [ ] Add a small environment map or procedural sky contribution for coherent reflections.
+- [x] Add a small environment map or procedural sky contribution for coherent reflections.
 - [ ] Add contact-shadow decals or a low-cost blob-shadow pool beneath vehicles/large props.
 - [ ] Introduce terrain macro color/roughness variation and slope-aware rock seasoning.
 - [ ] Improve water depth color, shoreline foam restraint, night response, and reflection roughness.
@@ -74,4 +74,3 @@
 - [ ] Test high/low tiers on desktop and a physical mobile device.
 - [ ] Test asset-load failure and confirm primitive fallbacks produce a playable scene.
 - [ ] Run full tests/build, update asset provenance, and update `docs/HANDOFF.md`.
-

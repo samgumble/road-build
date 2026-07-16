@@ -10,10 +10,10 @@ describe('horizon skirt (world-edge softening)', () => {
 
     const geometry = skirt.geometry as THREE.CylinderGeometry;
     expect(geometry.type).toBe('CylinderGeometry');
-    // inside the fog's far distance (900) so the fog fully tints it, but beyond the camera's
-    // maximum orbit so the player can never fly through it
-    expect(geometry.parameters.radiusTop).toBeGreaterThan(900 * 0.9);
-    expect(geometry.parameters.radiusTop).toBeLessThan(1100);
+    // Beyond fog far (900) plus the camera's maximum orbit (620), so even the nearest wall is
+    // fully fog-tinted and the player can never expose the cylinder's surface or fly through it.
+    expect(geometry.parameters.radiusTop).toBeGreaterThan(1520);
+    expect(geometry.parameters.radiusTop).toBeLessThan(1800);
     expect(geometry.parameters.openEnded).toBe(true);
 
     const material = skirt.material as THREE.MeshBasicMaterial;

@@ -1,7 +1,9 @@
 import * as THREE from 'three';
 import { QUALITY } from './quality';
 
-const DOME_RADIUS = 900; // inside the camera's far plane (2000), outside fog far (900 base) and terrain
+// Large enough that the camera's maximum 620-unit orbit cannot approach the shell. The former
+// 900-unit dome exposed its coarse latitude bands when zoomed out and panned off-centre.
+const DOME_RADIUS = 2400;
 
 const STAR_COUNT_HIGH = 1400;
 const STAR_COUNT_LOW = 500;
@@ -81,7 +83,7 @@ export class Sky {
   private zenithScratch = new THREE.Color();
 
   constructor(scene: THREE.Scene) {
-    const geo = new THREE.SphereGeometry(DOME_RADIUS, 48, 32);
+    const geo = new THREE.SphereGeometry(DOME_RADIUS, 96, 64);
     this.material = new THREE.ShaderMaterial({
       vertexShader: VERTEX_SHADER,
       fragmentShader: FRAGMENT_SHADER,

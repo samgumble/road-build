@@ -147,6 +147,13 @@ assuming a green build means the page is live.
   per-object draws are the three bounded construction crew rigs (cheap primitives per the Task 25
   ruling) and one-off landmarks. The "instanced rendering" improvement bet is closed — R5's asset
   budgets are the next lever, not more instancing.
+- Lighting/atmosphere upgrade (2026-07-15, `codex/lighting-atmosphere-upgrade`): standard/physical
+  materials now share a procedural PMREM environment with restrained solar-elevation intensity;
+  hemisphere color shifts toward blue after sunset and ACES exposure adapts continuously instead
+  of switching to a darker binary night value. Base fog begins beyond the opening overview, and
+  the horizon skirt/sky dome were moved outside the maximum camera orbit and given denser geometry
+  so their bands cannot become visible at wide zoom. Pure lighting curves are pinned in
+  `tests/atmosphere.test.ts`; the skirt clearance contract is pinned in `tests/horizonSkirt.test.ts`.
 
 ## Invariants worth protecting
 

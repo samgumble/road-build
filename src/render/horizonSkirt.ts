@@ -1,11 +1,12 @@
 import * as THREE from 'three';
 
-/** Horizon skirt (polish pass): a huge inward-facing cylinder just inside the fog's far distance.
- * At that range the fog paints it entirely fog-colored, and its alpha map fades it out toward the
+/** Horizon skirt (polish pass): a huge inward-facing cylinder beyond the fog's far distance even
+ * after accounting for the camera's maximum 620-unit orbit. Fog paints it entirely horizon-colored,
+ * and its alpha map fades it out toward the
  * top — so the island's terrain/water edge dissolves into haze instead of ending like a table
  * edge when viewed from low angles. No per-frame color sync needed: the fog does the tinting. */
 export function buildHorizonSkirt(): THREE.Mesh {
-  const geometry = new THREE.CylinderGeometry(950, 950, 320, 48, 1, true);
+  const geometry = new THREE.CylinderGeometry(1700, 1700, 320, 64, 1, true);
   const material = new THREE.MeshBasicMaterial({
     color: '#ffffff', // irrelevant — fully fog-mixed at this distance
     side: THREE.BackSide,
