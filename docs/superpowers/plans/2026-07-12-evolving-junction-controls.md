@@ -56,7 +56,7 @@ export interface JunctionPlan {
 }
 ```
 
-- [ ] **Step 1: Write failing planner-policy tests**
+- [x] **Step 1: Write failing planner-policy tests**
 
 Add these deterministic fixtures to `tests/junctionPlan.test.ts`:
 
@@ -125,13 +125,13 @@ it('never assigns controls to a degree-two seam', () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `npx vitest run tests/junctionPlan.test.ts`
 
 Expected: missing `majorEdgeIds`, `stoppedEdgeIds`, and `signalGroups`.
 
-- [ ] **Step 3: Implement deterministic approach classification**
+- [x] **Step 3: Implement deterministic approach classification**
 
 Normalize angle distance with:
 
@@ -158,13 +158,13 @@ stopZ: node.z + Math.sin(arm.heading) * 4.5,
 stopHeading: arm.heading + Math.PI,
 ```
 
-- [ ] **Step 4: Run planner tests**
+- [x] **Step 4: Run planner tests**
 
 Run: `npx vitest run tests/junctionPlan.test.ts`
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sim/roads/junctionPlan.ts tests/junctionPlan.test.ts

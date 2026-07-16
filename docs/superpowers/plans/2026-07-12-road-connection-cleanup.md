@@ -40,7 +40,7 @@
 - Produces: `'roads:connectionsChanged': { nodeIds: number[] }`
 - Contract: one sorted, deduplicated payload after each successful public `commitChain`, `splitEdge`, or `removeEdge` transaction.
 
-- [ ] **Step 1: Write failing graph-event tests**
+- [x] **Step 1: Write failing graph-event tests**
 
 Append tests that collect payloads and cover simple commit, interior split/tie-in, loop closure, and removal:
 
@@ -79,13 +79,13 @@ it('emits one transaction for a closed loop and one for removal', () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `npx vitest run tests/graph.test.ts`
 
 Expected: TypeScript/test failure because `roads:connectionsChanged` is not in `GameEvents` and no payload is emitted.
 
-- [ ] **Step 3: Add the event and transaction collector**
+- [x] **Step 3: Add the event and transaction collector**
 
 Add to `GameEvents`:
 
@@ -135,13 +135,13 @@ commitChain(rawCtrl: P2[]): number[] {
 
 Extract the current body verbatim to `private commitChainBody(rawCtrl: P2[]): number[]`. In `makeEdge`, call `touchConnection(a, b)`. In `replaceEdgeWithSplit`, call `touchConnection(e.a, id, e.b)`. This makes nested operations additive while the outermost boundary emits once.
 
-- [ ] **Step 4: Run graph tests and full typecheck**
+- [x] **Step 4: Run graph tests and full typecheck**
 
 Run: `npx vitest run tests/graph.test.ts && npx tsc --noEmit`
 
 Expected: all graph tests pass; no event payload type errors.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/core/events.ts src/sim/roads/graph.ts tests/graph.test.ts
@@ -170,7 +170,7 @@ export interface JunctionPlan {
 export function planJunction(graph: RoadGraph, nodeId: number): JunctionPlan | null;
 ```
 
-- [ ] **Step 1: Write failing planner tests**
+- [x] **Step 1: Write failing planner tests**
 
 Create `tests/junctionPlan.test.ts` with these imports/helpers, then the tests below:
 
@@ -232,13 +232,13 @@ it('separates stable topology identity from stage-only surface state', () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `npx vitest run tests/junctionPlan.test.ts`
 
 Expected: module-not-found failure for `junctionPlan.ts`.
 
-- [ ] **Step 3: Implement the pure planner**
+- [x] **Step 3: Implement the pure planner**
 
 Use endpoint samples to calculate outward headings:
 
@@ -266,13 +266,13 @@ export function planJunction(graph: RoadGraph, nodeId: number): JunctionPlan | n
 }
 ```
 
-- [ ] **Step 4: Run planner tests**
+- [x] **Step 4: Run planner tests**
 
 Run: `npx vitest run tests/junctionPlan.test.ts`
 
 Expected: all planner tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sim/roads/junctionPlan.ts tests/junctionPlan.test.ts
@@ -291,7 +291,7 @@ git commit -m "feat(roads): classify connection seams and junctions"
 - Consumes: `planJunction(graph, nodeId)` and `roads:connectionsChanged`.
 - Produces: seam meshes tagged `roadDetail='connectionSurface'` and `roadDetail='connectionCenterline'`.
 
-- [ ] **Step 1: Replace the old degree-2 cap expectation with failing ownership tests**
+- [x] **Step 1: Replace the old degree-2 cap expectation with failing ownership tests**
 
 Add these fixtures beside the existing `junctionSampler` in `tests/roadContinuity.test.ts`:
 
@@ -360,13 +360,13 @@ it('gives both closed-loop nodes seam geometry without controls', () => {
 });
 ```
 
-- [ ] **Step 2: Run the continuity tests and verify RED**
+- [x] **Step 2: Run the continuity tests and verify RED**
 
 Run: `npx vitest run tests/roadContinuity.test.ts`
 
 Expected: degree-2 groups do not exist and both incident surfaces still carry endpoint caps.
 
-- [ ] **Step 3: Generalize connection ownership in RoadRenderer**
+- [x] **Step 3: Generalize connection ownership in RoadRenderer**
 
 Replace degree-3-only `junctionOwnsEdgeEnd` with:
 
@@ -397,13 +397,13 @@ const stripe = buildRibbonGeometry(stripeSamples, CENTERLINE_WIDTH, CENTERLINE_Y
 Use the existing road stage colors/material tags. Add centerline only when both incident edges are
 painted. Degree-3+ remains unstriped.
 
-- [ ] **Step 4: Run continuity and renderer tests**
+- [x] **Step 4: Run continuity and renderer tests**
 
 Run: `npx vitest run tests/roadContinuity.test.ts tests/roadRendererBands.test.ts tests/roadDetails.test.ts`
 
 Expected: all pass; bridge tests remain unchanged.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/render/roadRenderer.ts tests/roadContinuity.test.ts
@@ -423,7 +423,7 @@ git commit -m "feat(render): replace degree-two cap overlap with shared seams"
   `JunctionPlan.surfaceSignature`.
 - Produces: `rebuildConnections(nodeIds: readonly number[], forceControlMode?: boolean)` with signature no-op behavior.
 
-- [ ] **Step 1: Add failing lifecycle tests**
+- [x] **Step 1: Add failing lifecycle tests**
 
 Use geometry object identity as the observable rebuild signal; do not add test-only counters:
 
@@ -464,14 +464,14 @@ it('rebuilds every existing incident edge after a new tie-in', () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `npx vitest run tests/roadContinuity.test.ts`
 
 Expected: unrelated events or frames replace geometry because signature caching/transaction-only
 rebuild behavior is not implemented, or the existing incident edge keeps stale endpoint geometry.
 
-- [ ] **Step 3: Implement cached dirty-node rebuilds**
+- [x] **Step 3: Implement cached dirty-node rebuilds**
 
 Add:
 
@@ -497,7 +497,7 @@ Construction-stage handling calls `refreshConnectionStage(nodeId)` for the edge'
 that method compares only `surfaceSignature`, swaps material/visibility, and updates the cached
 surface signature without rebuilding incident edge geometry or recalculating topology.
 
-- [ ] **Step 4: Run focused and full tests**
+- [x] **Step 4: Run focused and full tests**
 
 Run: `npx vitest run tests/roadContinuity.test.ts tests/graph.test.ts tests/roadRendererBands.test.ts`
 
@@ -505,7 +505,7 @@ Then: `npm test && npm run build`
 
 Expected: all tests/build pass; existing bundle-size advisory may remain.
 
-- [ ] **Step 5: Update handoff and commit**
+- [x] **Step 5: Update handoff and commit**
 
 Append the event/ownership contract to `docs/HANDOFF.md`, then:
 

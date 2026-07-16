@@ -62,7 +62,7 @@ export class WeatherController {
 export const WEATHER_PROFILES: Readonly<Record<WeatherKind, WeatherSnapshot>>;
 ```
 
-- [ ] **Step 1: Write failing deterministic/state-machine tests**
+- [x] **Step 1: Write failing deterministic/state-machine tests**
 
 ```ts
 it('produces the same state sequence for the same seed and dt sequence', () => {
@@ -119,13 +119,13 @@ it('restores mid-transition and chooses the same following state', () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `npx vitest run tests/weather.test.ts`
 
 Expected: `src/render/weather.ts` missing.
 
-- [ ] **Step 3: Define profiles, transition graph, and deterministic draws**
+- [x] **Step 3: Define profiles, transition graph, and deterministic draws**
 
 Use exact profiles:
 
@@ -161,13 +161,13 @@ Re-derive transition duration from seed/index after restore. Blend with smoothst
 `u*u*(3-2*u)`. During transition, `snapshot.kind` remains `current`; it changes to `next` only when
 the transition completes and `update` returns true.
 
-- [ ] **Step 4: Run controller tests**
+- [x] **Step 4: Run controller tests**
 
 Run: `npx vitest run tests/weather.test.ts`
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/core/weather.ts src/render/weather.ts tests/weather.test.ts

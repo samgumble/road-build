@@ -192,14 +192,30 @@ assuming a green build means the page is live.
   cap reflection strength separately. The foam band is narrower, dimmer, and less opacity-heavy,
   while the existing depth tint, night daylight multiplier, fog, and depth-based outer fade remain
   authoritative. Shader wiring and response bounds are pinned in `tests/waterMaterial.test.ts`.
-- Weather/settlement legibility (2026-07-15, `codex/weather-settlement-legibility`): full rain now
+- Weather legibility (2026-07-15, `codex/weather-settlement-legibility`): full rain now
   floors fog at 480–720u and retains 65% of the solar key, keeping the island road network and work
   fronts readable while roads/rain streaks still sell wet weather. High tier adds a restrained
   0.96-saturation/1.02-contrast warm grade before the existing output pass; low tier remains direct.
-  GrowthSim reserves a 9u future-tower footprint before accepting a house, so later in-place
-  upgrades cannot create overlaps. `SceneryRenderer.rebuild` deterministically separates legacy
-  saved structures for rendering only; saved/simulation coordinates stay authoritative. Contracts
-  live in `tests/weatherLegibility.test.ts` and the settlement-placement block of `tests/growth.test.ts`.
+  Contracts live in `tests/weatherLegibility.test.ts`.
+- Structure-overlap rollback (2026-07-16, `codex/connection-roadmap`): by explicit design request,
+  houses/buildings may once again share or closely overlap parcel centers. Growth no longer rejects
+  a structure against a reserved 9u future-tower footprint, and restored saves render every
+  structure at its authoritative saved coordinates without a render-only separation pass. Focused
+  contracts live in `tests/growth.test.ts` and `tests/sceneryDecay.test.ts`.
+- Topology-owned road connections (2026-07-16, `codex/connection-roadmap`): each graph mutation now
+  emits one sorted `roads:connectionsChanged` transaction. Degree-2 corners and closed loops own a
+  shared surface, verge, and continuous painted centerline instead of overlapping edge caps;
+  degree-3+ junctions retain shared conflict geometry. The pure `planJunction` policy identifies
+  clear through pairs, stopped approaches, and non-conflicting signal groups. `RoadRenderer` caches
+  per-node topology/surface signatures, rebuilds only affected incident edges and endpoint groups,
+  disposes replaced GPU resources, and draws stop paint only on policy-stopped approaches. Contracts
+  live in `tests/graph.test.ts`, `tests/junctionPlan.test.ts`, and `tests/roadContinuity.test.ts`.
+- Living-weather foundation (2026-07-16, `codex/connection-roadmap`): `WeatherController` provides a
+  seeded five-state clear/overcast/rain/fog transition graph, smooth bounded presentation snapshots,
+  deterministic save/restore, cached transition durations, and a stable allocation-free snapshot
+  object for per-frame consumers. This slice is deliberately foundation-only: atmosphere, roads,
+  water, saves, and Guide UI still use their existing weather wiring until Tasks 2–5 of
+  `docs/superpowers/plans/2026-07-12-living-weather.md` are implemented.
 
 ## Invariants worth protecting
 
@@ -228,6 +244,10 @@ assuming a green build means the page is live.
   and corridor clearing; do not reuse the field/tree center-distance rule blindly.
 - **Road detail layering:** Keep shoulder polygon offset weaker than the road ribbon and omit it on
   bridge arclength ranges. Decorative wear must remain presentation-only and share mesh disposal.
+- **Connection ownership:** Degree-2 and degree-3+ shared surfaces belong to their graph node, while
+  incident edge ribbons trim at owned ends. Rebuild connection geometry only from
+  `roads:connectionsChanged` or a changed endpoint surface signature; never restore unconditional
+  all-node rebuilds or retain signature entries for degree-1 endpoints.
 - **Undo stays a thin input:** The undo window is wall-clock UI state, not sim state — it must
   never enter the save file, and undoing must stay "enqueueDemolish over the last commit's own
   edge ids" (filtered for edges that still exist) rather than growing a parallel removal path.
@@ -249,18 +269,16 @@ These are deliberately uncommitted product directions, not known blockers:
    focus/backdrop behavior was correct. Localhost automation was policy-blocked, so that check used
    the published GitHub Pages build after its workflow passed.
 
-## Latest release verification — 2026-07-10
+## Latest release verification — 2026-07-16
 
-- Commit `fe59de7` is on `origin/main`; GitHub Pages run `29134423122` completed successfully.
-- Local and CI verification: 33 Vitest files / 283 tests pass; `tsc --noEmit` and Vite production
-  build pass. The existing bundle-size advisory remains non-blocking.
-- Published smoke test used a clean `roadside-check-fe59de7` seed with development paused: a road
-  built through the full stage train, emitted the Road Open milestone, accepted traffic, rendered
-  seated shoulders/ditches/surface wear without scenery overlap, and produced no console errors.
-- Desktop HUD/title and a 375×812 responsive viewport were checked; document width stayed exactly
-  375px with no horizontal overflow. The in-app browser's live viewport-resize screenshot briefly
-  showed a partial WebGL frame until reload, but a clean-size reload and prior mobile checks cover
-  layout; keep real-device WebGL resize in the standing mobile QA checklist.
+- The `codex/connection-roadmap` release candidate passes the complete Vitest suite, `tsc --noEmit`,
+  and the Vite production build. The existing bundle-size advisory remains non-blocking.
+- Local production-preview smoke used a clean Broad Meadow island: two connected roads completed
+  through separate crews at 16×, rendered a clean shared corner seam, emitted both Road Open
+  milestones, and produced no browser console errors.
+- Focused regression coverage additionally proves overlapping settlement restore coordinates,
+  direct-split and tie-in invalidation cardinality, connection geometry identity/disposal, safe
+  signal grouping, and deterministic mid-transition weather restore.
 
 ## Review checklist
 
