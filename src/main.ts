@@ -228,13 +228,15 @@ function main(): void {
       const dt = Math.min((now - lastFrameTime) / 1000, 0.25);
       lastFrameTime = now;
       cameraRig.update(dt);
-      roadRenderer.update(dt, atmosphere.rainAmount);
       drawTool.update(dt);
       // Important 10: the day/night cycle accelerates with the HUD's speed control — but capped
       // at ATMOSPHERE_MAX_TIMESCALE (4x): at a raw 16x the lighting sweeps noon->midnight every
       // couple of minutes and reads as strobing while you fast-forward construction. Sim, crews,
       // traffic, and growth all still honor the full selected speed; only lighting stays calm.
       atmosphere.update(dt * atmosphereTimeScale(loop.timeScale));
+      // Roads, precipitation, clouds, and water all consume the same post-update weather snapshot
+      // so their blended transitions stay visually locked to one another within the render frame.
+      roadRenderer.update(dt, atmosphere.weatherSnapshot.rain);
       // Task 46 (Groundwork stutter fix): ConstructionRenderer's vehicle position/heading damping
       // needs to know how much SIM time this rendered frame actually covered (see
       // ConstructionRenderer.update's `timeScale` param doc) — but its many wall-clock-calibrated
@@ -260,7 +262,7 @@ function main(): void {
       audio.update(dt, atmosphere.timeOfDay, camera.position.x);
       // Task 38: feed Atmosphere's eased daylight signal into the water shader so lakes/ponds dim
       // at night along with the rest of the lit scene instead of glowing at a constant brightness.
-      terrain.update(dt, atmosphere.daylight);
+      terrain.update(dt, atmosphere.daylight, atmosphere.weatherSnapshot);
       renderFrame();
     },
   );

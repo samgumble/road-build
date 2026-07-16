@@ -1,4 +1,4 @@
-import type { WeatherSnapshot } from '../core/weather';
+import { WEATHER_PROFILES, type WeatherSnapshot } from '../core/weather';
 
 export interface RainVisibility {
   fogNear: number;
@@ -20,6 +20,32 @@ export interface WeatherAtmosphereValues {
   hemiScale: number;
   cloudOpacity: number;
   rainOpacity: number;
+}
+
+export interface WaterWeatherValues {
+  rippleAmpScale: number;
+  rippleSpeedScale: number;
+  foamScale: number;
+}
+
+/** Converts the shared weather snapshot into bounded multipliers for the authored water surface.
+ * Clear weather is an exact identity so adding living weather cannot alter the established look. */
+export function waterWeatherValues(
+  snapshot: Readonly<WeatherSnapshot>,
+  out?: WaterWeatherValues,
+): WaterWeatherValues {
+  const clear = WEATHER_PROFILES.clear;
+  const roughnessRange = Math.max(Number.EPSILON, 1 - clear.waterRoughness);
+  const windRange = Math.max(Number.EPSILON, 1 - clear.wind);
+  const roughness = Math.max(0, Math.min(1,
+    (snapshot.waterRoughness - clear.waterRoughness) / roughnessRange,
+  ));
+  const wind = Math.max(0, Math.min(1, (snapshot.wind - clear.wind) / windRange));
+  const values = out ?? { rippleAmpScale: 1, rippleSpeedScale: 1, foamScale: 1 };
+  values.rippleAmpScale = 1 + roughness * 0.85;
+  values.rippleSpeedScale = 1 + roughness * 0.65;
+  values.foamScale = 1 + wind * 0.25;
+  return values;
 }
 
 export function weatherCloudWeight(cloudCover: number, groupIndex: number, groupCount: number): number {

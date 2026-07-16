@@ -2,7 +2,9 @@ import * as THREE from 'three';
 import { GRID_SIZE, WORLD_SIZE, WATER_LEVEL, CELL } from '../core/constants';
 import type { Heightfield } from '../sim/terrain/heightfield';
 import type { EventBus } from '../core/events';
+import type { WeatherSnapshot } from '../core/weather';
 import { QUALITY } from './quality';
+import { waterWeatherValues, type WaterWeatherValues } from './weatherTuning';
 
 const SAND = new THREE.Color('#c9b98a');
 const GRASS = new THREE.Color('#7fae6b');
@@ -140,6 +142,7 @@ const WATER_FRAGMENT_SHADER = /* glsl */ `
   uniform vec3 uDeepColor;
   uniform float uOpacity;
   uniform float uFoamAnimAmount; // 0 on low tier (static band), 1 on high (animated)
+  uniform float uWeatherFoamScale;
   uniform float uReflectionStrength;
   uniform float uSurfaceRoughness;
   // Task 38: eased 0..1 daylight signal from Atmosphere (1.0 midday, floors ~0.25 deep night).
@@ -200,6 +203,8 @@ const WATER_FRAGMENT_SHADER = /* glsl */ `
     float foam = 1.0 - smoothstep(0.0, 0.065, animatedShore);
     float sparkle = waterNoise(vWorldXZ * 0.6 + uTime * 0.4 * uFoamAnimAmount);
     foam *= 0.58 + 0.22 * sparkle;
+    // Wind raises shore foam without adding shader branches or rebuilding the water material.
+    foam *= uWeatherFoamScale;
     // Task 38: foam scales down with daylight - white shore-foam sparkle is a daylight phenomenon
     // (sun glint/whitecaps) and reads as an unnatural glow when it stays full-bright at night.
     // uDaylight == 1.0 (midday) leaves foam untouched, so day rendering is unchanged.
@@ -256,6 +261,11 @@ export class TerrainRenderer {
   private geo: THREE.PlaneGeometry;
   private waterMaterial: THREE.ShaderMaterial;
   private waterTime = 0;
+  private readonly waterWeatherScratch: WaterWeatherValues = {
+    rippleAmpScale: 1,
+    rippleSpeedScale: 1,
+    foamScale: 1,
+  };
 
   private lastNormalRecomputeAt = 0;
   private pendingFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -330,6 +340,7 @@ export class TerrainRenderer {
           uRippleAmp: { value: WATER_RIPPLE_AMP },
           uRippleSpeed: { value: WATER_RIPPLE_SPEED },
           uFoamAnimAmount: { value: WATER_FOAM_ANIM },
+          uWeatherFoamScale: { value: 1 },
           uReflectionStrength: { value: WATER_REFLECTION_STRENGTH },
           uSurfaceRoughness: { value: WATER_SURFACE_ROUGHNESS },
           uDaylight: { value: 1 },
@@ -406,14 +417,27 @@ export class TerrainRenderer {
   /**
    * Advances the water ripple/foam time uniform and feeds Atmosphere's eased daylight signal
    * into the water shader (Task 38: night water dims instead of glowing — see uDaylight comments
-   * in WATER_FRAGMENT_SHADER). `daylight` defaults to 1 (full day / no-op) so callers that don't
-   * pass it — none currently, but kept safe for tests constructing this in isolation — keep the
-   * pre-Task-38 look. Called every render frame from main.ts.
+   * in WATER_FRAGMENT_SHADER). The optional shared weather snapshot scales the immutable authored
+   * ripple/foam bases; omitting it actively restores clear water rather than retaining a storm.
+   * `daylight` defaults to 1 (full day / no-op) for isolated callers. Called every render frame.
    */
-  update(dt: number, daylight = 1): void {
+  update(dt: number, daylight = 1, weather?: Readonly<WeatherSnapshot>): void {
     this.waterTime += dt;
+    const response = weather
+      ? waterWeatherValues(weather, this.waterWeatherScratch)
+      : this.resetWaterWeatherScratch();
     this.waterMaterial.uniforms.uTime.value = this.waterTime;
     this.waterMaterial.uniforms.uDaylight.value = daylight;
+    this.waterMaterial.uniforms.uRippleAmp.value = WATER_RIPPLE_AMP * response.rippleAmpScale;
+    this.waterMaterial.uniforms.uRippleSpeed.value = WATER_RIPPLE_SPEED * response.rippleSpeedScale;
+    this.waterMaterial.uniforms.uWeatherFoamScale.value = response.foamScale;
+  }
+
+  private resetWaterWeatherScratch(): WaterWeatherValues {
+    this.waterWeatherScratch.rippleAmpScale = 1;
+    this.waterWeatherScratch.rippleSpeedScale = 1;
+    this.waterWeatherScratch.foamScale = 1;
+    return this.waterWeatherScratch;
   }
 
   private colorForVertex(i: number, j: number, y: number): THREE.Color {

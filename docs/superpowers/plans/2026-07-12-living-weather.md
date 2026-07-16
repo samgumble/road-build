@@ -291,7 +291,7 @@ git commit -m "feat(render): drive atmosphere from blended weather"
 - `TerrainRenderer.update(dt, daylight = 1, weather?: WeatherSnapshot)`.
 - `RoadRenderer.update` continues receiving only `weather.rain`.
 
-- [ ] **Step 1: Write failing water-response tests**
+- [x] **Step 1: Write failing water-response tests**
 
 Export a pure helper:
 
@@ -323,13 +323,13 @@ it('keeps fog water calm compared with heavy rain', () => {
 Retain current `wetRoadAppearance` tests and add a snapshot-driven assertion that clear maps to
 rain 0 and heavy rain maps to rain 1.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `npx vitest run tests/weather.test.ts tests/roadWeather.test.ts`
 
 Expected: helper/signature absent.
 
-- [ ] **Step 3: Add dynamic water uniforms**
+- [x] **Step 3: Add dynamic water uniforms**
 
 Add `uWeatherFoamScale`. Keep base quality constants immutable and set uniforms every frame:
 
@@ -351,13 +351,13 @@ multiply foam by `uWeatherFoamScale` before daylight scaling. Clear remains exac
 In `main.ts`, pass `atmosphere.weatherSnapshot.rain` to `roadRenderer.update` and the complete
 snapshot to `terrain.update`.
 
-- [ ] **Step 4: Run focused tests and build**
+- [x] **Step 4: Run focused tests and build**
 
 Run: `npx vitest run tests/weather.test.ts tests/roadWeather.test.ts && npm run build`
 
 Expected: all pass; low/high quality compile the same uniforms.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/render/terrainRenderer.ts src/main.ts tests/weather.test.ts tests/roadWeather.test.ts

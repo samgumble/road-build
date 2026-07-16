@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { WEATHER_PROFILES } from '../src/core/weather';
 import { wetRoadAppearance } from '../src/render/roadRenderer';
 
 describe('wet road appearance', () => {
@@ -25,5 +26,15 @@ describe('wet road appearance', () => {
   it('clamps rain input so appearance never overshoots its authored range', () => {
     expect(wetRoadAppearance('paint', 2, 0.85)).toEqual(wetRoadAppearance('paint', 1, 0.85));
     expect(wetRoadAppearance('paint', -1, 0.85)).toEqual(wetRoadAppearance('paint', 0, 0.85));
+  });
+
+  it('uses the blended weather snapshot rain amount without changing clear roads', () => {
+    expect(wetRoadAppearance('asphalt', WEATHER_PROFILES.clear.rain, 0.9)).toEqual({
+      colorScale: 1,
+      roughness: 0.9,
+    });
+    expect(wetRoadAppearance('asphalt', WEATHER_PROFILES['heavy-rain'].rain, 0.9)).toEqual(
+      wetRoadAppearance('asphalt', 1, 0.9),
+    );
   });
 });

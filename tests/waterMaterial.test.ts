@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import * as THREE from 'three';
 import { EventBus } from '../src/core/events';
+import { WEATHER_PROFILES } from '../src/core/weather';
 import { Heightfield } from '../src/sim/terrain/heightfield';
 
 let TerrainRenderer: typeof import('../src/render/terrainRenderer').TerrainRenderer;
@@ -47,5 +48,37 @@ describe('water surface response', () => {
     expect(material.uniforms.uReflectionStrength.value).toBeGreaterThan(0);
     expect(material.uniforms.uSurfaceRoughness.value).toBeGreaterThanOrEqual(0.6);
     expect(material.uniforms.uSurfaceRoughness.value).toBeLessThanOrEqual(0.85);
+  });
+
+  it('drives ripple and foam uniforms from weather and restores exact clear defaults', () => {
+    const renderer = new TerrainRenderer(
+      new THREE.Scene(),
+      new Heightfield('weather-water-test', new EventBus()),
+      new EventBus(),
+    );
+    const material = renderer.water.material as THREE.ShaderMaterial;
+    const clearAmp = material.uniforms.uRippleAmp.value;
+    const clearSpeed = material.uniforms.uRippleSpeed.value;
+
+    renderer.update(1 / 60, 1, WEATHER_PROFILES['heavy-rain']);
+
+    expect(material.uniforms.uRippleAmp.value).toBeGreaterThan(clearAmp * 1.5);
+    expect(material.uniforms.uRippleSpeed.value).toBeGreaterThan(clearSpeed * 1.4);
+    expect(material.uniforms.uWeatherFoamScale.value).toBeGreaterThan(1);
+    expect(material.fragmentShader).toContain('foam *= uWeatherFoamScale;');
+
+    renderer.update(1 / 60, 1, WEATHER_PROFILES.clear);
+
+    expect(material.uniforms.uRippleAmp.value).toBe(clearAmp);
+    expect(material.uniforms.uRippleSpeed.value).toBe(clearSpeed);
+    expect(material.uniforms.uWeatherFoamScale.value).toBe(1);
+
+    renderer.update(1 / 60, 1, WEATHER_PROFILES['heavy-rain']);
+    renderer.update(1 / 60, 0.4);
+
+    expect(material.uniforms.uRippleAmp.value).toBe(clearAmp);
+    expect(material.uniforms.uRippleSpeed.value).toBe(clearSpeed);
+    expect(material.uniforms.uWeatherFoamScale.value).toBe(1);
+    expect(material.uniforms.uDaylight.value).toBe(0.4);
   });
 });

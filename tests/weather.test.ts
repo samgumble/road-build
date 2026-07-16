@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { WEATHER_KINDS, WEATHER_PROFILES, type WeatherKind } from '../src/core/weather';
 import { WeatherController } from '../src/render/weather';
+import { waterWeatherValues } from '../src/render/weatherTuning';
 
 describe('WeatherController', () => {
   it('defines a complete bounded profile for every weather kind', () => {
@@ -92,5 +93,35 @@ describe('WeatherController', () => {
     weather.update(75);
     weather.restore(initial);
     expect(weather.saved).toEqual(initial);
+  });
+});
+
+describe('water weather response', () => {
+  it('leaves the authored clear-water presentation unchanged', () => {
+    expect(waterWeatherValues(WEATHER_PROFILES.clear)).toEqual({
+      rippleAmpScale: 1,
+      rippleSpeedScale: 1,
+      foamScale: 1,
+    });
+  });
+
+  it('reuses a supplied output object for allocation-free frame updates', () => {
+    const scratch = { rippleAmpScale: 0, rippleSpeedScale: 0, foamScale: 0 };
+
+    expect(waterWeatherValues(WEATHER_PROFILES['light-rain'], scratch)).toBe(scratch);
+    expect(scratch.rippleAmpScale).toBeGreaterThan(1);
+    expect(scratch.rippleSpeedScale).toBeGreaterThan(1);
+    expect(scratch.foamScale).toBeGreaterThan(1);
+  });
+
+  it('makes storm water visibly rougher and faster while keeping fog water calmer', () => {
+    const heavyRain = waterWeatherValues(WEATHER_PROFILES['heavy-rain']);
+    const coastalFog = waterWeatherValues(WEATHER_PROFILES['coastal-fog']);
+
+    expect(heavyRain.rippleAmpScale).toBeGreaterThan(1.5);
+    expect(heavyRain.rippleSpeedScale).toBeGreaterThan(1.4);
+    expect(heavyRain.foamScale).toBeGreaterThan(1);
+    expect(coastalFog.rippleAmpScale).toBeLessThan(heavyRain.rippleAmpScale);
+    expect(coastalFog.foamScale).toBe(1);
   });
 });
