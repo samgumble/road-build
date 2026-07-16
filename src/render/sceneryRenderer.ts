@@ -221,7 +221,100 @@ interface Recovering {
   fromSink: number; // sink distance (u) at the moment of rescue, eased back to 0
 }
 
-function fallbackTreeVariant(color: number, scene: THREE.Scene, capacity: number): VariantMesh {
+export interface WeatherWindUniforms {
+  time: { value: number };
+  wind: { value: number };
+}
+
+export function weatherWindUniforms(): WeatherWindUniforms {
+  return {
+    time: { value: 0 },
+    wind: { value: 0 },
+  };
+}
+
+const WEATHER_WIND_COMMON = `
+uniform float uWeatherTime;
+uniform float uWeatherWind;
+`;
+
+const TREE_WIND_VERTEX = `
+vec2 groundworkTreeOrigin = vec2(0.0);
+#ifdef USE_INSTANCING
+  groundworkTreeOrigin = instanceMatrix[3].xz;
+#endif
+float groundworkTreeWind = sin(
+  (groundworkTreeOrigin.x + groundworkTreeOrigin.y) * 0.08 + uWeatherTime * 1.7
+);
+float groundworkHeight = clamp(position.y / 5.0, 0.0, 1.0);
+transformed.xz += vec2(1.0, 0.35) * groundworkTreeWind * uWeatherWind * groundworkHeight * 0.12;
+`;
+
+const FIELD_WIND_VERTEX = `
+vec3 groundworkFieldWorld = position;
+#ifdef USE_INSTANCING
+  groundworkFieldWorld = (instanceMatrix * vec4(position, 1.0)).xyz;
+#endif
+float groundworkFieldRipple = (0.5 + 0.5 * sin(
+  groundworkFieldWorld.x * 0.42 + groundworkFieldWorld.z * 0.31 + uWeatherTime * 2.1
+)) * uWeatherWind * 0.025;
+transformed.y += groundworkFieldRipple;
+`;
+
+// Tree/field angular speeds are 17/10 and 21/10 rad/s, so 20π seconds completes an
+// integer 17/21 cycles respectively. Wrapping here protects long-session mobile precision without
+// a synchronized phase jump across the island.
+const WEATHER_WIND_TIME_WRAP = 20 * Math.PI;
+const weatherWindInstalls = new WeakMap<THREE.MeshStandardMaterial, 'tree' | 'field'>();
+
+function installWeatherWind(
+  material: THREE.MeshStandardMaterial,
+  uniforms: WeatherWindUniforms,
+  kind: 'tree' | 'field',
+  vertexSource: string,
+): void {
+  // Material.clone copies userData but not onBeforeCompile/customProgramCacheKey. A WeakMap marks
+  // the actual material object, allowing a cloned material to receive its own hook correctly.
+  if (weatherWindInstalls.get(material) === kind) return;
+
+  const previousCompile = material.onBeforeCompile;
+  const previousProgramKey = material.customProgramCacheKey.bind(material);
+  material.onBeforeCompile = (shader, renderer) => {
+    previousCompile.call(material, shader, renderer);
+    shader.uniforms.uWeatherTime = uniforms.time;
+    shader.uniforms.uWeatherWind = uniforms.wind;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n${WEATHER_WIND_COMMON}`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>\n${vertexSource}`);
+  };
+  material.customProgramCacheKey = () => `${previousProgramKey()}|groundwork-${kind}-wind-v1`;
+  material.userData.groundworkWeatherWind = kind;
+  weatherWindInstalls.set(material, kind);
+  material.needsUpdate = true;
+}
+
+/** Installs restrained, height-weighted sway while preserving MeshStandardMaterial lighting. */
+export function installTreeWind(
+  material: THREE.MeshStandardMaterial,
+  uniforms: WeatherWindUniforms,
+): void {
+  installWeatherWind(material, uniforms, 'tree', TREE_WIND_VERTEX);
+}
+
+/** Installs an upward-only crop ripple so a field can never dip into the terrain beneath it. */
+export function installFieldWind(
+  material: THREE.MeshStandardMaterial,
+  uniforms: WeatherWindUniforms,
+): void {
+  installWeatherWind(material, uniforms, 'field', FIELD_WIND_VERTEX);
+}
+
+function fallbackTreeVariant(
+  color: number,
+  scene: THREE.Scene,
+  capacity: number,
+  wind: WeatherWindUniforms,
+): VariantMesh {
   const trunk = new THREE.CylinderGeometry(0.15, 0.2, 1, 6);
   trunk.translate(0, 0.5, 0);
   const canopy = new THREE.ConeGeometry(1.4, 3, 8);
@@ -230,6 +323,7 @@ function fallbackTreeVariant(color: number, scene: THREE.Scene, capacity: number
   trunk.dispose();
   canopy.dispose();
   const mat = new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.85 });
+  installTreeWind(mat, wind);
   const mesh = new THREE.InstancedMesh(merged, mat, capacity);
   mesh.count = 0;
   mesh.castShadow = true;
@@ -297,6 +391,7 @@ export class SceneryRenderer {
   private buildingVariants: VariantMesh[] = [];
   private usingFallback = { tree: false, house: false, building: false };
   private ready = { tree: false, house: false, building: false };
+  private readonly weatherWind = weatherWindUniforms();
 
   private field: THREE.InstancedMesh;
   private fieldStripe: THREE.InstancedMesh;
@@ -380,6 +475,7 @@ export class SceneryRenderer {
     const fieldGeo = new THREE.PlaneGeometry(FIELD_SIZE, FIELD_SIZE);
     fieldGeo.rotateX(-Math.PI / 2);
     const fieldMat = new THREE.MeshStandardMaterial({ color: FIELD_STRIPE_COLORS[0], roughness: 0.95 });
+    installFieldWind(fieldMat, this.weatherWind);
     this.field = new THREE.InstancedMesh(fieldGeo, fieldMat, FIELD_CAPACITY);
     this.field.count = 0;
     this.field.receiveShadow = true;
@@ -390,6 +486,7 @@ export class SceneryRenderer {
     stripeGeo.rotateX(-Math.PI / 2);
     stripeGeo.translate(0, 0.02, 0);
     const stripeMat = new THREE.MeshStandardMaterial({ color: FIELD_STRIPE_COLORS[1], roughness: 0.95 });
+    installFieldWind(stripeMat, this.weatherWind);
     this.fieldStripe = new THREE.InstancedMesh(stripeGeo, stripeMat, FIELD_CAPACITY * 3);
     this.fieldStripe.count = 0;
     this.fieldStripe.receiveShadow = true;
@@ -442,8 +539,8 @@ export class SceneryRenderer {
       .catch(() => {
         const perVariant = Math.floor(TREE_CAPACITY / 2);
         this.treeVariants = [
-          fallbackTreeVariant(0x4e7d4a, this.scene, perVariant),
-          fallbackTreeVariant(0x3f6b3c, this.scene, TREE_CAPACITY - perVariant),
+          fallbackTreeVariant(0x4e7d4a, this.scene, perVariant, this.weatherWind),
+          fallbackTreeVariant(0x3f6b3c, this.scene, TREE_CAPACITY - perVariant, this.weatherWind),
         ];
         this.usingFallback.tree = true;
         this.ready.tree = true;
@@ -687,6 +784,7 @@ export class SceneryRenderer {
             0.35,
             1,
           );
+          if (category === 'tree') installTreeWind(styledMaterial, this.weatherWind);
         }
 
         const isLast = runtimeVariantIndex === runtimeVariantCount - 1;
@@ -1406,7 +1504,14 @@ export class SceneryRenderer {
     return t;
   }
 
-  update(dt: number): void {
+  update(dt: number, weatherWind = 0, weatherDt = dt): void {
+    // Wind is presentation-only and uses the same capped clock as Atmosphere. Keeping this clock
+    // separate from `dt` preserves sim-time pop/fade behavior at 16x without vibrating vegetation.
+    this.weatherWind.time.value = (
+      this.weatherWind.time.value + Math.max(0, weatherDt)
+    ) % WEATHER_WIND_TIME_WRAP;
+    this.weatherWind.wind.value = THREE.MathUtils.clamp(weatherWind, 0, 1);
+
     if (this.animating.length) {
       const stillAnimating: Animating[] = [];
       for (const a of this.animating) {

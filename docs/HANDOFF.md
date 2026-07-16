@@ -210,8 +210,8 @@ assuming a green build means the page is live.
   per-node topology/surface signatures, rebuilds only affected incident edges and endpoint groups,
   disposes replaced GPU resources, and draws stop paint only on policy-stopped approaches. Contracts
   live in `tests/graph.test.ts`, `tests/junctionPlan.test.ts`, and `tests/roadContinuity.test.ts`.
-- Living weather Tasks 1–3 (2026-07-16, `codex/connection-roadmap` and
-  `codex/living-weather-atmosphere`): `WeatherController` provides a seeded five-state
+- Living weather Tasks 1–4 (2026-07-16, `codex/connection-roadmap`,
+  `codex/living-weather-atmosphere`, and `codex/living-weather-wind`): `WeatherController` provides a seeded five-state
   clear/overcast/rain/fog transition graph, smooth bounded snapshots, deterministic save/restore,
   cached transition durations, and a stable allocation-free snapshot object. `Atmosphere` now
   replaces its independent binary shower scheduler with that snapshot: cloud coverage/color/drift,
@@ -221,8 +221,11 @@ assuming a green build means the page is live.
   live overview QA found the plan's 35/110u floor hid the entire island. Zero-weight cloud groups
   stop submitting draw calls. The same post-update snapshot now drives road rain and water every
   frame: clear is an exact authored reset, while roughness increases ripple amplitude/speed and
-  wind adds bounded shore foam before the existing daylight dimming. Vegetation wind, save
-  persistence, and Guide status remain Tasks 4–5 in
+  wind adds bounded shore foam before the existing daylight dimming. Trees now receive restrained,
+  root-weighted GPU sway and legacy field/crop-stripe materials receive an upward-only world-phased
+  ripple. These share two material uniforms, add no draw calls or per-frame matrix rewrites, and
+  use Atmosphere's capped visual clock separately from sim-time scenery fades. Save persistence and
+  Guide status remain Task 5 in
   `docs/superpowers/plans/2026-07-12-living-weather.md`.
 
 ## Invariants worth protecting

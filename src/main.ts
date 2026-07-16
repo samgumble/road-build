@@ -254,7 +254,11 @@ function main(): void {
       // could arrive up to 16x faster than this renderer's local fade timer at the fastest speed
       // setting, popping buildings out instantly at ~1.5% through their local fade rather than
       // smoothly finishing together.
-      sceneryRenderer.update(dt * loop.timeScale);
+      sceneryRenderer.update(
+        dt * loop.timeScale,
+        atmosphere.weatherSnapshot.wind,
+        dt * atmosphereTimeScale(loop.timeScale),
+      );
       villagerRenderer.update(dt);
       // Audio intentionally stays real-time: `update()` uses `dt` only for its own wall-clock
       // scheduling (bird/cricket timers, pad chord crossfades), not to advance the day cycle —

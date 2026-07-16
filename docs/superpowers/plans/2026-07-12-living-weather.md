@@ -374,10 +374,11 @@ git commit -m "feat(render): make roads and water respond to living weather"
 - Modify: `src/main.ts`
 
 **Interfaces:**
-- `SceneryRenderer.update(dt, weatherWind = 0)`.
+- `SceneryRenderer.update(dt, weatherWind = 0, weatherDt = dt)`; `dt` stays on sim time for
+  pop/fade/recovery, while `weatherDt` follows Atmosphere's capped visual clock.
 - Shared uniforms `uWeatherTime` and `uWeatherWind` installed once per tree/field material.
 
-- [ ] **Step 1: Write failing shader-installation tests**
+- [x] **Step 1: Write failing shader-installation tests**
 
 Export:
 
@@ -425,13 +426,13 @@ it('updates one shared wind scalar without replacing instance matrices', () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `npx vitest run tests/sceneryWeather.test.ts`
 
 Expected: wind helpers absent.
 
-- [ ] **Step 3: Install material-level wind once**
+- [x] **Step 3: Install material-level wind once**
 
 Patch `<common>` with uniforms and patch `<begin_vertex>`:
 
@@ -450,13 +451,13 @@ Store the shared object as `private readonly weatherWind: WeatherWindUniforms`; 
 through the same structural-private pattern already used elsewhere, without adding a public
 test-only method.
 
-- [ ] **Step 4: Run scenery and full render tests**
+- [x] **Step 4: Run scenery and full render tests**
 
 Run: `npx vitest run tests/sceneryWeather.test.ts tests/sceneryDecay.test.ts tests/modelStyles.test.ts`
 
 Expected: all pass; model fallback and GLTF paths both install wind hooks.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/render/sceneryRenderer.ts src/main.ts tests/sceneryWeather.test.ts
