@@ -167,6 +167,12 @@ assuming a green build means the page is live.
   clears idle slots every frame, and covers synthesized rollers, graders, and the shared crane
   without adding shadow-casting lights or per-machine draw calls. The scene contract and idle
   cleanup are pinned in `tests/constructionConvoy.test.ts`.
+- Terrain-material depth (2026-07-15, `codex/terrain-material-upgrade`): the terrain vertex palette
+  now crossfades sand, grass, highland grass, and rock instead of snapping at fixed bands. A
+  deterministic world-space value field gently varies the cliff threshold and albedo, while the
+  existing `MeshStandardMaterial` shader hook adds macro roughness variation with no textures or
+  extra draw calls. Deformation repaints remain deterministic; palette progression and the shader
+  contract are pinned in `tests/terrainMaterial.test.ts`.
 
 ## Invariants worth protecting
 
