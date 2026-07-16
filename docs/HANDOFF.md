@@ -173,6 +173,12 @@ assuming a green build means the page is live.
   existing `MeshStandardMaterial` shader hook adds macro roughness variation with no textures or
   extra draw calls. Deformation repaints remain deterministic; palette progression and the shader
   contract are pinned in `tests/terrainMaterial.test.ts`.
+- Water-surface response (2026-07-15, `codex/water-material-upgrade`): the custom water shader now
+  derives a world-space ripple normal analytically and uses a bounded rough-Fresnel term to reflect
+  the live fog/sky color at glancing angles. Shore water is deliberately rougher; high/low tiers
+  cap reflection strength separately. The foam band is narrower, dimmer, and less opacity-heavy,
+  while the existing depth tint, night daylight multiplier, fog, and depth-based outer fade remain
+  authoritative. Shader wiring and response bounds are pinned in `tests/waterMaterial.test.ts`.
 
 ## Invariants worth protecting
 

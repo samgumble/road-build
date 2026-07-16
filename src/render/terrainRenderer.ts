@@ -98,6 +98,8 @@ const WATER_VERTEX_SHADER = /* glsl */ `
   varying float vShore;
   varying float vEdgeFade;
   varying vec2 vWorldXZ;
+  varying vec3 vWorldPosition;
+  varying vec3 vWorldNormal;
   varying float vFogDepth;
 
   void main() {
@@ -112,11 +114,21 @@ const WATER_VERTEX_SHADER = /* glsl */ `
     // as "simplified" rather than removed, since the shader cost itself is the same either way).
     float rippleAmp = uRippleAmp * smoothstep(0.0, 0.25, aShore);
     float t = uTime * uRippleSpeed;
-    float wave = sin(worldPos.x * 0.18 + t * 1.3) * 0.5 + sin(worldPos.z * 0.23 - t * 1.7) * 0.5;
+    float phaseX = worldPos.x * 0.18 + t * 1.3;
+    float phaseZ = worldPos.z * 0.23 - t * 1.7;
+    float wave = sin(phaseX) * 0.5 + sin(phaseZ) * 0.5;
     vec3 displaced = position;
     displaced.y += wave * rippleAmp;
 
-    vec4 mvPosition = modelViewMatrix * vec4(displaced, 1.0);
+    // Analytic derivatives keep the reflection normal in lockstep with the displaced ripple and
+    // avoid texture normal maps. Convert it and the view vector into the same world space.
+    float dWaveDx = cos(phaseX) * 0.09 * rippleAmp;
+    float dWaveDz = cos(phaseZ) * 0.115 * rippleAmp;
+    vWorldNormal = normalize(mat3(modelMatrix) * normalize(vec3(-dWaveDx, 1.0, -dWaveDz)));
+    vec4 displacedWorldPos = modelMatrix * vec4(displaced, 1.0);
+    vWorldPosition = displacedWorldPos.xyz;
+
+    vec4 mvPosition = viewMatrix * displacedWorldPos;
     vFogDepth = -mvPosition.z;
     gl_Position = projectionMatrix * mvPosition;
   }
@@ -128,6 +140,8 @@ const WATER_FRAGMENT_SHADER = /* glsl */ `
   uniform vec3 uDeepColor;
   uniform float uOpacity;
   uniform float uFoamAnimAmount; // 0 on low tier (static band), 1 on high (animated)
+  uniform float uReflectionStrength;
+  uniform float uSurfaceRoughness;
   // Task 38: eased 0..1 daylight signal from Atmosphere (1.0 midday, floors ~0.25 deep night).
   // Scales foam visibility and base water brightness so lakes dim at night along with the rest of
   // the lit scene, instead of glowing at a constant brightness while terrain dims around them.
@@ -139,6 +153,8 @@ const WATER_FRAGMENT_SHADER = /* glsl */ `
   varying float vShore;
   varying float vEdgeFade;
   varying vec2 vWorldXZ;
+  varying vec3 vWorldPosition;
+  varying vec3 vWorldNormal;
   varying float vFogDepth;
 
   float waterHash(vec2 p) {
@@ -155,16 +171,35 @@ const WATER_FRAGMENT_SHADER = /* glsl */ `
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
   }
 
+  float groundworkReflectionMix(float viewFacing, float roughness, float strength) {
+    float fresnel = pow(1.0 - clamp(viewFacing, 0.0, 1.0), 3.0);
+    return clamp(fresnel * strength * (1.0 - roughness * 0.45), 0.0, strength);
+  }
+
   void main() {
     // Depth tint: deeper (higher vShore) = darker/more saturated blue.
     vec3 col = mix(uShallowColor, uDeepColor, smoothstep(0.0, 1.0, vShore));
 
+    // Rough Fresnel sky response: glancing water picks up the live fog/sky color while face-on
+    // water keeps its readable depth tint. A broad procedural roughness field breaks up the
+    // reflection without texture samples or a second render pass; shore water stays rougher.
+    vec3 viewDir = normalize(cameraPosition - vWorldPosition);
+    float viewFacing = dot(normalize(vWorldNormal), viewDir);
+    float roughnessField = waterNoise(vWorldXZ * 0.035 + uTime * 0.012 * uFoamAnimAmount);
+    float surfaceRoughness = clamp(
+      uSurfaceRoughness + (roughnessField - 0.5) * 0.12 + (1.0 - vShore) * 0.08,
+      0.45,
+      0.95
+    );
+    float reflectionMix = groundworkReflectionMix(viewFacing, surfaceRoughness, uReflectionStrength);
+    col = mix(col, fogColor, reflectionMix);
+
     // Shore foam: a soft band right at the shoreline, animated on high tier, static on low tier
     // (uFoamAnimAmount gates the time-varying terms without branching).
     float animatedShore = vShore + (waterNoise(vWorldXZ * 0.08 + uTime * 0.05 * uFoamAnimAmount) - 0.5) * 0.05;
-    float foam = 1.0 - smoothstep(0.0, 0.09, animatedShore);
+    float foam = 1.0 - smoothstep(0.0, 0.065, animatedShore);
     float sparkle = waterNoise(vWorldXZ * 0.6 + uTime * 0.4 * uFoamAnimAmount);
-    foam *= 0.75 + 0.25 * sparkle;
+    foam *= 0.58 + 0.22 * sparkle;
     // Task 38: foam scales down with daylight - white shore-foam sparkle is a daylight phenomenon
     // (sun glint/whitecaps) and reads as an unnatural glow when it stays full-bright at night.
     // uDaylight == 1.0 (midday) leaves foam untouched, so day rendering is unchanged.
@@ -178,7 +213,7 @@ const WATER_FRAGMENT_SHADER = /* glsl */ `
     // readable dark mirror rather than crushing to pure black.
     col *= uDaylight;
 
-    float alpha = mix(uOpacity, min(1.0, uOpacity + foam * 0.3), foam);
+    float alpha = mix(uOpacity, min(1.0, uOpacity + foam * 0.18), foam);
 
     // Fog: blend toward the scene fog color with camera distance, same linear falloff THREE's
     // built-in materials use. Without this, the water plane's far edge (well past the terrain
@@ -206,6 +241,14 @@ const WATER_SHORE_DEPTH = 16; // world units of "shore falloff" — aShore reach
 const WATER_RIPPLE_AMP = QUALITY === 'high' ? 0.05 : 0.03;
 const WATER_RIPPLE_SPEED = QUALITY === 'high' ? 1.0 : 0.5;
 const WATER_FOAM_ANIM = QUALITY === 'high' ? 1.0 : 0.0;
+const WATER_REFLECTION_STRENGTH = QUALITY === 'high' ? 0.34 : 0.2;
+const WATER_SURFACE_ROUGHNESS = QUALITY === 'high' ? 0.65 : 0.8;
+
+/** CPU twin of the shader's bounded rough Fresnel term, kept public for regression tests. */
+export function waterReflectionMix(viewFacing: number, roughness: number, strength: number): number {
+  const fresnel = (1 - THREE.MathUtils.clamp(viewFacing, 0, 1)) ** 3;
+  return THREE.MathUtils.clamp(fresnel * strength * (1 - roughness * 0.45), 0, strength);
+}
 
 export class TerrainRenderer {
   readonly mesh: THREE.Mesh;
@@ -287,6 +330,8 @@ export class TerrainRenderer {
           uRippleAmp: { value: WATER_RIPPLE_AMP },
           uRippleSpeed: { value: WATER_RIPPLE_SPEED },
           uFoamAnimAmount: { value: WATER_FOAM_ANIM },
+          uReflectionStrength: { value: WATER_REFLECTION_STRENGTH },
+          uSurfaceRoughness: { value: WATER_SURFACE_ROUGHNESS },
           uDaylight: { value: 1 },
         },
       ]),
