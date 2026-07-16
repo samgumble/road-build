@@ -77,17 +77,33 @@ describe('GrowthSim', () => {
     const { bus, sim } = world();
     const kinds: string[] = [];
     bus.on('growth:spawn', (e) => kinds.push(e.kind));
-    // Task 23 slowed development pacing (first house no sooner than ~3 sim-min, first building no
-    // sooner than ~5 sim-min — see growth.ts's THRESHOLDS/DEV_RATE_BASE doc comments), so the old
+    // Task 23 slowed development pacing (first house no sooner than ~3 sim-min and visible towers
+    // later still through the upgrade gate), so the old
     // 5 sim-minute run no longer reliably observes houses. Extended to 7 sim-minutes, which
-    // comfortably clears the ~231s first-house / ~324s first-building marks measured by direct
-    // simulation while keeping the assertions themselves unchanged in strength.
+    // comfortably clears the ~231s first-house mark while keeping the assertions unchanged.
     for (let i = 0; i < 60 * 420; i++) sim.update(1 / 60); // 7 sim-minutes
     expect(kinds.filter((k) => k === 'tree').length).toBeGreaterThan(0);
     const firstTree = kinds.indexOf('tree'), firstHouse = kinds.indexOf('house');
     expect(firstHouse).toBeGreaterThan(-1); // pacing slowed but houses must still appear in 7 sim-min
     expect(firstTree).toBeLessThan(firstHouse);
     expect(sim.houseCount).toBe(kinds.filter((k) => k === 'house').length);
+  });
+
+  it('creates towers only by upgrading an existing house parcel', () => {
+    const { bus, sim } = world();
+    let directBuildingCount = 0;
+    const upgradedIds: number[] = [];
+    bus.on('growth:spawn', (e) => {
+      if (e.kind === 'building') directBuildingCount++;
+    });
+    bus.on('growth:upgrade', (e) => upgradedIds.push(e.id));
+
+    // Coarse fixed steps are sufficient for growth and keep this long morphology check cheap.
+    for (let t = 0; t < 600; t += 0.5) sim.update(0.5);
+
+    expect(upgradedIds.length).toBeGreaterThan(0);
+    expect(sim.spawned.some((record) => record.kind === 'building')).toBe(true);
+    expect(directBuildingCount).toBe(0);
   });
   it('spawns nothing with no painted roads', () => {
     const bus = new EventBus();

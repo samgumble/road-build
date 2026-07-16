@@ -154,6 +154,13 @@ assuming a green build means the page is live.
   the horizon skirt/sky dome were moved outside the maximum camera orbit and given denser geometry
   so their bands cannot become visible at wide zoom. Pure lighting curves are pinned in
   `tests/atmosphere.test.ts`; the skirt clearance contract is pinned in `tests/horizonSkirt.test.ts`.
+- Settlement-density correction (2026-07-15, `codex/settlement-morphology-upgrade`): the legacy
+  building threshold no longer spawns a second structure beside a parcel's house; it remains a
+  consumed/save-compatible progression bit, while every new tower now comes from the existing
+  in-place house upgrade path and therefore honors neighbor/low-rise gates. Skyline height now
+  uses distance to the same painted degree-3 junction centers that boost growth morphology rather
+  than distance to a road (all real parcels already share an 8–10u road setback, which made the
+  previous falloff nearly inert). Simple-road settlements stay low-rise; connected centers peak.
 
 ## Invariants worth protecting
 

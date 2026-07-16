@@ -52,6 +52,14 @@ the delivered morphology layer is intentionally migration-free infrastructure fo
 > become buildings; extend `skylineHeightScale`/the tint palette rather than adding a second
 > per-building scale path.
 
+## Delivered density-correction slice — 2026-07-15 (Codex session)
+
+- [x] Towers now arise only by upgrading an existing house record. The retained building threshold
+  consumes its historical/save bit without directly stacking a second structure on the parcel.
+- [x] `paintedJunctionDistance` is shared by growth morphology and renderer skyline shaping. This
+  replaces the ineffective road-distance signal (every real parcel already sits at the same road
+  setback) with a true connected-center-to-fringe gradient.
+
 ## Task 1: Seed settlement pockets instead of continuous roadside walls
 
 **Files:** `src/sim/growth/growth.ts`, `src/sim/save.ts`, `tests/growth.test.ts`, `tests/save.test.ts`

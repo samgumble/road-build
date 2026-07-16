@@ -24,25 +24,26 @@ async function warmUpBuildings(bus: EventBus, sr: SceneryRenderer, timeoutMs: nu
   throw new Error(`SceneryRenderer never became ready for buildings within ${timeoutMs}ms`);
 }
 
-/** Road distance stub: the "road" is the line x=0, so distance is just |x|. */
-const roadDistanceAt = (x: number, _z: number): number => Math.abs(x);
+/** Settlement-center distance stub: the center is at x=0, so distance is just |x|. */
+const settlementCenterDistanceAt = (x: number, _z: number): number => Math.abs(x);
 
-describe('skyline variety (height falloff from the road + facade tints)', () => {
+describe('skyline variety (height falloff from settlement centers + facade tints)', () => {
   let bus: EventBus;
   let sr: SceneryRenderer;
 
   beforeAll(async () => {
     bus = new EventBus();
     const hf = new Heightfield('skyline-variety', bus);
-    sr = new SceneryRenderer(new THREE.Scene(), hf, bus, roadDistanceAt);
+    sr = new SceneryRenderer(new THREE.Scene(), hf, bus, settlementCenterDistanceAt);
     await warmUpBuildings(bus, sr, 20000);
   }, 25000);
 
   it('shapes the pure height curve: tall at the core, damped at the fringe, jitter-bounded', () => {
-    // near the road: downtown towers stand taller than the base model
+    // near a connected junction center: downtown towers stand taller than the base model
     expect(skylineHeightScale(5, 0.5)).toBeGreaterThan(1);
-    // far from the road: fringe blocks are clearly damped below it
-    expect(skylineHeightScale(40, 0.5)).toBeLessThan(0.85);
+    // far from a center (including a simple road with no degree-3 junction): blocks stay low-rise
+    expect(skylineHeightScale(80, 0.5)).toBeLessThan(0.85);
+    expect(skylineHeightScale(Infinity, 0.5)).toBeLessThan(0.85);
     // monotonic: same jitter, more distance never means a taller tower
     for (let d = 0; d < 60; d += 4) {
       expect(skylineHeightScale(d + 4, 0.31)).toBeLessThanOrEqual(skylineHeightScale(d, 0.31));
@@ -53,8 +54,8 @@ describe('skyline variety (height falloff from the road + facade tints)', () => 
   });
 
   it('stretches core buildings taller and fringe buildings shorter in the live instance matrices', () => {
-    spawn(bus, 'building', 6, 0, 11);   // 6u from the road: core tower
-    spawn(bus, 'building', 40, 40, 12); // 40u out: fringe block
+    spawn(bus, 'building', 6, 0, 11);   // 6u from the settlement center: core tower
+    spawn(bus, 'building', 80, 40, 12); // 80u out: fringe block
     const core = sr.verticalStretchOf(11)!;
     const fringe = sr.verticalStretchOf(12)!;
     expect(core).toBeGreaterThan(1);
