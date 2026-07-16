@@ -1,4 +1,5 @@
 import type { Stage, V3, VehicleKind } from './types';
+import type { WeatherKind } from './weather';
 
 export interface GameEvents {
   'roads:changed': Record<string, never>;                     // any topology/stage change relevant to lanes+growth
@@ -54,6 +55,7 @@ export interface GameEvents {
   // emitted for a record cleared this way, even if the road that cleared it is later demolished.
   'growth:cleared': { id: number; kind?: 'tree' | 'field' | 'house' | 'building' | 'park' };
   'atmosphere:phase': { night: boolean };
+  'atmosphere:weather': { kind: WeatherKind };
   // Task 31: ambient wilderness clearing. `indices` are positions into the WildernessTree[] array
   // the renderer/sim were both constructed with (stable per tree for the life of the world).
   'wilderness:cleared': { indices: number[] };

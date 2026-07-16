@@ -188,7 +188,7 @@ git commit -m "feat(weather): add seeded living weather state machine"
 - Adds getters `weatherSnapshot` and `weatherSave`.
 - Adds event `'atmosphere:weather': { kind: WeatherKind }` on completed transitions only.
 
-- [ ] **Step 1: Write failing atmosphere composition tests**
+- [x] **Step 1: Write failing atmosphere composition tests**
 
 Extract a pure helper:
 
@@ -229,13 +229,13 @@ it('makes fog and heavy rain visually distinct', () => {
 });
 ```
 
-- [ ] **Step 2: Run atmosphere tests and verify RED**
+- [x] **Step 2: Run atmosphere tests and verify RED**
 
 Run: `npx vitest run tests/atmosphere.test.ts`
 
 Expected: helper absent.
 
-- [ ] **Step 3: Replace binary scheduler with snapshot application**
+- [x] **Step 3: Replace binary scheduler with snapshot application**
 
 Delete `RAIN_*INTERVAL`, `RAIN_CHANCE`, duration fields, and `updateRainScheduler`. In `update(dt)`,
 call `weather.update(dt)` before applying visuals; emit `atmosphere:weather` when it returns true.
@@ -264,13 +264,13 @@ the helper value. Existing camera-following streak recycling remains.
 Apply fog values, multiply existing day/night sun/hemi values by scales, and reduce exposure by at
 most 0.08 under cloud darkness while retaining the current day/night targets.
 
-- [ ] **Step 4: Run weather/atmosphere tests**
+- [x] **Step 4: Run weather/atmosphere tests**
 
 Run: `npx vitest run tests/weather.test.ts tests/atmosphere.test.ts && npx tsc --noEmit`
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/render/atmosphere.ts src/core/events.ts tests/atmosphere.test.ts

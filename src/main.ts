@@ -20,6 +20,7 @@ import { generateWilderness, WildernessSim } from './sim/growth/wilderness';
 import { QuarrySim } from './sim/quarry';
 import { SceneryRenderer } from './render/sceneryRenderer';
 import { Atmosphere } from './render/atmosphere';
+import { WeatherController } from './render/weather';
 import { atmosphereTimeScale } from './render/solarTime';
 import { Hud, randomSeed } from './ui/hud';
 import { StartScreen } from './ui/startScreen';
@@ -168,7 +169,16 @@ function main(): void {
 
   const cameraRig = new CameraRig(camera, canvas);
 
-  const atmosphere = new Atmosphere(scene, sun, hemi, renderer, bus, createRng('atmosphere-' + hf.seed));
+  const weather = new WeatherController(seed);
+  const atmosphere = new Atmosphere(
+    scene,
+    sun,
+    hemi,
+    renderer,
+    bus,
+    createRng('atmosphere-' + hf.seed),
+    weather,
+  );
   atmosphere.setCameraTarget(cameraRig.target);
 
   const audio = new AmbientAudio(bus);
