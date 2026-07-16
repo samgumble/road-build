@@ -8,6 +8,8 @@ import { BuildQueue } from '../src/sim/construction/queue';
 import { QuarrySim } from '../src/sim/quarry';
 import { EventBus } from '../src/core/events';
 import { createRng } from '../src/core/rng';
+import { DEFAULT_WEATHER_SAVE } from '../src/core/weather';
+import { WeatherController } from '../src/render/weather';
 
 function freshWorld(seed: string) {
   const bus = new EventBus();
@@ -34,9 +36,11 @@ describe('save/load', () => {
     const anchor = findAnchor(w.hf, 32);
     const [id] = w.graph.commitChain([anchor, { x: anchor.x + 32, z: anchor.z }]);
     w.graph.edges.get(id)!.stage = 'painted';
-    const json = serialize({ seed: 'save-test', timeOfDay: 0.7, graph: w.graph, growth: w.growth, quarry: w.quarry });
+    const json = serialize({ seed: 'save-test', timeOfDay: 0.7, graph: w.graph, growth: w.growth, quarry: w.quarry, weather: DEFAULT_WEATHER_SAVE });
     const save = deserialize(json)!;
-    expect(save.version).toBe(3);
+    expect(save.version).toBe(4);
+    expect(save.junctionControls).toEqual([]);
+    expect(save.weather).toEqual(DEFAULT_WEATHER_SAVE);
     const w2 = freshWorld('save-test');
     restoreWorld(save, w2);
     expect(w2.graph.edges.size).toBe(1);
@@ -46,6 +50,80 @@ describe('save/load', () => {
   it('returns null for garbage or wrong version', () => {
     expect(deserialize('not json')).toBeNull();
     expect(deserialize(JSON.stringify({ version: 99 }))).toBeNull();
+  });
+  it('migrates a v3 save to deterministic clear weather', () => {
+    const migrated = deserialize(JSON.stringify({
+      version: 3,
+      seed: 'weather-v3-migration',
+      timeOfDay: 0.35,
+      edges: [],
+      growth: { dev: [], spawned: [], decay: [] },
+      quarry: null,
+    }))!;
+
+    expect(migrated.version).toBe(4);
+    expect(migrated.junctionControls).toEqual([]);
+    expect(migrated.weather).toEqual(DEFAULT_WEATHER_SAVE);
+  });
+  it('serializes the live controller state rather than the clear migration default', () => {
+    const weather = new WeatherController('save-live-weather', {
+      current: 'heavy-rain',
+      next: 'light-rain',
+      transition: 0.25,
+      remaining: 41,
+      transitionIndex: 8,
+    });
+    const world = freshWorld('save-live-weather');
+    const junctionControls = [{
+      x: 8,
+      z: -16,
+      mode: 'signal' as const,
+      maturitySeconds: 120,
+      passageEmaPerMinute: 3.5,
+    }];
+    const save = deserialize(serialize({
+      seed: 'save-live-weather',
+      timeOfDay: 0.5,
+      graph: world.graph,
+      growth: world.growth,
+      quarry: world.quarry,
+      junctionControls,
+      weather: weather.saved,
+    }))!;
+
+    expect(save.weather).toEqual(weather.saved);
+    expect(save.junctionControls).toEqual(junctionControls);
+  });
+  it('rejects malformed native v4 weather rather than silently resetting it', () => {
+    const base = {
+      version: 4,
+      seed: 'weather-v4-corrupt',
+      timeOfDay: 0,
+      edges: [],
+      growth: { dev: [], spawned: [], decay: [] },
+      quarry: null,
+      junctionControls: [],
+      weather: DEFAULT_WEATHER_SAVE,
+    };
+
+    expect(deserialize(JSON.stringify({
+      ...base,
+      weather: { ...DEFAULT_WEATHER_SAVE, transition: 1.1 },
+    }))).toBeNull();
+    expect(deserialize(JSON.stringify({
+      ...base,
+      weather: { ...DEFAULT_WEATHER_SAVE, current: 'hail' },
+    }))).toBeNull();
+    expect(deserialize(JSON.stringify({
+      ...base,
+      junctionControls: [{
+        x: 0,
+        z: 0,
+        mode: 'signal',
+        maturitySeconds: 301,
+        passageEmaPerMinute: 2,
+      }],
+    }))).toBeNull();
   });
   it('returns null when an edge has an invalid stage or malformed ctrl', () => {
     const base = {
@@ -100,7 +178,7 @@ describe('save/load', () => {
     const anchor = findAnchor(w.hf, 32);
     const [id] = w.graph.commitChain([anchor, { x: anchor.x + 32, z: anchor.z }]);
     w.graph.edges.get(id)!.stage = 'gravel'; // simulate autosave mid-build
-    const json = serialize({ seed: 'resume-test', timeOfDay: 0.5, graph: w.graph, growth: w.growth, quarry: w.quarry });
+    const json = serialize({ seed: 'resume-test', timeOfDay: 0.5, graph: w.graph, growth: w.growth, quarry: w.quarry, weather: DEFAULT_WEATHER_SAVE });
     const w2 = freshWorld('resume-test');
     restoreWorld(deserialize(json)!, w2);
     const [rid] = [...w2.graph.edges.keys()];
@@ -116,7 +194,7 @@ describe('save/load', () => {
       expect(w.quarry.placement).not.toBeNull();
       const placement = w.quarry.placement;
 
-      const json = serialize({ seed: 'quarry-save-test', timeOfDay: 0.3, graph: w.graph, growth: w.growth, quarry: w.quarry });
+      const json = serialize({ seed: 'quarry-save-test', timeOfDay: 0.3, graph: w.graph, growth: w.growth, quarry: w.quarry, weather: DEFAULT_WEATHER_SAVE });
       const save = deserialize(json)!;
       expect(save.quarry).toEqual(placement);
 
@@ -128,7 +206,7 @@ describe('save/load', () => {
     it('serializes quarry: null when no road has ever been committed', () => {
       const w = freshWorld('quarry-none-test');
       expect(w.quarry.placement).toBeNull();
-      const json = serialize({ seed: 'quarry-none-test', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry });
+      const json = serialize({ seed: 'quarry-none-test', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry, weather: DEFAULT_WEATHER_SAVE });
       const save = deserialize(json)!;
       expect(save.quarry).toBeNull();
     });
@@ -152,7 +230,7 @@ describe('save/load', () => {
       const anchor = findAnchor(w.hf, 64);
       w.graph.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
       const placement = w.quarry.placement;
-      const json = serialize({ seed: 'quarry-restore-noemit', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry });
+      const json = serialize({ seed: 'quarry-restore-noemit', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry, weather: DEFAULT_WEATHER_SAVE });
       const save = deserialize(json)!;
 
       const w2 = freshWorld('quarry-restore-noemit');
@@ -183,7 +261,7 @@ describe('save/load', () => {
 
       const save = deserialize(json);
       expect(save).not.toBeNull();
-      expect(save!.version).toBe(3);
+      expect(save!.version).toBe(4);
 
       const w2 = freshWorld('quarry-migration');
       expect(w2.quarry.placement).toBeNull();
@@ -226,7 +304,7 @@ describe('save/load', () => {
       expect(new Set(ids).size).toBe(ids.length); // all unique
       expect(ids.every((id) => typeof id === 'number')).toBe(true);
 
-      const json = serialize({ seed: 'ids-roundtrip', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry });
+      const json = serialize({ seed: 'ids-roundtrip', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry, weather: DEFAULT_WEATHER_SAVE });
       const save = deserialize(json)!;
       expect(save.growth.spawned.map((r) => r.id)).toEqual(ids);
     });
@@ -249,13 +327,13 @@ describe('save/load', () => {
       };
       const save = deserialize(JSON.stringify(v2Save));
       expect(save).not.toBeNull();
-      expect(save!.version).toBe(3);
+      expect(save!.version).toBe(4);
       const ids = save!.growth.spawned.map((r) => r.id);
       expect(ids).toEqual([1, 2, 3]);
       expect(new Set(ids).size).toBe(3);
     });
 
-    it('a v1 save (no record ids, no quarry) migrates all the way to v3 with ids assigned', () => {
+    it('a v1 save (no record ids, no quarry) migrates all the way to v4 with ids assigned', () => {
       const v1Save = {
         version: 1,
         seed: 'ids-migration-v1',
@@ -271,7 +349,7 @@ describe('save/load', () => {
       };
       const save = deserialize(JSON.stringify(v1Save));
       expect(save).not.toBeNull();
-      expect(save!.version).toBe(3);
+      expect(save!.version).toBe(4);
       expect(save!.growth.spawned.map((r) => r.id)).toEqual([1, 2]);
       expect(save!.quarry).toBeUndefined(); // still the v1-migration sentinel, unresolved (no edges)
     });
@@ -321,7 +399,7 @@ describe('save/load', () => {
       w.bus.emit('roads:changed', {});
       for (let i = 0; i < 60 * 10; i++) w.growth.update(1 / 60);
 
-      const json = serialize({ seed: 'decay-empty-save', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry });
+      const json = serialize({ seed: 'decay-empty-save', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry, weather: DEFAULT_WEATHER_SAVE });
       const save = deserialize(json)!;
       expect(save.growth.decay).toEqual([]);
     });
@@ -343,7 +421,7 @@ describe('save/load', () => {
       expect(state.length).toBe(1);
       expect(state[0].stranded).toBeCloseTo(40, 0);
 
-      const json = serialize({ seed: 'decay-save-midgrace', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry });
+      const json = serialize({ seed: 'decay-save-midgrace', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry, weather: DEFAULT_WEATHER_SAVE });
       const save = deserialize(json)!;
       expect(save.growth.decay).toEqual([{ id: 1, stranded: expect.closeTo(40, 1) }]);
 
@@ -383,7 +461,7 @@ describe('save/load', () => {
       expect(state.length).toBe(1);
       expect(state[0].fading).toBeCloseTo(15, 0);
 
-      const json = serialize({ seed: 'decay-save-midfade', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry });
+      const json = serialize({ seed: 'decay-save-midfade', timeOfDay: 0, graph: w.graph, growth: w.growth, quarry: w.quarry, weather: DEFAULT_WEATHER_SAVE });
       const save = deserialize(json)!;
       expect(save.growth.decay[0].fading).toBeCloseTo(15, 1);
       expect(save.growth.decay[0].stranded).toBeUndefined();
@@ -507,6 +585,7 @@ describe('save/load', () => {
         graph: w.graph,
         growth: w.growth,
         quarry: w.quarry,
+        weather: DEFAULT_WEATHER_SAVE,
       });
       const save = deserialize(json)!;
       expect(save.edges).toHaveLength(2);

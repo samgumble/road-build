@@ -14,8 +14,13 @@ import {
 import { sampleHeadingAt } from './roads/path';
 import { EventBus } from '../core/events';
 import { QuarrySim, placeQuarry, type QuarryPlacement } from './quarry';
+import {
+  DEFAULT_WEATHER_SAVE,
+  WEATHER_KINDS,
+  type WeatherSaveState,
+} from '../core/weather';
 
-const SAVE_VERSION = 3 as const;
+const SAVE_VERSION = 4 as const;
 
 export interface SaveV1 {
   version: 1;
@@ -75,7 +80,33 @@ export interface SaveV3 {
   quarry: QuarryPlacement | null;
 }
 
-export type AnySave = SaveV3;
+export type SavedJunctionControlMode = 'stop' | 'signal';
+
+/**
+ * Reserved v4 save shape for the upcoming junction-control simulation. Keeping the schema here
+ * lets the weather slice ship without consuming v4 incompatibly before that runtime lands.
+ */
+export interface SavedJunctionControl {
+  x: number;
+  z: number;
+  mode: SavedJunctionControlMode;
+  maturitySeconds: number;
+  passageEmaPerMinute: number;
+}
+
+/** v4 reserves junction controls and persists deterministic presentation weather. */
+export interface SaveV4 {
+  version: 4;
+  seed: string;
+  timeOfDay: number;
+  edges: { ctrl: P2[]; stage: Stage }[];
+  growth: { dev: number[]; spawned: SpawnRecord[]; decay: DecayEntry[] };
+  quarry: QuarryPlacement | null;
+  junctionControls: SavedJunctionControl[];
+  weather: WeatherSaveState;
+}
+
+export type AnySave = SaveV4;
 
 /** Minimal shape `serialize` needs from the live world. */
 interface SerializableWorld {
@@ -84,10 +115,12 @@ interface SerializableWorld {
   graph: RoadGraph;
   growth: GrowthSim;
   quarry: QuarrySim;
+  junctionControls?: readonly SavedJunctionControl[];
+  weather: WeatherSaveState;
 }
 
 export function serialize(world: SerializableWorld): string {
-  const save: SaveV3 = {
+  const save: SaveV4 = {
     version: SAVE_VERSION,
     seed: world.seed,
     timeOfDay: world.timeOfDay,
@@ -106,6 +139,8 @@ export function serialize(world: SerializableWorld): string {
       })),
     },
     quarry: world.quarry.placement,
+    junctionControls: world.junctionControls?.slice() ?? [],
+    weather: { ...world.weather },
   };
   return JSON.stringify(save);
 }
@@ -159,6 +194,35 @@ function validQuarry(q: unknown): q is QuarryPlacement | null {
   );
 }
 
+const finite = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
+
+function validControl(value: unknown): value is SavedJunctionControl {
+  if (typeof value !== 'object' || value === null) return false;
+  const control = value as Partial<SavedJunctionControl>;
+  return finite(control.x)
+    && finite(control.z)
+    && (control.mode === 'stop' || control.mode === 'signal')
+    && finite(control.maturitySeconds)
+    && control.maturitySeconds >= 0
+    && control.maturitySeconds <= 300
+    && finite(control.passageEmaPerMinute)
+    && control.passageEmaPerMinute >= 0;
+}
+
+function validWeather(value: unknown): value is WeatherSaveState {
+  if (typeof value !== 'object' || value === null) return false;
+  const weather = value as Partial<WeatherSaveState>;
+  return (WEATHER_KINDS as readonly unknown[]).includes(weather.current)
+    && (WEATHER_KINDS as readonly unknown[]).includes(weather.next)
+    && typeof weather.transition === 'number' && Number.isFinite(weather.transition)
+    && weather.transition >= 0 && weather.transition <= 1
+    && typeof weather.remaining === 'number' && Number.isFinite(weather.remaining)
+    && weather.remaining >= 0
+    && typeof weather.transitionIndex === 'number' && Number.isInteger(weather.transitionIndex)
+    && weather.transitionIndex >= 0;
+}
+
 /** Finding 2 (Groundwork): validates a `growth.decay` array — each entry needs a finite `id` and
  * exactly a finite `stranded` XOR a finite `fading` offset (never both, never neither — mirrors
  * `DecayEntry`'s own "exactly one of stranded/fading" invariant; a corrupt/hand-edited save
@@ -179,8 +243,7 @@ function validDecay(decay: unknown): decay is DecayEntry[] {
   return true;
 }
 
-/** Loosely-typed shape covering v1/v2/v3 on-disk saves, used only inside `deserialize` before the
- * version-specific validation/migration below settles on a real `SaveV3`. */
+/** Loosely-typed shape covering v1-v4 on-disk saves during validation/migration. */
 interface RawSaveShape {
   version?: unknown;
   seed?: unknown;
@@ -188,20 +251,23 @@ interface RawSaveShape {
   edges?: unknown;
   growth?: { dev?: unknown; spawned?: unknown; decay?: unknown };
   quarry?: unknown;
+  junctionControls?: unknown;
+  weather?: unknown;
 }
 
 /**
  * Returns `null` on parse error or unrecognized version — caller should start a fresh world.
  * Migrations chain forward one step at a time so each step only has to reason about its own
- * predecessor's shape, mirroring the SaveV1 -> SaveV2 -> SaveV3 doc comments above:
+ * predecessor's shape, mirroring the SaveV1 -> SaveV2 -> SaveV3 -> SaveV4 comments above:
  *   v1 -> v2: fills in `quarry: undefined` (deferred to `restoreWorld`, which has the Heightfield +
  *             first edge's samples needed to actually compute a placement) — this function's job
  *             is just to accept the older shape rather than reject it outright.
  *   v2 -> v3: assigns sequential ids (via `assignIds`) to every `growth.spawned` record, since v2
  *             predates SpawnRecord.id entirely.
- * A v1 save therefore falls through both steps to reach v3 in one `deserialize` call.
+ *   v3 -> v4: reserves empty junction controls and starts weather from the clear migration default.
+ * A v1 save therefore falls through every step to reach v4 in one `deserialize` call.
  */
-export function deserialize(json: string): SaveV3 | null {
+export function deserialize(json: string): SaveV4 | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(json);
@@ -210,7 +276,7 @@ export function deserialize(json: string): SaveV3 | null {
   }
   if (typeof parsed !== 'object' || parsed === null) return null;
   const p = parsed as RawSaveShape;
-  if (p.version !== 1 && p.version !== 2 && p.version !== 3) return null;
+  if (p.version !== 1 && p.version !== 2 && p.version !== 3 && p.version !== 4) return null;
 
   if (
     typeof p.seed !== 'string' ||
@@ -255,13 +321,30 @@ export function deserialize(json: string): SaveV3 | null {
     decay = p.growth.decay;
   }
 
+  // Step 4: native v4 saves must carry both reserved controls and valid weather state. Historical
+  // saves receive empty controls and start from the deterministic clear timeline rather than
+  // guessing how much unloaded wall time elapsed.
+  let junctionControls: SavedJunctionControl[];
+  let weather: WeatherSaveState;
+  if (p.version === 4) {
+    if (!Array.isArray(p.junctionControls) || !p.junctionControls.every(validControl)) return null;
+    if (!validWeather(p.weather)) return null;
+    junctionControls = p.junctionControls;
+    weather = p.weather;
+  } else {
+    junctionControls = [];
+    weather = { ...DEFAULT_WEATHER_SAVE };
+  }
+
   return {
-    version: 3,
+    version: SAVE_VERSION,
     seed: p.seed,
     timeOfDay: p.timeOfDay,
     edges: p.edges,
     growth: { dev, spawned, decay },
     quarry: quarry as QuarryPlacement | null,
+    junctionControls,
+    weather,
   };
 }
 
@@ -314,7 +397,7 @@ interface RestoreDeps {
  * play pace, or the "16x" speed control toggled at different moments) is not guaranteed to
  * reproduce bit-identical results, even discounting the `rateMult` caveat above.
  */
-export function restoreWorld(save: SaveV3, deps: RestoreDeps): void {
+export function restoreWorld(save: SaveV3 | SaveV4, deps: RestoreDeps): void {
   const { bus, hf, graph, growth, queue, quarry } = deps;
   const gradeRadius = ROAD_WIDTH / 2;
   const offset = ROAD_WIDTH / 2 - 0.8;

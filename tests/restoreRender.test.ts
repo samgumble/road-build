@@ -9,6 +9,7 @@ import { QuarrySim } from '../src/sim/quarry';
 import { EventBus } from '../src/core/events';
 import { serialize, deserialize, restoreWorld } from '../src/sim/save';
 import { createRng } from '../src/core/rng';
+import { DEFAULT_WEATHER_SAVE } from '../src/core/weather';
 import type { P2, RoadSample } from '../src/core/types';
 
 // Flat stub sampler, same pattern as rollerDarkening.test.ts / graph.test.ts.
@@ -68,7 +69,7 @@ describe('restoreWorld render sync', () => {
     const w1 = buildWorld('restore-render-test');
     const [edgeId] = w1.graph.commitChain([{ x: 0, z: 0 }, { x: 32, z: 0 }]);
     w1.graph.edges.get(edgeId)!.stage = 'painted';
-    const json = serialize({ seed: 'restore-render-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth, quarry: w1.quarry });
+    const json = serialize({ seed: 'restore-render-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth, quarry: w1.quarry, weather: DEFAULT_WEATHER_SAVE });
     const save = deserialize(json)!;
 
     // Fresh world + fresh scene + fresh RoadRenderer, then restore into it.
@@ -96,7 +97,7 @@ describe('restoreWorld render sync', () => {
     const w1 = buildWorld('restore-bridge-test', bridgeStubSampler);
     const [edgeId] = w1.graph.commitChain([{ x: 0, z: 0 }, { x: 64, z: 0 }]);
     w1.graph.edges.get(edgeId)!.stage = 'painted';
-    const json = serialize({ seed: 'restore-bridge-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth, quarry: w1.quarry });
+    const json = serialize({ seed: 'restore-bridge-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth, quarry: w1.quarry, weather: DEFAULT_WEATHER_SAVE });
     const save = deserialize(json)!;
 
     // Fresh world + fresh scene + fresh RoadRenderer, then restore into it. This is the path where
@@ -138,7 +139,7 @@ describe('restoreWorld render sync', () => {
     w1.graph.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
     expect(w1.quarry.placement).not.toBeNull();
     const placement = w1.quarry.placement!;
-    const json = serialize({ seed: 'restore-quarry-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth, quarry: w1.quarry });
+    const json = serialize({ seed: 'restore-quarry-test', timeOfDay: 0.5, graph: w1.graph, growth: w1.growth, quarry: w1.quarry, weather: DEFAULT_WEATHER_SAVE });
     const save = deserialize(json)!;
 
     // Fresh world, and — matching main.ts's real boot order — construct the renderer BEFORE

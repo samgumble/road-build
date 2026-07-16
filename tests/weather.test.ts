@@ -1,7 +1,62 @@
 import { describe, expect, it } from 'vitest';
+import { EventBus } from '../src/core/events';
+import { createRng } from '../src/core/rng';
 import { WEATHER_KINDS, WEATHER_PROFILES, type WeatherKind } from '../src/core/weather';
 import { WeatherController } from '../src/render/weather';
 import { waterWeatherValues } from '../src/render/weatherTuning';
+import { GrowthSim } from '../src/sim/growth/growth';
+import { makeSampler } from '../src/sim/roads/path';
+import { RoadGraph } from '../src/sim/roads/graph';
+import { Heightfield } from '../src/sim/terrain/heightfield';
+import { TrafficSim } from '../src/sim/traffic/traffic';
+
+function authoritativeWorld(seed: string) {
+  const bus = new EventBus();
+  const heightfield = new Heightfield(seed, bus);
+  const graph = new RoadGraph(bus, makeSampler(heightfield));
+  let anchor: { x: number; z: number } | null = null;
+  outer: for (let x = -160; x <= 160; x += 8) {
+    for (let z = -160; z <= 160; z += 8) {
+      if (!heightfield.isLand(x, z) || !heightfield.isLand(x + 64, z)) continue;
+      anchor = { x, z };
+      break outer;
+    }
+  }
+  if (!anchor) throw new Error('no weather-isolation road anchor');
+
+  graph.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+  for (const edge of graph.edges.values()) edge.stage = 'painted';
+
+  const growth = new GrowthSim(graph, heightfield, bus, createRng(`${seed}:growth`), 0.217);
+  const traffic = new TrafficSim(graph, bus, createRng(`${seed}:traffic`));
+  traffic.targetPopulation = 4;
+  bus.emit('roads:changed', {});
+
+  return { graph, growth, traffic };
+}
+
+function authoritativeSnapshot(world: ReturnType<typeof authoritativeWorld>) {
+  return {
+    nodes: [...world.graph.nodes.values()].map((node) => ({ ...node })),
+    edges: [...world.graph.edges.values()].map((edge) => ({
+      id: edge.id,
+      a: edge.a,
+      b: edge.b,
+      ctrl: edge.ctrl.map((point) => ({ ...point })),
+      stage: edge.stage,
+    })),
+    growth: {
+      devLevels: world.growth.devLevels,
+      spawned: world.growth.spawned.map((record) => ({ ...record })),
+      houseCount: world.growth.houseCount,
+      decay: world.growth.decayState,
+    },
+    traffic: world.traffic.cars.map((car) => ({
+      ...car,
+      lane: world.traffic.laneAndS(car.id),
+    })),
+  };
+}
 
 describe('WeatherController', () => {
   it('defines a complete bounded profile for every weather kind', () => {
@@ -93,6 +148,46 @@ describe('WeatherController', () => {
     weather.update(75);
     weather.restore(initial);
     expect(weather.saved).toEqual(initial);
+  });
+
+  it('cannot change authoritative simulation outcomes when updated at a different cadence', () => {
+    const everyTick = authoritativeWorld('weather-isolation');
+    const batched = authoritativeWorld('weather-isolation');
+    const changingWeather = {
+      current: 'overcast' as const,
+      next: 'light-rain' as const,
+      transition: 0,
+      remaining: 0,
+      transitionIndex: 3,
+    };
+    const smoothWeather = new WeatherController('weather-isolation', changingWeather);
+    const batchedWeather = new WeatherController('weather-isolation', changingWeather);
+    const dt = 1 / 60;
+    const ticks = 900;
+    let smoothUpdates = 0;
+    let batchedUpdates = 0;
+
+    for (let tick = 0; tick < ticks; tick++) {
+      smoothWeather.update(dt);
+      smoothUpdates++;
+      if ((tick + 1) % 4 === 0) {
+        batchedWeather.update(dt * 4);
+        batchedUpdates++;
+      }
+
+      everyTick.growth.update(dt);
+      everyTick.traffic.update(dt, 0.3);
+      batched.growth.update(dt);
+      batched.traffic.update(dt, 0.3);
+    }
+
+    expect(smoothUpdates).toBe(900);
+    expect(batchedUpdates).toBe(225);
+    expect(smoothWeather.saved.transitionIndex).toBeGreaterThan(3);
+    expect(batchedWeather.saved.transitionIndex).toBeGreaterThan(3);
+    expect(authoritativeSnapshot(batched)).toEqual(authoritativeSnapshot(everyTick));
+    expect(everyTick.traffic.cars.length).toBeGreaterThan(0);
+    expect(everyTick.growth.devLevels.some((level) => level > 0)).toBe(true);
   });
 });
 

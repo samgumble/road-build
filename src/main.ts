@@ -280,6 +280,7 @@ function main(): void {
     if (raw) {
       const save = deserialize(raw);
       if (save && save.seed === seed) {
+        weather.restore(save.weather);
         restoreWorld(save, { bus, hf, graph, growth, queue: buildQueue, quarry });
         // Finding 2 (Task 35 follow-up "Groundwork"): pass along any records that were mid-fade at
         // save time so `rebuild()` restores them at the correct partial-fade progress instead of
@@ -341,6 +342,7 @@ function main(): void {
       buildings: growth.spawned.filter((record) => record.kind === 'building').length,
       paused: loop.isPaused,
       growthPaused: growth.isDevelopmentPaused,
+      weather: atmosphere.weatherSnapshot.kind,
     }),
     getEdgeLength: (edgeId) => graph.edges.get(edgeId)?.length ?? 0,
     getGrowthPaused: () => growth.isDevelopmentPaused,
@@ -388,7 +390,15 @@ function main(): void {
 
   const save = () => {
     try {
-      const json = serialize({ seed, timeOfDay: atmosphere.timeOfDay, graph, growth, quarry });
+      const json = serialize({
+        seed,
+        timeOfDay: atmosphere.timeOfDay,
+        graph,
+        growth,
+        quarry,
+        junctionControls: [],
+        weather: weather.saved,
+      });
       window.localStorage.setItem(saveKeyFor(seed), json);
     } catch {
       // localStorage unavailable/full — autosave silently no-ops rather than crashing the game

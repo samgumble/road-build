@@ -3,6 +3,7 @@ import { STAGES, type Stage } from '../core/types';
 import type { DrawTool, DrawToolMode } from '../input/drawTool';
 import type { Loop } from '../core/loop';
 import type { AmbientAudio } from '../audio/ambient';
+import type { WeatherKind } from '../core/weather';
 
 const ADJECTIVES = [
   'amber', 'quiet', 'copper', 'dusty', 'stone', 'cedar', 'misty', 'golden', 'rusty', 'granite',
@@ -376,7 +377,16 @@ export interface SiteOverview {
   buildings: number;
   paused: boolean;
   growthPaused: boolean;
+  weather: WeatherKind;
 }
+
+const WEATHER_LABEL: Readonly<Record<WeatherKind, string>> = Object.freeze({
+  clear: 'CLEAR',
+  overcast: 'OVERCAST',
+  'light-rain': 'LIGHT RAIN',
+  'heavy-rain': 'HEAVY RAIN',
+  'coastal-fog': 'COASTAL FOG',
+});
 
 /** Compact, stable wording for the site guide's event-driven snapshot. Kept pure so the UI's
  * player-facing language is regression-tested without requiring a DOM/WebGL environment. */
@@ -386,6 +396,7 @@ export function formatSiteOverview(site: SiteOverview): string[] {
     `WORK      ${site.activeCrews} CREW${site.activeCrews === 1 ? '' : 'S'} · ${site.scheduledJobs} JOB${site.scheduledJobs === 1 ? '' : 'S'}`,
     `TOWN      ${site.homes} HOME${site.homes === 1 ? '' : 'S'} · ${site.buildings} BUILDING${site.buildings === 1 ? '' : 'S'}`,
     `TRAFFIC   ${site.cars} CAR${site.cars === 1 ? '' : 'S'}`,
+    `WEATHER   ${WEATHER_LABEL[site.weather]}`,
     `SIM       ${site.paused ? 'PAUSED' : site.growthPaused ? 'RUNNING · GROWTH PAUSED' : 'RUNNING'}`,
   ];
 }
@@ -844,8 +855,8 @@ export class Hud {
     panel.appendChild(header);
 
     const overview = el('div', {}, { display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '14px', padding: '10px', background: '#141516', border: `1px solid ${BORDER}` });
-    for (let i = 0; i < 5; i++) {
-      const line = el('div', { textContent: '' }, { ...labelStyle(), color: i === 4 ? ACCENT : TEXT });
+    for (let i = 0; i < 6; i++) {
+      const line = el('div', { textContent: '' }, { ...labelStyle(), color: i === 5 ? ACCENT : TEXT });
       this.guideOverviewLines.push(line);
       overview.appendChild(line);
     }
@@ -1083,6 +1094,9 @@ export class Hud {
     this.deps.bus.on('atmosphere:phase', ({ night }) => {
       this.showNotice(night ? 'NIGHT SHIFT · WORK LIGHTS ON' : 'DAYBREAK · FULL OPERATIONS');
     });
+    // Weather belongs in the on-demand Guide, not the notification stream. Closed guides make
+    // refreshGuide a no-op; open guides update only on completed weather transitions.
+    this.deps.bus.on('atmosphere:weather', () => this.refreshGuide());
   }
 
   /** Renders one line per crew with an entry in `crewStateByCrew` (indices in ascending crew order,

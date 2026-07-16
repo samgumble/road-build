@@ -210,7 +210,7 @@ assuming a green build means the page is live.
   per-node topology/surface signatures, rebuilds only affected incident edges and endpoint groups,
   disposes replaced GPU resources, and draws stop paint only on policy-stopped approaches. Contracts
   live in `tests/graph.test.ts`, `tests/junctionPlan.test.ts`, and `tests/roadContinuity.test.ts`.
-- Living weather Tasks 1–4 (2026-07-16, `codex/connection-roadmap`,
+- Living weather Tasks 1–5 (2026-07-16, `codex/connection-roadmap`,
   `codex/living-weather-atmosphere`, and `codex/living-weather-wind`): `WeatherController` provides a seeded five-state
   clear/overcast/rain/fog transition graph, smooth bounded snapshots, deterministic save/restore,
   cached transition durations, and a stable allocation-free snapshot object. `Atmosphere` now
@@ -224,9 +224,13 @@ assuming a green build means the page is live.
   wind adds bounded shore foam before the existing daylight dimming. Trees now receive restrained,
   root-weighted GPU sway and legacy field/crop-stripe materials receive an upward-only world-phased
   ripple. These share two material uniforms, add no draw calls or per-frame matrix rewrites, and
-  use Atmosphere's capped visual clock separately from sim-time scenery fades. Save persistence and
-  Guide status remain Task 5 in
-  `docs/superpowers/plans/2026-07-12-living-weather.md`.
+  use Atmosphere's capped visual clock separately from sim-time scenery fades. Save V4 now persists
+  the controller timeline and strictly validates it on load; V1–V3 saves migrate to deterministic
+  clear weather. V4 also retains an empty, validated `junctionControls` reservation so the planned
+  traffic-control runtime can land without another incompatible schema claim. The Guide reports the
+  current weather on the fifth line of its six-line overview without adding a toolbar control or
+  transition notices, and refreshes only while open. Task 6 (visual matrix, performance gate, and
+  deployment) remains in `docs/superpowers/plans/2026-07-12-living-weather.md`.
 
 ## Invariants worth protecting
 

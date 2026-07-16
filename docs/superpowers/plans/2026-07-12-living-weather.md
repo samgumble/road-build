@@ -478,7 +478,7 @@ git commit -m "feat(render): add restrained weather wind to vegetation"
 - `SiteOverview` adds `weather: WeatherKind`.
 - `formatSiteOverview` adds `WEATHER   <LABEL>` as the fifth line, moving SIM to sixth.
 
-- [ ] **Step 1: Write failing HUD and live-weather save tests**
+- [x] **Step 1: Write failing HUD and live-weather save tests**
 
 ```ts
 it('formats current weather without adding toolbar controls', () => {
@@ -503,13 +503,13 @@ it('serializes the controller state rather than the clear reservation default', 
 });
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `npx vitest run tests/hud.test.ts tests/save.test.ts`
 
 Expected: `SiteOverview.weather`/sixth line absent or main still saves default weather.
 
-- [ ] **Step 3: Wire controller restore/save and Guide refresh**
+- [x] **Step 3: Wire controller restore/save and Guide refresh**
 
 Construct `WeatherController` before `Atmosphere` and pass it in. On restore call
 `weather.restore(save.weather)` before the first post-restore frame. Autosave passes
@@ -530,7 +530,7 @@ to `i === 5` so the final SIM line remains highlighted rather than the new weath
 Listen to `atmosphere:weather` only to refresh an open Guide; do not show transient notices for
 every weather transition.
 
-- [ ] **Step 4: Prove presentation-only isolation**
+- [x] **Step 4: Prove presentation-only isolation**
 
 Add this paired integration test. It runs identical graph/build/traffic/growth fixed steps while
 advancing different weather dt values only on the presentation side:
@@ -577,7 +577,7 @@ Run: `npx vitest run tests/weather.test.ts tests/hud.test.ts tests/save.test.ts 
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/main.ts src/ui/hud.ts tests/hud.test.ts tests/save.test.ts tests/weather.test.ts

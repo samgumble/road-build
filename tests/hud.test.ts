@@ -73,11 +73,13 @@ describe('formatSiteOverview', () => {
       buildings: 2,
       paused: false,
       growthPaused: false,
+      weather: 'overcast',
     })).toEqual([
       'NETWORK  7 ROADS',
       'WORK      3 CREWS · 4 JOBS',
       'TOWN      8 HOMES · 2 BUILDINGS',
       'TRAFFIC   12 CARS',
+      'WEATHER   OVERCAST',
       'SIM       RUNNING',
     ]);
   });
@@ -92,6 +94,7 @@ describe('formatSiteOverview', () => {
       buildings: 0,
       paused: true,
       growthPaused: true,
+      weather: 'heavy-rain',
     }).at(-1)).toBe('SIM       PAUSED');
   });
 
@@ -105,7 +108,25 @@ describe('formatSiteOverview', () => {
       buildings: 1,
       paused: false,
       growthPaused: true,
+      weather: 'clear',
     }).at(-1)).toBe('SIM       RUNNING · GROWTH PAUSED');
+  });
+
+  it('formats current coastal fog in the six-line briefing without adding a control', () => {
+    const lines = formatSiteOverview({
+      roads: 4,
+      scheduledJobs: 0,
+      activeCrews: 0,
+      cars: 6,
+      homes: 3,
+      buildings: 1,
+      paused: false,
+      growthPaused: false,
+      weather: 'coastal-fog',
+    });
+
+    expect(lines).toContain('WEATHER   COASTAL FOG');
+    expect(lines).toHaveLength(6);
   });
 });
 
