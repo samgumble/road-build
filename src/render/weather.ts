@@ -149,14 +149,14 @@ export class WeatherController {
 
     const to = WEATHER_PROFILES[this.state.next];
     const progress = smoothstep(this.state.transition);
-    Object.assign(this.currentSnapshot, {
-      kind: this.state.current,
-      cloudCover: lerp(from.cloudCover, to.cloudCover, progress),
-      cloudDarkness: lerp(from.cloudDarkness, to.cloudDarkness, progress),
-      rain: lerp(from.rain, to.rain, progress),
-      fog: lerp(from.fog, to.fog, progress),
-      wind: lerp(from.wind, to.wind, progress),
-      waterRoughness: lerp(from.waterRoughness, to.waterRoughness, progress),
-    });
+    // Mutate the stable snapshot directly: this runs every visual frame during transitions, so an
+    // Object.assign source literal would create avoidable steady-state garbage.
+    this.currentSnapshot.kind = this.state.current;
+    this.currentSnapshot.cloudCover = lerp(from.cloudCover, to.cloudCover, progress);
+    this.currentSnapshot.cloudDarkness = lerp(from.cloudDarkness, to.cloudDarkness, progress);
+    this.currentSnapshot.rain = lerp(from.rain, to.rain, progress);
+    this.currentSnapshot.fog = lerp(from.fog, to.fog, progress);
+    this.currentSnapshot.wind = lerp(from.wind, to.wind, progress);
+    this.currentSnapshot.waterRoughness = lerp(from.waterRoughness, to.waterRoughness, progress);
   }
 }

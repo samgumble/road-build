@@ -63,7 +63,9 @@ function sampleStops(stops: Stop[], t: number): THREE.Color {
   return stops[stops.length - 1].color.clone();
 }
 
-const CLOUD_GROUP_COUNT = 9;
+// Four broad merged groups preserve the clear-to-overcast cover range while leaving headroom for
+// rain streaks and per-road puddle meshes under the program's 250-draw-call high-tier ceiling.
+const CLOUD_GROUP_COUNT = 4;
 const CLOUD_DRIFT_SPEED = 1.5; // u/s, +x
 const CLOUD_Y_MIN = 60;
 const CLOUD_Y_MAX = 80;

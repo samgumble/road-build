@@ -210,7 +210,7 @@ assuming a green build means the page is live.
   per-node topology/surface signatures, rebuilds only affected incident edges and endpoint groups,
   disposes replaced GPU resources, and draws stop paint only on policy-stopped approaches. Contracts
   live in `tests/graph.test.ts`, `tests/junctionPlan.test.ts`, and `tests/roadContinuity.test.ts`.
-- Living weather Tasks 1–5 (2026-07-16, `codex/connection-roadmap`,
+- Living weather Tasks 1–6 (2026-07-16, `codex/connection-roadmap`,
   `codex/living-weather-atmosphere`, and `codex/living-weather-wind`): `WeatherController` provides a seeded five-state
   clear/overcast/rain/fog transition graph, smooth bounded snapshots, deterministic save/restore,
   cached transition durations, and a stable allocation-free snapshot object. `Atmosphere` now
@@ -229,8 +229,19 @@ assuming a green build means the page is live.
   clear weather. V4 also retains an empty, validated `junctionControls` reservation so the planned
   traffic-control runtime can land without another incompatible schema claim. The Guide reports the
   current weather on the fifth line of its six-line overview without adding a toolbar control or
-  transition notices, and refreshes only while open. Task 6 (visual matrix, performance gate, and
-  deployment) remains in `docs/superpowers/plans/2026-07-12-living-weather.md`.
+  transition notices, and refreshes only while open. Weather transitions blend over 8–15 visual
+  seconds; seeded dwell ranges are clear 120–240s, overcast 90–180s, light rain 60–120s, heavy rain
+  45–90s, and coastal fog 60–150s. Four broad merged cloud groups cover the authored range while
+  preserving high-tier draw-call headroom. Weather is presentation-only: it never enters traffic,
+  construction, growth, routing, physics, or any fixed-step decision. The paired integration proof
+  advances different weather cadences beside identical graph/growth/traffic inputs and gets
+  bit-identical authoritative outcomes.
+- Junction-control status: only the pure approach classifier and Save V4 reservation are present;
+  there is no active stop/signal simulation or signal renderer yet, so signal-emissive QA is not
+  applicable to this release. The reserved future contract remains: controls require 3+ painted
+  approaches; signal promotion requires pressure >=12 for 300 accumulated seconds, low pressure
+  decays maturity at 0.25x, stop dwell is 0.8s at 4.5u, and signal phases are 9s green / 2s yellow /
+  1s all-red. Do not describe those thresholds as shipped gameplay until the runtime plan lands.
 
 ## Invariants worth protecting
 
@@ -286,14 +297,36 @@ These are deliberately uncommitted product directions, not known blockers:
 
 ## Latest release verification — 2026-07-16
 
-- The `codex/connection-roadmap` release candidate passes the complete Vitest suite, `tsc --noEmit`,
-  and the Vite production build. The existing bundle-size advisory remains non-blocking.
-- Local production-preview smoke used a clean Broad Meadow island: two connected roads completed
-  through separate crews at 16×, rendered a clean shared corner seam, emitted both Road Open
-  milestones, and produced no browser console errors.
+- The combined connection + living-weather release candidate passes 46 Vitest files / 407 tests,
+  `tsc --noEmit`, and the Vite production build. The existing bundle-size advisory is the only
+  build warning.
+- Visual matrix: clear, overcast, light rain, heavy rain, and coastal fog were inspected at noon
+  and night on high and low tiers (20 states) on the same built-out town. Roads remained readable,
+  light/heavy rain stayed distinct and restrained, coastal fog stayed denser without hiding the
+  island, night water remained subdued, and sampled clear->overcast / light->heavy blends showed
+  no cloud popping. Browser console warning/error scan was empty.
+- Guide matrix: desktop and 375x812 both fit all six overview lines with no overflow. The mobile
+  panel measured 364x450 inside the viewport; focus moved to Close, Escape returned focus to Guide,
+  and the toolbar contained zero weather controls.
+- Optimized production-profile measurement used the same frozen built-out high-tier town in the
+  local Codex in-app Chromium browser at 1440x900, with `renderer.info.autoReset=false` around the
+  complete EffectComposer frame. Clear measured 240
+  draw calls and a recent 60-frame submission average/worst of 1.26/1.60ms; heavy rain measured
+  243 calls and 1.32/1.80ms. Cloud/rain geometry and typed arrays are constructor-owned and reused;
+  weather updates allocate no per-frame material, geometry, or array, and blended snapshot fields
+  now mutate directly without an Object.assign source allocation.
 - Focused regression coverage additionally proves overlapping settlement restore coordinates,
   direct-split and tie-in invalidation cardinality, connection geometry identity/disposal, safe
-  signal grouping, and deterministic mid-transition weather restore.
+  junction grouping, deterministic mid-transition weather restore, and weather/simulation isolation.
+
+### Release rollback policy
+
+- Roll forward or disable weather consumers if a shipped build produces console errors, unreadable
+  roads/water in any matrix state, high-tier built-out draw calls >=250, or any V4 save/load failure.
+- Never wholesale-revert the Save V4 commit after deployment: clients autosave V4 within 10 seconds,
+  while the former production reader accepts only V1–V3 and would make those worlds appear missing.
+  A safe rollback retains the V4 reader/writer/migrations and removes only weather presentation/UI
+  consumers, or ships a forward hotfix. Verify a V4 world reload before declaring recovery complete.
 
 ## Review checklist
 

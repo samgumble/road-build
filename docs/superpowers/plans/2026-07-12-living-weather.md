@@ -596,24 +596,26 @@ git commit -m "feat(ui): persist and report living weather"
 - Consumes: complete weather implementation.
 - Produces: deploy-ready combined program.
 
-- [ ] **Step 1: Run the day/night/weather visual matrix**
+- [x] **Step 1: Run the day/night/weather visual matrix**
 
 Inspect clear, overcast, light rain, heavy rain, and fog at noon/night on both quality tiers. Confirm
 road readability, no bright night water, visible-but-restrained rain, distinct fog, stable signal
 emissives, and no cloud popping during transitions.
 
-- [ ] **Step 2: Check desktop and mobile Guide layout**
+Signal emissives are deferred: the junction-control runtime/renderer is not present on this branch.
+
+- [x] **Step 2: Check desktop and mobile Guide layout**
 
 Verify six overview lines fit at 375×812 and desktop, focus/escape still work, and no permanent
 weather toolbar control was added.
 
-- [ ] **Step 3: Profile bounded cost**
+- [x] **Step 3: Profile bounded cost**
 
 At high tier with a built-out town, measure draw calls and frame submission in clear and heavy rain.
 Confirm draw calls remain below 250, cloud/rain geometry is reused, and no per-frame material,
 geometry, or array allocation appears in changed update methods.
 
-- [ ] **Step 4: Run final checks**
+- [x] **Step 4: Run final checks**
 
 ```bash
 npm test
@@ -625,7 +627,7 @@ git status --short
 
 Expected: full green, existing bundle-size advisory only, no temporary hooks.
 
-- [ ] **Step 5: Update handoff and commit**
+- [x] **Step 5: Update handoff and commit**
 
 Document weather profiles, fog floors, Save V4 state, presentation-only boundary, control thresholds,
 and visual/performance evidence:
