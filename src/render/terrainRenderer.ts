@@ -6,11 +6,15 @@ import { QUALITY } from './quality';
 
 const SAND = new THREE.Color('#c9b98a');
 const GRASS = new THREE.Color('#7fae6b');
+const HIGHLAND_GRASS = new THREE.Color('#789663');
 const ROCK = new THREE.Color('#8d8577');
 
-const SAND_MAX_Y = 1;
-const GRASS_MAX_Y = 14;
-const ROCK_SLOPE = 0.6;
+const SAND_BLEND_START_Y = 0.25;
+const SAND_BLEND_END_Y = 1.8;
+const HIGHLAND_BLEND_START_Y = 8;
+const HIGHLAND_BLEND_END_Y = 15;
+const ALTITUDE_ROCK_START_Y = 13;
+const ALTITUDE_ROCK_END_Y = 18;
 
 const NORMAL_RECOMPUTE_THROTTLE_MS = 100;
 
@@ -34,6 +38,56 @@ const TERRAIN_SEASONING_GLSL = /* glsl */ `
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
   }
 `;
+
+function smoothstep(edge0: number, edge1: number, value: number): number {
+  const t = THREE.MathUtils.clamp((value - edge0) / (edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+function terrainHash(x: number, z: number): number {
+  const value = Math.sin(x * 127.1 + z * 311.7) * 43758.5453123;
+  return value - Math.floor(value);
+}
+
+/** CPU twin of the shader's macro value noise. Keeping palette selection deterministic and
+ * world-space based means terrain deformations repaint to the exact same local character. */
+function terrainValueNoise(x: number, z: number): number {
+  const ix = Math.floor(x);
+  const iz = Math.floor(z);
+  const fx = x - ix;
+  const fz = z - iz;
+  const ux = fx * fx * (3 - 2 * fx);
+  const uz = fz * fz * (3 - 2 * fz);
+  const a = terrainHash(ix, iz);
+  const b = terrainHash(ix + 1, iz);
+  const c = terrainHash(ix, iz + 1);
+  const d = terrainHash(ix + 1, iz + 1);
+  return THREE.MathUtils.lerp(
+    THREE.MathUtils.lerp(a, b, ux),
+    THREE.MathUtils.lerp(c, d, ux),
+    uz,
+  );
+}
+
+/** Blended terrain palette used by the live vertex-color buffer and pinned by unit tests.
+ * Sand/grass/highland bands crossfade, while world-space noise moves the cliff threshold enough
+ * to break up a contour without turning the low-poly island into speckle. */
+export function terrainSurfaceColor(y: number, slope: number, worldX: number, worldZ: number): THREE.Color {
+  const macro = terrainValueNoise(worldX / 42, worldZ / 42);
+  const sandToGrass = smoothstep(SAND_BLEND_START_Y, SAND_BLEND_END_Y, y);
+  const highland = smoothstep(HIGHLAND_BLEND_START_Y, HIGHLAND_BLEND_END_Y, y);
+  const color = SAND.clone().lerp(GRASS, sandToGrass).lerp(HIGHLAND_GRASS, highland);
+
+  const thresholdJitter = (macro - 0.5) * 0.12;
+  const slopeRock = smoothstep(0.36 + thresholdJitter, 0.78 + thresholdJitter, slope);
+  const altitudeRock = smoothstep(ALTITUDE_ROCK_START_Y, ALTITUDE_ROCK_END_Y, y);
+  color.lerp(ROCK, Math.max(slopeRock, altitudeRock));
+
+  // Small albedo modulation complements the shader's roughness variation and remains bounded
+  // enough that roads, build fronts, and settlement silhouettes keep their contrast.
+  color.multiplyScalar(0.97 + macro * 0.06);
+  return color;
+}
 
 const WATER_VERTEX_SHADER = /* glsl */ `
   uniform float uTime;
@@ -174,7 +228,12 @@ export class TerrainRenderer {
     this.writeHeightsAndColors(0, 0, GRID_SIZE - 1, GRID_SIZE - 1);
     this.geo.computeVertexNormals();
 
-    const material = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true });
+    const material = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      flatShading: true,
+      roughness: 0.92,
+      metalness: 0,
+    });
     // Task 28 terrain seasoning: multiply the final vertex color by a low-frequency world-xz value
     // noise, ±6%. Injected via onBeforeCompile rather than a bespoke ShaderMaterial so we keep
     // MeshStandardMaterial's lighting/shadow model untouched — this is seasoning, not a rewrite.
@@ -194,8 +253,13 @@ export class TerrainRenderer {
         .replace(
           '#include <color_fragment>',
           `#include <color_fragment>\nfloat groundworkSeason = groundworkValueNoise(vGroundworkWorldXZ * uSeasonScale);\ndiffuseColor.rgb *= 0.94 + groundworkSeason * 0.12;`,
+        )
+        .replace(
+          '#include <roughnessmap_fragment>',
+          `#include <roughnessmap_fragment>\nroughnessFactor *= 0.90 + groundworkSeason * 0.10;`,
         );
     };
+    material.customProgramCacheKey = () => 'groundwork-terrain-seasoning-v2';
     this.mesh = new THREE.Mesh(this.geo, material);
     this.mesh.receiveShadow = true;
     this.mesh.castShadow = true;
@@ -309,11 +373,9 @@ export class TerrainRenderer {
 
   private colorForVertex(i: number, j: number, y: number): THREE.Color {
     const half = WORLD_SIZE / 2;
-    const slope = this.hf.slopeAt(i * CELL - half, j * CELL - half);
-    if (slope > ROCK_SLOPE) return ROCK;
-    if (y < SAND_MAX_Y) return SAND;
-    if (y < GRASS_MAX_Y) return GRASS;
-    return ROCK;
+    const worldX = i * CELL - half;
+    const worldZ = j * CELL - half;
+    return terrainSurfaceColor(y, this.hf.slopeAt(worldX, worldZ), worldX, worldZ);
   }
 
   private writeHeightsAndColors(minI: number, minJ: number, maxI: number, maxJ: number): void {

@@ -57,7 +57,9 @@
 - [x] Add contact-shadow decals or a low-cost blob-shadow pool beneath vehicles/large props.
   Construction fleet delivered as one fixed-capacity instanced pool; extend the same pattern to
   any future large moving props instead of enabling extra shadow-casting lights.
-- [ ] Introduce terrain macro color/roughness variation and slope-aware rock seasoning.
+- [x] Introduce terrain macro color/roughness variation and slope-aware rock seasoning.
+  Delivered through deterministic blended vertex colors plus the existing PBR shader hook; no
+  texture allocation, custom lighting model, or extra draw call.
 - [ ] Improve water depth color, shoreline foam restraint, night response, and reflection roughness.
 - [ ] Clamp rain/fog to a gameplay-legibility floor and add a restrained LUT/grade on high tier.
 - [ ] Gate SSAO/contact AO behind measured ≥55fps headroom only.
