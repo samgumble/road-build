@@ -60,7 +60,9 @@
 - [x] Introduce terrain macro color/roughness variation and slope-aware rock seasoning.
   Delivered through deterministic blended vertex colors plus the existing PBR shader hook; no
   texture allocation, custom lighting model, or extra draw call.
-- [ ] Improve water depth color, shoreline foam restraint, night response, and reflection roughness.
+- [x] Improve water depth color, shoreline foam restraint, night response, and reflection roughness.
+  Depth/night/fade groundwork was retained; this pass adds rough Fresnel sky response and a more
+  restrained foam band without texture samples or a reflection render pass.
 - [ ] Clamp rain/fog to a gameplay-legibility floor and add a restrained LUT/grade on high tier.
 - [ ] Gate SSAO/contact AO behind measured ≥55fps headroom only.
 
