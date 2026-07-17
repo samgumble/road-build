@@ -202,9 +202,26 @@ assuming a green build means the page is live.
   a structure against a reserved 9u future-tower footprint, and restored saves render every
   structure at its authoritative saved coordinates without a render-only separation pass. Focused
   contracts live in `tests/growth.test.ts` and `tests/sceneryDecay.test.ts`.
+- City-core tower density (2026-07-16): low-rise damping keeps its seeded 1–3 nearby-building
+  tolerance beside simple roads and outside town centers, but gains +1 in the outer half and +2 in
+  the inner half of the existing 24u painted degree-3 junction core. This raises the bounded local
+  ceiling from three to five towers without changing development speed, parks, neighbor gates,
+  in-place upgrades, saves, or the intentional overlap behavior. `towerDensityTolerance` is pure
+  and deterministic; focused contracts live in `tests/growth.test.ts`.
+- Pending-structure render cleanup (2026-07-16): `growth:remove` now cancels matching queued GLTF
+  spawns and pending fade offsets even when the model category has not loaded yet. This prevents a
+  removed skyscraper and its emissive window grid from being resurrected after async asset load;
+  cancellation is by authoritative id, so same-position overlapping structures remain independent.
+  The race is pinned in `tests/windowGrids.test.ts`.
+- Dashed-road and bridge-junction cleanup (2026-07-16): clipped centerline ranges retain global
+  arclength dash phase, and topology-owned degree-2 seam connectors use dashed geometry instead of
+  a solid paint ribbon. Connections adjacent to a bridge keep their shared paved surface and policy
+  markings but omit the ground-style gravel/earth verge apron that could cross the deck. These are
+  presentation-only changes; graph topology, pathing, and construction gameplay are unchanged.
+  Contracts live in `tests/roadContinuity.test.ts`.
 - Topology-owned road connections (2026-07-16, `codex/connection-roadmap`): each graph mutation now
   emits one sorted `roads:connectionsChanged` transaction. Degree-2 corners and closed loops own a
-  shared surface, verge, and continuous painted centerline instead of overlapping edge caps;
+  shared surface, verge, and phase-consistent dashed centerline instead of overlapping edge caps;
   degree-3+ junctions retain shared conflict geometry. The pure `planJunction` policy identifies
   clear through pairs, stopped approaches, and non-conflicting signal groups. `RoadRenderer` caches
   per-node topology/surface signatures, rebuilds only affected incident edges and endpoint groups,

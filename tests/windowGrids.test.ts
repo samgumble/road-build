@@ -29,14 +29,36 @@ async function warmUp(bus: EventBus, sr: SceneryRenderer, kind: GrowthKind, time
 describe('night window grids', () => {
   let bus: EventBus;
   let sr: SceneryRenderer;
+  const removedBeforeReadyId = -900;
+  const survivingOverlapId = -901;
 
   beforeAll(async () => {
     bus = new EventBus();
     const hf = new Heightfield('window-grids', bus);
     sr = new SceneryRenderer(new THREE.Scene(), hf, bus, (x) => Math.abs(x));
+    // Reproduce the asset-load race behind orphaned night lights: the authoritative building can
+    // be removed while its GLTF category is still loading. A later pending-spawn flush must not
+    // resurrect either the skyscraper instance or its separate emissive window-grid instances.
+    spawn(bus, 'building', 18, 18, removedBeforeReadyId);
+    spawn(bus, 'building', 18, 18, survivingOverlapId);
+    bus.emit('growth:remove', { id: removedBeforeReadyId });
     await warmUp(bus, sr, 'house', 20000);
     await warmUp(bus, sr, 'building', 20000);
   }, 45000);
+
+  it('does not resurrect window lights for a building removed before its model is ready', () => {
+    const internal = sr as unknown as { byId: Map<number, unknown> };
+    expect(internal.byId.has(removedBeforeReadyId)).toBe(false);
+    // Removal is keyed by authoritative id, not position: the intentionally overlapping survivor
+    // still owns a building and its windows at the exact same parcel center.
+    expect(internal.byId.has(survivingOverlapId)).toBe(true);
+    expect(sr.instanceStats.buildingMeshTotal).toBe(1);
+    expect(sr.instanceStats.windowMeshCount).toBeGreaterThanOrEqual(3);
+
+    bus.emit('growth:remove', { id: survivingOverlapId });
+    expect(sr.instanceStats.buildingMeshTotal).toBe(0);
+    expect(sr.instanceStats.windowMeshCount).toBe(0);
+  });
 
   it('plants a multi-row window grid on buildings and a modest set on houses', () => {
     const before = sr.instanceStats.windowMeshCount;

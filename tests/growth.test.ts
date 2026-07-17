@@ -4,6 +4,7 @@ import {
   FIELD_SIZE,
   GrowthSim,
   settlementMorphology,
+  towerDensityTolerance,
   type SpawnRecord,
 } from '../src/sim/growth/growth';
 import { RoadGraph } from '../src/sim/roads/graph';
@@ -1347,14 +1348,37 @@ describe('Living Towns parks and low-rise variety', () => {
   });
 
   describe('low-rise damping', () => {
-    function upgradeWorld(buildings: Array<{ x: number; z: number }>) {
+    it('keeps rural tower tolerance unchanged while raising only painted-junction cores', () => {
+      const rural = towerDensityTolerance(17, 23, 0.217, Infinity);
+      expect(rural).toBeGreaterThanOrEqual(1);
+      expect(rural).toBeLessThanOrEqual(3);
+      expect(towerDensityTolerance(17, 23, 0.217, 24)).toBe(rural);
+      expect(towerDensityTolerance(17, 23, 0.217, 18)).toBe(rural + 1);
+      const innerCore = towerDensityTolerance(17, 23, 0.217, 6);
+      expect(innerCore).toBe(rural + 2);
+      expect(towerDensityTolerance(17, 23, 0.217, 6)).toBe(innerCore);
+    });
+
+    function upgradeWorld(buildings: Array<{ x: number; z: number }>, cityCore = false) {
       const bus = new EventBus();
       const hf = new Heightfield('upgrade-test', bus);
       const g = new RoadGraph(bus, makeSampler(hf));
       let anchor = { x: 0, z: 0 };
       outer: for (let x = -160; x <= 160; x += 8) for (let z = -160; z <= 160; z += 8)
         if (hf.isLand(x, z) && hf.isLand(x + 64, z)) { anchor = { x, z }; break outer; }
-      g.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+      if (cityCore) {
+        // A painted T marks the same compact center used by settlement morphology and skyline
+        // shaping. Keeping the target close to `anchor` exercises the simulation's downtown
+        // density policy rather than renderer-only tower stretching.
+        g.commitChain([
+          { x: anchor.x - 32, z: anchor.z },
+          anchor,
+          { x: anchor.x + 64, z: anchor.z },
+        ]);
+        g.commitChain([anchor, { x: anchor.x, z: anchor.z + 32 }]);
+      } else {
+        g.commitChain([anchor, { x: anchor.x + 64, z: anchor.z }]);
+      }
       for (const e of g.edges.values()) e.stage = 'painted';
       const sim = new GrowthSim(g, hf, bus, createRng('damp'), 0.217);
       bus.emit('roads:changed', {});
@@ -1401,6 +1425,14 @@ describe('Living Towns parks and low-rise variety', () => {
 
     it('the same qualifying house upgrades normally in an empty neighborhood', () => {
       const { sim } = upgradeWorld([]);
+      expect(sim.spawned.find((r) => r.id === 1)!.kind).toBe('building');
+    });
+
+    it('allows more qualifying towers inside an established painted junction core', () => {
+      const { sim } = upgradeWorld(
+        [{ x: 6, z: 0 }, { x: -6, z: 4 }, { x: 0, z: -6 }],
+        true,
+      );
       expect(sim.spawned.find((r) => r.id === 1)!.kind).toBe('building');
     });
   });

@@ -214,6 +214,27 @@ const PARK_TREES = 2; // pocket trees spawned as ordinary tree records (full dec
 const LOWRISE_DENSITY_RADIUS = 20; // u
 const LOWRISE_SALT_I = 7919;
 const LOWRISE_SALT_J = 104729;
+// Painted three-way junctions already define compact town centers for morphology and render-side
+// skyline height. Let parcels in that same center accept a few more neighboring buildings before
+// low-rise damping wins, so mature city areas produce an actual cluster rather than one isolated
+// tower. Outside JUNCTION_CENTER_RADIUS the established 1..3 tolerance is unchanged.
+
+/** Seeded nearby-tower tolerance for a house parcel. Rural/simple-road cells retain the original
+ * 1..3 result exactly. Painted junction centers gain a bounded +1 outer-core / +2 inner-core
+ * allowance, raising downtown capacity without removing the low-rise ceiling. */
+export function towerDensityTolerance(
+  i: number,
+  j: number,
+  morphologySeed: number,
+  junctionDistance: number,
+): number {
+  const base = 1 + Math.floor(
+    morphologyHash(i + LOWRISE_SALT_I, j + LOWRISE_SALT_J, morphologySeed) * 3,
+  );
+  if (!Number.isFinite(junctionDistance) || junctionDistance >= JUNCTION_CENTER_RADIUS) return base;
+  const coreBonus = Math.ceil(2 * smooth01(1 - junctionDistance / JUNCTION_CENTER_RADIUS));
+  return base + coreBonus;
+}
 
 interface Threshold {
   value: number;
@@ -903,12 +924,18 @@ export class GrowthSim {
 
     // Living Towns low-rise damping (see LOWRISE_* above): the moment the neighbor gate first
     // passes, check the built mass already standing nearby against this cell's seeded tolerance
-    // (1..3 buildings). At or over tolerance, the cell is PERMANENTLY marked handled — this block
-    // stays low-rise, breaking up continuous tower walls. Deterministic: same seed and event order
-    // reach this check with the same records every time.
+    // (1..3 buildings, plus a small allowance inside a painted junction core). At or over
+    // tolerance, the cell is PERMANENTLY marked handled — this block stays low-rise, breaking up
+    // continuous tower walls. Deterministic: same seed, graph and event order reach this check with
+    // the same records every time.
     if (this.morphologySeed !== null) {
-      const tolerance = 1 + Math.floor(morphologyHash(i + LOWRISE_SALT_I, j + LOWRISE_SALT_J, this.morphologySeed) * 3);
       const center = cellCenter(i, j);
+      const tolerance = towerDensityTolerance(
+        i,
+        j,
+        this.morphologySeed,
+        this.nearestPaintedJunctionDistance(center.x, center.z),
+      );
       let nearbyBuildings = 0;
       for (const r of this.records) {
         if (r.kind !== 'building') continue;

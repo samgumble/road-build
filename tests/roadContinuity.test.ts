@@ -5,6 +5,7 @@ import type { P2, RoadSample } from '../src/core/types';
 import { ConstructionRenderer } from '../src/render/constructionRenderer';
 import {
   bridgeApproachRanges,
+  buildDashedRibbonGeometry,
   buildJunctionPatchGeometry,
   buildRibbonGeometry,
   RoadRenderer,
@@ -43,6 +44,14 @@ function junctionSampler(ctrl: P2[]): RoadSample[] {
   const last = ctrl[ctrl.length - 1];
   out.push({ x: last.x, y: 2, z: last.z, bridge: false });
   return out;
+}
+
+function bridgeJunctionSampler(ctrl: P2[]): RoadSample[] {
+  return junctionSampler(ctrl).map((sample) => ({
+    ...sample,
+    y: 5,
+    bridge: sample.z === 0 && sample.x > 16 && sample.x <= 48,
+  }));
 }
 
 function renderedConnections() {
@@ -460,6 +469,17 @@ describe('road and bridge continuity', () => {
     expect(trimJunctionStripeRange(0, 40, 40, 3, 3)).toEqual({ from: 5, to: 35 });
   });
 
+  it('keeps dash phase anchored to road arclength when a painted range begins inside a gap', () => {
+    const samples = junctionSampler([{ x: 0, z: 0 }, { x: 12, z: 0 }]);
+    const geometry = buildDashedRibbonGeometry(samples, 0.5, 0.24, 3, 9, 2);
+    const positions = geometry.getAttribute('position') as THREE.BufferAttribute;
+    let minX = Infinity;
+    for (let i = 0; i < positions.count; i++) minX = Math.min(minX, positions.getX(i));
+    // Global pattern is paint [0,2], gap [2,4], paint [4,6]...; clipping at x=3 must preserve
+    // the remaining gap instead of restarting a solid-looking dash at the clip boundary.
+    expect(minX).toBeCloseTo(4, 5);
+  });
+
   it('winds endpoint coverage upward so it renders from the gameplay camera', () => {
     const samples = bridgeSampler([{ x: 0, z: 0 }, { x: 8, z: 0 }]);
     const geo = buildRibbonGeometry(samples, 6, 0.1, 0, 8, 0, true, true);
@@ -528,13 +548,30 @@ describe('road and bridge continuity', () => {
     expect(visual.bridgeMaskTo).toBeNull();
   });
 
-  it('uses one shared degree-2 seam with continuous paint and no overlapping caps', () => {
+  it('uses one shared degree-2 seam with continuous centerline ownership and no overlapping caps', () => {
     const { graph, scene } = renderedCorner();
     const node = [...graph.nodes.values()].find((candidate) => graph.edgesAtNode(candidate.id).length === 2)!;
     const connectionGroup = scene.getObjectByName(`road-connection-${node.id}`) as THREE.Group;
     expect(connectionGroup).toBeTruthy();
     expect(connectionGroup.children.filter((child) => child.userData.roadDetail === 'connectionSurface')).toHaveLength(1);
-    expect(connectionGroup.children.filter((child) => child.userData.roadDetail === 'connectionCenterline')).toHaveLength(1);
+    const centerline = connectionGroup.children.find(
+      (child) => child.userData.roadDetail === 'connectionCenterline',
+    ) as THREE.Mesh;
+    expect(centerline).toBeTruthy();
+    // The first connector arm runs x=19..24. A true dash pattern has an empty [21,23] interval;
+    // the former single ribbon had a triangle centroid inside it and read as a solid stripe.
+    const positions = centerline.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const index = centerline.geometry.getIndex();
+    const vertexAt = (offset: number) => index ? index.getX(offset) : offset;
+    const triangleIndexCount = index?.count ?? positions.count;
+    let hasTriangleInGap = false;
+    for (let i = 0; i < triangleIndexCount; i += 3) {
+      const a = vertexAt(i), b = vertexAt(i + 1), c = vertexAt(i + 2);
+      const x = (positions.getX(a) + positions.getX(b) + positions.getX(c)) / 3;
+      const z = (positions.getZ(a) + positions.getZ(b) + positions.getZ(c)) / 3;
+      if (x > 21.05 && x < 22.95 && Math.abs(z) < 0.3) hasTriangleInGap = true;
+    }
+    expect(hasTriangleInGap).toBe(false);
 
     for (const edgeId of graph.edgesAtNode(node.id)) {
       const group = scene.children.find((child) => child.userData.edgeId === edgeId) as THREE.Group;
@@ -646,5 +683,22 @@ describe('road and bridge continuity', () => {
     graph.removeEdge(edgeId);
     expect(caches.connectionTopologySignatures.size).toBe(0);
     expect(caches.connectionSurfaceSignatures.size).toBe(0);
+  });
+
+  it('keeps bridge-adjacent junctions paved without laying a gravel verge apron across the deck', () => {
+    const bus = new EventBus();
+    const graph = new RoadGraph(bus, bridgeJunctionSampler);
+    const scene = new THREE.Scene();
+    new RoadRenderer(scene, graph, bus, new Heightfield('bridge-junction', bus));
+    graph.commitChain([{ x: 0, z: 0 }, { x: 16, z: 0 }, { x: 64, z: 0 }]);
+    graph.commitChain([{ x: 16, z: 0 }, { x: 16, z: 24 }]);
+    paintAll(bus, graph);
+
+    const node = [...graph.nodes.values()].find((candidate) => candidate.x === 16 && candidate.z === 0)!;
+    const group = scene.getObjectByName(`road-connection-${node.id}`)!;
+    expect(group.children.some((child) => child.userData.roadDetail === 'junctionSurface')).toBe(true);
+    expect(group.children.some((child) => child.userData.roadDetail === 'junctionVerge')).toBe(false);
+    const surface = group.children.find((child) => child.userData.roadDetail === 'junctionSurface') as THREE.Mesh;
+    expect(surface.userData.weatherSurface).toBe('asphalt');
   });
 });

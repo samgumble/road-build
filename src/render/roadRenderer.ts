@@ -570,7 +570,7 @@ export function buildJunctionPatchGeometry(
 }
 
 /** Builds a dashed ribbon: alternating "on" segments of `dashLen`, skipping `dashLen` in between, across [from, to]. */
-function buildDashedRibbonGeometry(
+export function buildDashedRibbonGeometry(
   samples: RoadSample[],
   width: number,
   yLift: number,
@@ -580,12 +580,12 @@ function buildDashedRibbonGeometry(
 ): THREE.BufferGeometry {
   const segs: THREE.BufferGeometry[] = [];
   let cursor = from;
-  let on = true;
+  let dashIndex = Math.floor(from / dashLen);
   while (cursor < to) {
-    const segEnd = Math.min(to, cursor + dashLen);
-    if (on) segs.push(buildRibbonGeometry(samples, width, yLift, cursor, segEnd));
+    const segEnd = Math.min(to, (dashIndex + 1) * dashLen);
+    if (dashIndex % 2 === 0) segs.push(buildRibbonGeometry(samples, width, yLift, cursor, segEnd));
     cursor = segEnd;
-    on = !on;
+    dashIndex++;
   }
   const merged = mergeGeometries(segs);
   segs.forEach((g) => g.dispose());
@@ -970,6 +970,16 @@ export class RoadRenderer {
     return { heading, y: a.y, far };
   }
 
+  /** True when the road leaves this node directly onto bridge deck. Looking at the first two
+   * samples catches a bridge run that begins immediately after its ground/deck boundary sample. */
+  private edgeMeetsBridgeAtNode(edge: RoadEdge, nodeId: number): boolean {
+    const fromStart = edge.a === nodeId;
+    if (!fromStart && edge.b !== nodeId) return false;
+    const endpoint = fromStart ? 0 : edge.samples.length - 1;
+    const neighbor = fromStart ? 1 : edge.samples.length - 2;
+    return Boolean(edge.samples[endpoint]?.bridge || edge.samples[neighbor]?.bridge);
+  }
+
   /** Per-end verge setbacks for `edge`'s shoulder/ditch strips (see `vergeJunctionSetback`) —
    * computed against every OTHER arm at each of the edge's nodes, at ANY degree >= 2: acute
    * junction arms and sharp corners both put a wide verge across the neighbor's asphalt. */
@@ -1094,6 +1104,10 @@ export class RoadRenderer {
       });
       const stages = [...new Set(arms.map((arm) => arm.stage))]
         .sort((a, b) => junctionSurfaceRank(a) - junctionSurfaceRank(b));
+      const bridgeAdjacent = plan.arms.some((plannedArm) => {
+        const edge = this.graph.edges.get(plannedArm.edgeId);
+        return edge ? this.edgeMeetsBridgeAtNode(edge, node.id) : false;
+      });
       const lifted = (arm: JunctionArm, lift: number): JunctionArm => ({
         heading: arm.heading,
         y: arm.y + lift,
@@ -1106,7 +1120,7 @@ export class RoadRenderer {
       // extends to that arm's ACTUAL shoulder start (the angle-aware verge setback — see
       // vergeJunctionSetback), so acute junctions get a continuous verge wedge instead of bare
       // terrain between the fixed-reach apron edge and where the shoulder strip finally begins.
-      if (stages.length) {
+      if (stages.length && !bridgeAdjacent) {
         const apronStage = stages[0];
         const apronLift = Math.max(0.015, STAGE_YLIFT[apronStage] - SHOULDER_Y_GAP) + 0.002;
         const apronY = Math.max(...arms.map((arm) => arm.y)) + apronLift;
@@ -1153,7 +1167,7 @@ export class RoadRenderer {
       }
 
       // A seam owns the center paint too: once both incident edges are painted, bridge the two
-      // trimmed edge-owned dash ranges with one continuous ribbon through the node. The actual
+      // trimmed edge-owned dash ranges with one phased dashed ribbon through the node. The actual
       // sampled arm endpoints keep the connector flush with curved and sloped approaches.
       if (plan.kind === 'seam' && arms.length === 2 && arms.every((arm) => arm.edge.stage === 'painted')) {
         const [a, b] = arms;
@@ -1162,8 +1176,9 @@ export class RoadRenderer {
           { x: plan.x, y: Math.max(a.y, b.y), z: plan.z, bridge: false },
           { x: b.far.x, y: b.far.y, z: b.far.z, bridge: false },
         ];
-        const stripeGeometry = buildRibbonGeometry(
-          stripeSamples, CENTERLINE_WIDTH, CENTERLINE_YLIFT, 0, Infinity,
+        const stripeLength = cumulativeDistances(stripeSamples).at(-1)?.dist ?? 0;
+        const stripeGeometry = buildDashedRibbonGeometry(
+          stripeSamples, CENTERLINE_WIDTH, CENTERLINE_YLIFT, 0, stripeLength, 2,
         );
         if (stripeGeometry.getAttribute('position')) {
           const stripeMaterial = makeStandardMaterial(CENTERLINE_COLOR, 1, 'stripe');

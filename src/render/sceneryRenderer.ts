@@ -1253,6 +1253,14 @@ export class SceneryRenderer {
    * `Recovering` entry pointing at a since-compacted slot would be a real (if unlikely) bug if it
    * ever did. */
   private onRemove(id: number): void {
+    // A growth record can disappear while its GLTF category is still loading. In that case there
+    // is no `byId` entry yet, but the queued spawn is still authoritative enough for
+    // `flushPending()` to place it later — including its separate emissive window grid. Cancel all
+    // queued work for the removed id before looking for a live instance so a completed asset load
+    // cannot resurrect a demolished/decayed structure (or leave lights where it used to be).
+    this.pendingSpawns = this.pendingSpawns.filter((entry) => entry.id !== id);
+    this.pendingFadeOffsets.delete(id);
+
     const instance = this.byId.get(id);
     if (!instance) return;
     this.fading = this.fading.filter((f) => f.instance !== instance);
